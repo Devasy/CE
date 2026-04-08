@@ -1,0 +1,12 @@
+{
+    "delimiter": ",",
+    "encoding": "utf-8",
+    "has-column-header": true,
+    "columns": ["First", "Last", "SSN", "SSN11", "MRN", "MRN1"],
+    "stopwords": "stopwords",
+    "names-lowercase": true,
+    "names": ["First", "Last"],
+    "ids-strip-leading-zeros": 2,
+    "normalize-ids": ["SSN", "SSN11", "MRN", "MRN1"],
+    "primary-secondary-ids": [["SSN", "SSN11"], ["MRN", "MRN1"]]
+}
