@@ -78,8 +78,8 @@ if [ "$MIGRATE_MONGO" = "true" ]; then
     PROCESSED_KEY=$(echo -n $CE_SETUP_ID | openssl dgst -sha256 -hex | awk '{print $2}')
     # export value
     export MONGO_INITDB_ROOT_PASSWORD="$(decrypt "${MONGO_INITDB_ROOT_PASSWORD}" "${PROCESSED_KEY}")"
-    compose_command exec mongodb-primary bash -c "mongosh -u root -p $MONGO_INITDB_ROOT_PASSWORD --eval 'cfg = rs.conf();cfg.members[0].host = \"$HA_PRIMARY_NODE_IP:27017\";rs.reconfig(cfg, { force: true })'"
+    compose_command exec -e MONGO_INITDB_ROOT_PASSWORD -e HA_PRIMARY_NODE_IP mongodb-primary bash -c 'mongosh -u root -p "$MONGO_INITDB_ROOT_PASSWORD" --eval "cfg = rs.conf();cfg.members[0].host = \"$HA_PRIMARY_NODE_IP:27017\";rs.reconfig(cfg, { force: true })"'
     sleep 5
-    compose_command down -v
+    compose_command down mongodb-primary -v
     echo "Successfully migrated Mongo data"
 fi
