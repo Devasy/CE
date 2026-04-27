@@ -6,6 +6,8 @@ red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
 
+out() { if [ -t 1 ]; then echo -ne "$@" >/dev/tty; else echo -ne "$@" >&2; fi; }
+
 SUBJECT=some-unique-id
 DISCARD_MONGO_STRING_REGX="\\x1b]0;mongosh mongodb:\/\/<credentials>@127\.0\.0\.1:27017\/cte?directConnection=true&serverSelectionTimeoutMS=2000\\x07"
 
@@ -70,7 +72,7 @@ check_mongo_running() {
           echo "true"
           exit
         else
-          echo -ne "\r$yellow$done    $1Error occured while connecting to Mongodb Container. Retries: $retry.\n\033[0m" >/dev/tty
+          out "\r$yellow$done    $1Error occured while connecting to Mongodb Container. Retries: $retry.\n\033[0m"
           sleep 2
           ((retry++))
         fi
@@ -85,7 +87,7 @@ check_mongo_running() {
           echo "true"
           exit
         else
-          echo -ne "\r$yellow$done    $1Error occured while connecting to Mongodb Container. Retries: $retry.\n\033[0m" >/dev/tty
+          out "\r$yellow$done    $1Error occured while connecting to Mongodb Container. Retries: $retry.\n\033[0m"
           sleep 2
           ((retry++))
         fi
@@ -103,19 +105,19 @@ trap_ctrlC() {
 spin() {
   while [ 1 ]; do
     for i in "${spinner[@]}"; do
-      echo -ne "\r$i    $1Collecting" >/dev/tty
-      sleep 0.1
+    out "\r$i    $1Collecting"
+    sleep 0.1
     done
   done
 }
 
 stop_spin() {
   trap "kill -9 $2" $(seq 0 15)
-  echo -ne "\033[2K" >/dev/tty
+  out "\033[2K"
   if [[ $3 == *"Error"* ]]; then
-    echo -ne "\r$red$done    $1$3\n\033[0m" >/dev/tty
+    out "\r$red$done    $1$3\n\033[0m"
   else
-    echo -ne "\r$green$done    $1Collected\n\033[0m" >/dev/tty
+    out "\r$green$done    $1Collected\n\033[0m"
   fi
 }
 
@@ -329,7 +331,7 @@ out_platform_details() {
     $podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$SETTINGS_COLLECTION.find({},{proxy:{scheme: {\$ifNull: ['\$proxy.scheme', null]}, server:{\$ifNull: ['\$proxy.server', null]}, username:{\$ifNull: ['\$proxy.username', null]}}, _id:0})" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
 
     echo -e "\n------- General Settings Details -------" >>$OUT
-    $podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$SETTINGS_COLLECTION.find({},{_id:0, migrationHistory:{\$ifNull: ['\$migrationHistory', null]}, logLevel:{\$ifNull: ['\$logLevel', null]}, logsCleanup:{\$ifNull: ['\$logsCleanup', null]}, ssoEnable:{\$ifNull: ['\$ssoEnable', null]}, forceAuth:{\$ifNull: ['\$forceAuth', null]}, secretsManagerSettings:{enabled:{\$ifNull: ['\$secretsManagerSettings.enabled', null]}, params:{authMethod:{\$ifNull: ['\$secretsManagerSettings.params.authMethod', null]}, provider:{\$ifNull: ['\$secretsManagerSettings.provider', null]}}}})" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
+    $podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$SETTINGS_COLLECTION.find({},{_id:0, migrationHistory:{\$ifNull: ['\$migrationHistory', null]}, logLevel:{\$ifNull: ['\$logLevel', null]}, logsCleanup:{\$ifNull: ['\$logsCleanup', null]}, ssoEnable:{\$ifNull: ['\$ssoEnable', null]}, forceAuth:{\$ifNull: ['\$forceAuth', null]}, secretsManagerSettings:{enabled:{\$ifNull: ['\$secretsManagerSettings.enabled', null]}, params:{authMethod:{\$ifNull: ['\$secretsManagerSettings.params.authMethod', null]}, provider:{\$ifNull: ['\$secretsManagerSettings.params.provider', null]}}}})" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
 
     echo -e "\n------- System Specific Details -------" >>$OUT
     $podman_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ && export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt && python netskope/common/utils/collect_diagnose.py standalone_ha" >>$OUT
@@ -356,6 +358,9 @@ out_platform_details() {
     echo "Active Indicator(s): $active_indicators" >> $OUT
     inactive_indicators=$($podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$INDICATORS.countDocuments({active:false})" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g")
     echo "Inactive Indicator(s): $inactive_indicators" >> $OUT
+    TAGS=$($podman_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py COMMON TAGS")
+    tags_count=$($podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$TAGS.countDocuments()" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g")
+    echo "Tag(s) Count: $tags_count" >> $OUT
     echo -e "\n------- CTE Module End ---------" >>$OUT
 
     echo -e "\n\n------- CTO Module Start ---------" >>$OUT
@@ -364,7 +369,7 @@ out_platform_details() {
     $podman_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/collect_diagnose.py $CTO_CONFIGURATIONS" >>$OUT
     echo -e "\n------- CTO Business Rule Details --------" >>$OUT
     CTO_BUSINESS_RULES=$($podman_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py CTO BUSINESS_RULES")
-    $podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); JSON.stringify(db.$CTO_BUSINESS_RULES.find({}, {name: 1, muted:1, alertFilters:1, dedupeRules:1, muteRules:1, queues:1, _id:0}).toArray(), null, 2)" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
+    $podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); JSON.stringify(db.$CTO_BUSINESS_RULES.find({}, {name: 1, muted:1, filters:1, dedupeRules:1, muteRules:1, queues:1, _id:0}).toArray(), null, 2)" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
     CTO_ALERTS=$($podman_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py CTO ALERTS")
     alerts=$($podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$CTO_ALERTS.countDocuments({})" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g")
     echo -e "\n Alert(s): $alerts" >> $OUT
@@ -379,7 +384,7 @@ out_platform_details() {
     $podman_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/collect_diagnose.py $CRE_CONFIGURATIONS" >>$OUT
     echo -e "\n------- CRE Business Rule Details --------" >>$OUT
     CRE_BUSINESS_RULES=$($podman_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py CRE BUSINESS_RULES")
-    $podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); JSON.stringify(db.$CRE_BUSINESS_RULES.find({}, {name: 1, muted:1, userFilters:1, muteRules:1, actions:1, _id:0}).toArray(), null, 2)" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
+    $podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); JSON.stringify(db.$CRE_BUSINESS_RULES.find({}, {name: 1, muted:1, userFilters:1, muteRules:1, actions:1, entity:1, entityFilters:1, _id:0}).toArray(), null, 2)" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
     CRE_USERS=$($podman_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py CRE USERS")
     users=$($podman_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$CRE_USERS.countDocuments({type:'user'})" | sed -e '/podman/d' -e '/exit code/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g")
     echo "User(s): $users" >> $OUT
@@ -476,7 +481,7 @@ out_platform_details() {
     $docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$SETTINGS_COLLECTION.find({},{proxy:{scheme: {\$ifNull: ['\$proxy.scheme', null]}, server:{\$ifNull: ['\$proxy.server', null]}, username:{\$ifNull: ['\$proxy.username', null]}}, _id:0})" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
 
     echo -e "\n------- General Settings Details -------" >>$OUT
-    $docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$SETTINGS_COLLECTION.find({},{_id:0, migrationHistory:{\$ifNull: ['\$migrationHistory', null]}, logLevel:{\$ifNull: ['\$logLevel', null]}, logsCleanup:{\$ifNull: ['\$logsCleanup', null]}, ssoEnable:{\$ifNull: ['\$ssoEnable', null]}, forceAuth:{\$ifNull: ['\$forceAuth', null]}, secretsManagerSettings:{enabled:{\$ifNull: ['\$secretsManagerSettings.enabled', null]}, params:{authMethod:{\$ifNull: ['\$secretsManagerSettings.params.authMethod', null]}, provider:{\$ifNull: ['\$secretsManagerSettings.provider', null]}}}})" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
+    $docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$SETTINGS_COLLECTION.find({},{_id:0, migrationHistory:{\$ifNull: ['\$migrationHistory', null]}, logLevel:{\$ifNull: ['\$logLevel', null]}, logsCleanup:{\$ifNull: ['\$logsCleanup', null]}, ssoEnable:{\$ifNull: ['\$ssoEnable', null]}, forceAuth:{\$ifNull: ['\$forceAuth', null]}, secretsManagerSettings:{enabled:{\$ifNull: ['\$secretsManagerSettings.enabled', null]}, params:{authMethod:{\$ifNull: ['\$secretsManagerSettings.params.authMethod', null]}, provider:{\$ifNull: ['\$secretsManagerSettings.params.provider', null]}}}})" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
 
     echo -e "\n------- System Specific Details -------" >>$OUT
     $docker_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ && export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt && python netskope/common/utils/collect_diagnose.py standalone_ha" >>$OUT
@@ -502,6 +507,9 @@ out_platform_details() {
     echo "Active Indicator(s): $active_indicators" >> $OUT
     inactive_indicators=$($docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$INDICATORS.countDocuments({active:false})" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g")
     echo "Inactive Indicator(s): $inactive_indicators" >> $OUT
+    TAGS=$($docker_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py COMMON TAGS")
+    tags_count=$($docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$TAGS.countDocuments()" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g")
+    echo "Tag(s) Count: $tags_count" >> $OUT
     echo -e "\n------- CTE Module End ---------" >>$OUT
 
     echo -e "\n\n------- CTO Module Start ---------" >>$OUT
@@ -510,7 +518,7 @@ out_platform_details() {
     $docker_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/collect_diagnose.py $CTO_CONFIGURATIONS" >>$OUT
     echo -e "\n------- CTO Business Rule Details --------" >>$OUT
     CTO_BUSINESS_RULES=$($docker_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py CTO BUSINESS_RULES")
-    $docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); JSON.stringify(db.$CTO_BUSINESS_RULES.find({}, {name: 1, muted:1, alertFilters:1, dedupeRules:1, muteRules:1, queues:1, _id:0}).toArray(), null, 2)" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
+    $docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); JSON.stringify(db.$CTO_BUSINESS_RULES.find({}, {name: 1, muted:1, filters:1, dedupeRules:1, muteRules:1, queues:1, _id:0}).toArray(), null, 2)" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
     CTO_ALERTS=$($docker_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py CTO ALERTS")
     alerts=$($docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$CTO_ALERTS.countDocuments({})" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g")
     echo -e "\n Alert(s): $alerts" >> $OUT
@@ -525,7 +533,7 @@ out_platform_details() {
     $docker_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/collect_diagnose.py $CRE_CONFIGURATIONS" >>$OUT
     echo -e "\n------- CRE Business Rule Details --------" >>$OUT
     CRE_BUSINESS_RULES=$($docker_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py CRE BUSINESS_RULES")
-    $docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); JSON.stringify(db.$CRE_BUSINESS_RULES.find({}, {name: 1, muted:1, userFilters:1, muteRules:1, actions:1, _id:0}).toArray(), null, 2)" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
+    $docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); JSON.stringify(db.$CRE_BUSINESS_RULES.find({}, {name: 1, muted:1, userFilters:1, muteRules:1, actions:1, entity:1, entityFilters:1, _id:0}).toArray(), null, 2)" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g" >>$OUT
     CRE_USERS=$($docker_compose exec core bash -c "source /opt/load_env.sh && export PYTHONPATH=/opt/ &&  python netskope/common/utils/module_collections.py CRE USERS")
     users=$($docker_compose exec mongodb-primary mongosh --quiet --username cteadmin --password $MAINTENANCE_PASSWORD cte --eval "db.getMongo().setReadPref('secondary'); db.$CRE_USERS.countDocuments({type:'user'})" | sed -e '/\"t\"/d' | sed -r 's/\x1B\[(([0-9]{1,2})?(;)?([0-9]{1,2})?)?[m,K,H,f,J]//g' | sed -e "s/$DISCARD_MONGO_STRING_REGX//g")
     echo "User(s): $users" >> $OUT
@@ -630,7 +638,7 @@ out_ce_logs() {
     --collection logs \
     --type json \
     --query "{}" \
-    --fields createdAt,type,message,errorCode,details,_id \
+    --fields createdAt,ce_log_type,message,errorCode,details,_id \
     > $OUT
   else
     $docker_compose exec mongodb-primary mongoexport \
@@ -641,7 +649,7 @@ out_ce_logs() {
     --collection logs \
     --type json \
     --query "{}" \
-    --fields createdAt,type,message,errorCode,details,_id \
+    --fields createdAt,ce_log_type,message,errorCode,details,_id \
     > $OUT
   fi
   stop_spin "CE Logs\t\t" $pid "success"

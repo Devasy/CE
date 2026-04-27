@@ -5,15 +5,21 @@ decrypt() {
         echo ""
         return
     fi
-    echo "$1" | openssl enc -aes-256-cbc -A -d -a -S $CE_HEX_CODE -K "$2" -iv $CE_IV -pbkdf2 -iter 10000
+    result=$(printf "%s" "$1" | openssl enc -aes-256-cbc -A -d -a -S $CE_HEX_CODE -K "$2" -iv $CE_IV -pbkdf2 -iter 10000)
+    if [ $? -eq 0 ]; then
+        printf "%s" "$result"
+    else
+        echo ""
+    fi
 }
 
 CE_SETUP_ID=$(echo "$CE_SETUP_ID" | tr -d '"')
 # Generate processed key
 PROCESSED_KEY=$(echo -n $CE_SETUP_ID | openssl dgst -sha256 -hex | awk '{print $2}')
 # Export values
-for VAR in "MAINTENANCE_PASSWORD" "RABBITMQ_DEFAULT_PASS" "MONGO_INITDB_ROOT_PASSWORD" "MONGODB_PASSWORD" "MAINTENANCE_PASSWORD_ESCAPED" "CE_SSL_CERTIFICATE_PASSWORD"; do
-    export "$VAR"="$(decrypt "${!VAR}" "${PROCESSED_KEY}")"
+for VAR in "MAINTENANCE_PASSWORD" "RABBITMQ_DEFAULT_PASS" "MONGO_INITDB_ROOT_PASSWORD" "MONGODB_PASSWORD" "MAINTENANCE_PASSWORD_ESCAPED" "CE_SSL_CERTIFICATE_PASSWORD" "JWT_SECRET"; do
+    decrypted_value=$(decrypt "${!VAR}" "${PROCESSED_KEY}")
+    export "$VAR"="$decrypted_value"
 done
 
 if [ -n "${HA_IP_LIST:-}" ]; then

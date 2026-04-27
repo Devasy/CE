@@ -6,8 +6,6 @@ Release checklist:
     - CORE_TAG
     - UI_TAG
     - BETA_OPT_IN
-    - CORE_LATEST_VERSION_TAG
-    - UI_LATEST_VERSION_TAG
     - INSTALL_VERSION
 """
 from enum import Enum
@@ -32,7 +30,7 @@ import sys
 import random
 import io
 import string
-
+from data.management_server import utils
 from data.management_server.utils import (
     RECOMMENDED_HOST_OS,
     AVAILABLE_INPUTS,
@@ -62,7 +60,9 @@ from data.management_server.utils import (
     ServerExceptions,
     configure_logger,
     update_cloudexchange_config,
-    compare_versions
+    compare_versions,
+    fetch_container_info,
+    isRedHat
 )
 
 DEFAULT_INPUTS = {
@@ -118,7 +118,6 @@ DEFAULT_INPUTS = {
         "skip": True,
         "help": "Enter maintenance password that will be used for docker services. This password can be set only once.",
     },
-    "WATCHTOWER_TOKEN": {"default": "token", "skip": True, "help": ""},
     "DOCKER_USERNAME": {"default": "", "skip": True, "help": ""},
     "DOCKER_PASSWORD": {"default": "", "skip": True, "help": ""},
     "MAX_MAINTENANCE_WINDOW_MINUTES": {
@@ -148,6 +147,7 @@ DEFAULT_INPUTS = {
     "COMPOSE_VERSION": {"default": "", "skip": True, "help": ""},
     "HOST_OS": {"default": "", "skip": True, "help": ""},
     "PLATFORM_PROVIDER": {"default": "custom", "skip": True, "help": ""},
+    "CE_PROFILE": {"default": "Medium", "skip": True, "help": ""},
     "PROMOTION_BANNERS_FILE_LOCATION": {
         "default": "https://raw.githubusercontent.com/netskopeoss/ta_cloud_exchange/main/ce_promotions.json",
         "skip": True,
@@ -160,14 +160,12 @@ DEFAULT_INPUTS = {
     "ENV_FILE": {"default": "./.env", "skip": True, "help": ""},
 }
 LATEST_TAG_AND_VERSION = {
-    "CORE_TAG": "netskopetechnicalalliances/cloudexchange:core6-6.0.1",
-    "UI_TAG": "netskopetechnicalalliances/cloudexchange:ui6-6.0.1",
-    "MONGO_TAG": "netskopetechnicalalliances/cloudexchange:mongo8-8.0.17",
-    "RABBITMQ_TAG": "netskopetechnicalalliances/cloudexchange:rabbitmq4-4.2.2",
+    "CORE_TAG": "netskopetechnicalalliances/cloudexchange:core6-6.1.0",
+    "UI_TAG": "netskopetechnicalalliances/cloudexchange:ui6-6.1.0",
+    "MONGO_TAG": "netskopetechnicalalliances/cloudexchange:mongo6-6.1.0-8.0.18",
+    "RABBITMQ_TAG": "netskopetechnicalalliances/cloudexchange:rabbitmq6-6.1.0-4.2.2",
     "BETA_OPT_IN": "No",
-    "CORE_LATEST_VERSION_TAG": "netskopetechnicalalliances/cloudexchange:core5-latest",
-    "UI_LATEST_VERSION_TAG": "netskopetechnicalalliances/cloudexchange:ui5-latest",
-    "INSTALL_VERSION": "6.0.1",
+    "INSTALL_VERSION": "6.1.0",
 }
 CHECKS = {}
 MIN_CPU = 8
@@ -213,7 +211,7 @@ MIN_OPENSSL_VERSION = "1.1.1"
 N = 5
 VENV_DIR = ".cevenv"
 MIN_PYTHON_MAJOR = 3
-MIN_PYTHON_MINOR = 8
+MIN_PYTHON_MINOR = 11
 MIN_HA_SUPPORTED_VERSION = "5.0.0"
 RECOMMENDED_DOCKER_VERSION = "28.4.0"
 RECOMMENDED_DOCKER_COMPOSE_VERSION = "2.39.4"
@@ -274,7 +272,7 @@ class Status(Enum):
 
 def print_banner():
     print(
-        f"""
+        rf"""
   _   _        _         _                          ____  _____ 
  | \ | |  ___ | |_  ___ | | __ ___   _ __    ___   / ___|| ____|
  |  \| | / _ \| __|/ __|| |/ // _ \ | '_ \  / _ \ | |    |  _|  
@@ -373,45 +371,6 @@ def get_tls_version(version_string):
     tls_versions = " ".join(tls_versions)
     tls_versions = f'"{tls_versions}"'
     return tls_versions
-
-
-def fetch_container_info():
-    global is_ui_running, is_rabbitmq_running, is_mongodb_running
-    try:
-        if isRedHat():
-            p = subprocess.Popen(
-                ["podman", "ps", "--format", "json"],
-                stderr=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-            )
-            out, err = p.communicate()
-            containers = json.loads(out.decode("utf-8"))
-            if err:
-                raise Exception("Unable to fetch container information.")
-        else:
-            p = subprocess.Popen(
-                ["docker", "ps", "--format", "json"],
-                stderr=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-            )
-            out, err = p.communicate()
-            if err:
-                raise Exception("Unable to fetch container information.")
-            containers = [
-                json.loads(line) for line in out.decode("utf-8").splitlines()
-            ]
-
-        for container_info in containers:
-            if "_mongodb-primary" in _get_container_name(container_info):
-                is_mongodb_running = True
-            elif "_rabbitmq-stats" in _get_container_name(container_info):
-                is_rabbitmq_running = True
-            elif "_ui" in _get_container_name(container_info):
-                is_ui_running = True
-    except Exception:
-        print_warning("Unable to fetch container information.")
 
 
 def check_management_service_running():
@@ -516,11 +475,16 @@ def put_env_variable(inputs, location=".env"):
             ce_ssl_certificate_password = inputs.get("CE_SSL_CERTIFICATE_PASSWORD")
             if ce_ssl_certificate_password:
                 update_secrets["CE_SSL_CERTIFICATE_PASSWORD"] = ce_ssl_certificate_password
-            upsert_secret_file(update_secrets, secret_location)
+            jwt_secret = inputs.get("JWT_SECRET")
+            if jwt_secret:
+                update_secrets["JWT_SECRET"] = jwt_secret
+            if update_secrets:
+                upsert_secret_file(update_secrets, secret_location)
         inputs.pop("MAINTENANCE_PASSWORD", None)
         inputs.pop("MAINTENANCE_PASSWORD_ESCAPED", None)
         inputs.pop("MONGO_COMPATIBILITY", None)
         inputs.pop("CE_SSL_CERTIFICATE_PASSWORD", None)
+        inputs.pop("JWT_SECRET", None)
         with open(location, "w") as f:
             for key, value in inputs.items():
                 f.write(f"{key}={value}\n")
@@ -773,6 +737,17 @@ def _get_cert_location(crt_postfix="cte_cert", is_pem=False, with_ca=False, from
     return cert_file, key_file, pem_file, None, None
 
 
+def _configure_http_mode():
+    for _from_local in [False, True]:
+        cert_file, key_file, _, _, _ = _get_cert_location(crt_postfix="cte_cert", from_local=_from_local)
+        for file_path in (cert_file, key_file):
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+    DEFAULT_INPUTS["TLS_VERSION"]["default"] = "TLSv1.3"
+    DEFAULT_INPUTS["TLS_VERSION"]["skip"] = True
+    AVAILABLE_INPUTS["UI_PROTOCOL"] = "http"
+
+
 def check_for_certs(crt_postfix, is_pem=False, with_ca=False, from_local=False):
     try:
         cert_file, key_file, pem_file, ca_key, ca_crt = _get_cert_location(
@@ -809,7 +784,7 @@ def common_ca_self_signed_ssl(ca_key, ca_crt, tls_conf, tls_cert_cert, tls_cert_
         else:
             print(f"{err.decode('utf-8')}\n")
     if not os.path.exists(ca_crt):
-        command = f"""openssl req -x509 -new -nodes -key {ca_key} -sha256 -days 3650 -out {ca_crt} \
+        command = f"""openssl req -x509 -new -nodes -key {ca_key} -sha256 -days 365 -out {ca_crt} \
   -subj "/CN=CloudExchangeCA" \
   -extensions v3_ca -config {common_ca_conf}
   """
@@ -1183,6 +1158,7 @@ def check_machine_specs():
             f"\033[1;31mFailed for {profile_name} profile\033[0;37m"
         )
     print("\nCE Sizing Profile Check:", sizing_result, end="\n\n")
+    AVAILABLE_INPUTS["CE_PROFILE"] = profile_name
     if not matched:
         machine_specs = [
             cpu_cores,
@@ -1502,18 +1478,6 @@ def check_connectivity():
         )
 
 
-def isRedHat():
-    try:
-        with open("/etc/redhat-release") as f:
-            content = f.readline()
-            if content.startswith("Red Hat"):
-                return True
-            else:
-                return False
-    except Exception as e:
-        return False
-
-
 def isRedHat79():
     try:
         with open("/etc/redhat-release") as f:
@@ -1606,15 +1570,17 @@ def check_and_apply_file_permissions():
                 command = f"{SUDO_PREFIX} chown -R {MONGO_USER_ID}:{MONGO_USER_ID} data/mongo-data"
                 set_directory_permission("data/mongo-data", command)
                 print_pass(
-                    f"Changing owner of data/mongo-data to user with uid {MONGO_USER_ID}"
+                    "Changing owner of data/mongo-data "
+                    f"to user with uid {MONGO_USER_ID}"
                 )
                 CHECKS["MONGO"] = Status.PASS
 
             # mongo_data directory file
             try:
-                command = f"{SUDO_PREFIX} chmod -R 744 data/mongo-data"
-                set_directory_permission("data/mongo-data", command)
-                print_pass(f"Adding read/write permissions to data/mongo-data")
+                apply_permission_scheme("data/mongo-data", "740", "640")
+                print_pass(
+                    "Restricting data/mongo-data (dirs 740, files 640)"
+                )
                 CHECKS["MONGO-FILE"] = Status.PASS
             except Exception as e:
                 print_fail(
@@ -1639,21 +1605,26 @@ def check_and_apply_file_permissions():
                 command = f"{SUDO_PREFIX} chown -R {MONGO_USER_ID}:{MONGO_USER_ID} data/database-init"
                 set_directory_permission("data/database-init", command)
                 print_pass(
-                    f"Changing owner of data/database-init/mongo-init.sh to user with uid {MONGO_USER_ID}"
+                    "Changing owner of data/database-init/mongo-init.sh "
+                    f"to user with uid {MONGO_USER_ID}"
                 )
                 CHECKS["MONGO-INIT"] = Status.PASS
 
             # mongo-init.sh permissions check
             try:
-                command = f"{SUDO_PREFIX} chmod -R 775 data/database-init"
-                set_directory_permission("data/database-init", command)
+                apply_permission_scheme("data/database-init", "750", "640")
+                command = (
+                    f"{SUDO_PREFIX} chmod 750 "
+                    "data/database-init/mongo-init.sh data/database-init/mongo-autocompact.sh"
+                )
+                set_directory_permission("mongo-init and mongo-autocompact executable", command)
                 print_pass(
-                    "Adding read/write permissions to data/database-init/mongo-init.sh"
+                    "Restricting data/database-init (dirs 750, files 640)"
                 )
                 CHECKS["MONGO-INIT-FILE"] = Status.PASS
             except Exception as e:
                 print_fail(
-                    "Error occurred while verifying file permissions for data/database-init/mongo-init.sh"
+                    "Error occurred while verifying file permissions for data/database-init/mongo-init.sh and data/database-init/mongo-autocompact.sh"
                 )
                 CHECKS["MONGO-INIT-FILE"] = Status.FAIL
     except Exception as e:
@@ -1679,15 +1650,15 @@ def check_and_apply_file_permissions():
                 command = f"{SUDO_PREFIX} chown -R 1001:1001 data/custom_plugins"
                 set_directory_permission("data/custom_plugins", command)
                 print_pass(
-                    f"Changing owner of data/custom_plugins to user with uid 1001"
+                    "Changing owner of data/custom_plugins "
+                    "to user with uid 1001"
                 )
                 CHECKS["CUSTOM_PLUGINS"] = Status.PASS
 
             try:
-                command = f"{SUDO_PREFIX} chmod -R 755 data/custom_plugins"
-                set_directory_permission("data/custom_plugins", command)
+                apply_permission_scheme("data/custom_plugins", "750", "640")
                 print_pass(
-                    "Adding read/write permissions to data/custom_plugins"
+                    "Restricting data/custom_plugins (dirs 750, files 640)"
                 )
                 CHECKS["CUSTOM_PLUGINS_FILE"] = Status.PASS
             except Exception as e:
@@ -1719,25 +1690,17 @@ def check_and_apply_file_permissions():
                 )
                 CHECKS["SSL_CERTS"] = Status.PASS
 
-            command = f"{SUDO_PREFIX} chmod 755 data/ssl_certs"
-            set_directory_permission("data/ssl_certs", command)
-            print_pass(f"Adding read/write permissions to data/ssl_certs")
+            apply_permission_scheme("data/ssl_certs", "755", "644")
+            print_pass("Setting data/ssl_certs (dir 755, files 644) for container access")
             CHECKS["SSL_CERTS"] = Status.PASS
 
-        if os.path.exists("data/ssl_certs/cte_cert.crt"):
-            command = f"{SUDO_PREFIX} chmod 644 data/ssl_certs/cte_cert.crt"
-            set_directory_permission("data/ssl_certs/cte_cert.crt", command)
-            print_pass(
-                f"Adding read permissions to data/ssl_certs/cte_cert.crt"
-            )
-
         if os.path.exists("data/ssl_certs/cte_cert_key.key"):
-            command = f"{SUDO_PREFIX} chmod 644 data/ssl_certs/cte_cert_key.key"
+            command = f"{SUDO_PREFIX} chmod 600 data/ssl_certs/cte_cert_key.key"
             set_directory_permission(
                 "data/ssl_certs/cte_cert_key.key", command
             )
             print_pass(
-                f"Adding read permissions to data/ssl_certs/cte_cert_key.key"
+                "Restricting read permissions to data/ssl_certs/cte_cert_key.key (600)"
             )
 
     except Exception as e:
@@ -1760,25 +1723,22 @@ def check_and_apply_file_permissions():
                 print_pass("Changing owner of data/ssl_certs/mongodb_rabbitmq_certs to user with uid 1001")
                 CHECKS["MONGODB_RABBITMQ_SSL_CERTS"] = Status.PASS
 
-            command = f"{SUDO_PREFIX} chmod 755 data/ssl_certs/mongodb_rabbitmq_certs"
-            set_directory_permission("data/ssl_certs/mongodb_rabbitmq_certs", command)
-            print_pass("Adding read/write permissions to data/ssl_certs/mongodb_rabbitmq_certs")
+            apply_permission_scheme(
+                "data/ssl_certs/mongodb_rabbitmq_certs", "755", "644"
+            )
+            print_pass(
+                "Setting permissions on "
+                "data/ssl_certs/mongodb_rabbitmq_certs (dir 755, files 644) for container access"
+            )
             CHECKS["MONGODB_RABBITMQ_SSL_CERTS"] = Status.PASS
 
-        if os.path.exists("data/ssl_certs/mongodb_rabbitmq_certs/tls_cert.crt"):
-            command = f"{SUDO_PREFIX} chmod 644 data/ssl_certs/mongodb_rabbitmq_certs/tls_cert.crt"
-            set_directory_permission("data/ssl_certs/mongodb_rabbitmq_certs/tls_cert.crt", command)
-            print_pass("Adding read permissions to data/ssl_certs/mongodb_rabbitmq_certs/tls_cert.crt")
+        certs_dir = "data/ssl_certs/mongodb_rabbitmq_certs"
 
-        if os.path.exists("data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.key"):
-            command = f"{SUDO_PREFIX} chmod 644 data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.key"
-            set_directory_permission("data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.key", command)
-            print_pass("Adding read permissions to data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.key")
-
-        if os.path.exists("data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.pem"):
-            command = f"{SUDO_PREFIX} chmod 644 data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.pem"
-            set_directory_permission("data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.pem", command)
-            print_pass("Adding read permissions to data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.pem")
+        ca_key_path = os.path.join(certs_dir, "tls_cert_ca.key")
+        if os.path.exists(ca_key_path):
+            command = f"{SUDO_PREFIX} chmod 600 {ca_key_path}"
+            set_directory_permission(ca_key_path, command)
+            print_pass("Restricting CA private key to owner only (600)")
 
     except Exception as e:
         print_fail("Error occurred while verifying file permissions for data/ssl_certs/mongodb_rabbitmq_certs")
@@ -1799,13 +1759,11 @@ def check_and_apply_file_permissions():
                     "Changing owner of data/rabbitmq to user with uid 1001"
                 )
                 CHECKS["RABBITMQ"] = Status.PASS
-            command = f"{SUDO_PREFIX} chmod -R 744 data/rabbitmq"
-            set_directory_permission("data/rabbitmq", command)
-            command = f"{SUDO_PREFIX} chmod 755 data/rabbitmq"
-            set_directory_permission("data/rabbitmq", command)
-            command = f"{SUDO_PREFIX} chmod 755 data/rabbitmq"
-            set_directory_permission("data/rabbitmq", command)
-            print_pass("Adding read permissions to data/rabbitmq")
+            apply_permission_scheme("data/rabbitmq", "750", "640")
+            print_pass(
+                "Restricting data/rabbitmq "
+                "(dirs 750, files 640)"
+            )
             CHECKS["RABBITMQ"] = Status.PASS
     except Exception:
         print_fail(
@@ -1820,11 +1778,16 @@ def check_and_apply_file_permissions():
             )
             CHECKS["ca_certs"] = Status.FAIL
         else:
-            command = f"{SUDO_PREFIX} chmod -R 644 data/ca_certs/"
-            set_directory_permission("data/ca_certs", command)
-            command = f"{SUDO_PREFIX} chmod 755 data/ca_certs"
-            set_directory_permission("data/ca_certs", command)
-            print_pass(f"Adding read permissions to data/ca_certs")
+            if platform.system().lower() not in ["darwin"]:
+                command = f"{SUDO_PREFIX} chown -R 1001:1001 data/ca_certs"
+                set_directory_permission("data/ca_certs", command)
+                print_pass(
+                    "Changing owner of data/ca_certs to user with uid 1001"
+                )
+            apply_permission_scheme("data/ca_certs", "755", "644")
+            print_pass(
+                "Setting permissions on data/ca_certs (dirs 755, files 644) for update-ca-certificates"
+            )
             CHECKS["ca_certs"] = Status.PASS
     except Exception as e:
         print_fail(
@@ -1846,11 +1809,11 @@ def check_and_apply_file_permissions():
                     "Changing owner of data/files-data to user with uid 1001"
                 )
                 CHECKS["files_data"] = Status.PASS
-            command = f"{SUDO_PREFIX} chmod -R 760 data/files-data/"
-            set_directory_permission("data/files-data", command)
-            command = f"{SUDO_PREFIX} chmod 760 data/files-data"
-            set_directory_permission("data/files-data", command)
-            print_pass(f"Adding read and write permissions to data/files-data")
+            apply_permission_scheme("data/files-data", "760", "660")
+            print_pass(
+                "Restricting data/files-data "
+                "(dirs 760, files 660)"
+            )
             CHECKS["files_data"] = Status.PASS
     except Exception as e:
         print_fail(
@@ -1866,9 +1829,9 @@ def check_and_apply_file_permissions():
             )
             CHECKS["START"] = Status.FAIL
         else:
-            command = f"{SUDO_PREFIX} chmod 555 ./start"
+            command = f"{SUDO_PREFIX} chmod 550 ./start"
             set_directory_permission("start", command)
-            print_pass(f"Adding execute permissions to start script")
+            print_pass("Restricting execute permissions to owner/group for start script")
             CHECKS["START"] = Status.PASS
     except Exception as e:
         # print(e)
@@ -1885,9 +1848,9 @@ def check_and_apply_file_permissions():
             )
             CHECKS["STOP"] = Status.FAIL
         else:
-            command = f"{SUDO_PREFIX} chmod 555 ./stop"
+            command = f"{SUDO_PREFIX} chmod 550 ./stop"
             set_directory_permission("stop", command)
-            print_pass(f"Adding execute permissions to stop script")
+            print_pass("Restricting execute permissions to owner/group for stop script")
             CHECKS["STOP"] = Status.PASS
     except Exception as e:
         # print(e)
@@ -2059,15 +2022,9 @@ def assign_memory_to_rabbitmq_container():
 
 
 def validate_secret(secret_type, value):
+    """Validate that the secret is not empty. All special characters are now allowed."""
     if not value:
         return False, f"{secret_type} should not be empty."
-    restricted_chars = {"\\", "/", " ", "'", '"', "?", "&", "\t", "\n", "#", "$"}
-    for char in restricted_chars:
-        if char in value:
-            return False, (
-                f"{secret_type} can not contain \\ / space "
-                "tab ' \" ? & # $ characters."
-            )
     return True, "Valid"
 
 
@@ -2077,28 +2034,23 @@ def set_config_params():
     ui_port = CLOUD_EXCHANGE_CONFIG.get("UI_PORT", 443)
     protocol = "https" if protocol not in ["http", "https"] else protocol
     is_ssl_enabled = check_for_certs(crt_postfix="cte_cert")
-    if not is_ssl_enabled:
-        if protocol == "http":
-            DEFAULT_INPUTS["TLS_VERSION"]["default"] = "TLSv1.3"
-            DEFAULT_INPUTS["TLS_VERSION"]["skip"] = True
-            AVAILABLE_INPUTS["UI_PROTOCOL"] = "http"
-        elif protocol == "https":
-            AVAILABLE_INPUTS["UI_PROTOCOL"] = "https"
-            DEFAULT_INPUTS["UI_PORT"]["default"] = ui_port
-            is_ssl_enabled = check_for_certs(crt_postfix="cte_cert")  # Checking if SSL is enabled or not
-            if not is_ssl_enabled:
-                cert_file, key_file, _, _, _ = _get_cert_location(crt_postfix="cte_cert", is_pem=False, with_ca=False)
-                extendedkeyusage_conf = "data/ssl_certs/extendedkeyusage.txt"
-                create_self_signed_ssl_certs(
-                    cert_file=cert_file, key_file=key_file, extendedkeyusage_conf=extendedkeyusage_conf
-                )
-
+    if protocol == "http":
+        _configure_http_mode()
+        DEFAULT_INPUTS["UI_PORT"]["default"] = ui_port
+    elif protocol == "https":
+        AVAILABLE_INPUTS["UI_PROTOCOL"] = "https"
+        DEFAULT_INPUTS["UI_PORT"]["default"] = ui_port
+        is_ssl_enabled = check_for_certs(crt_postfix="cte_cert")  # Checking if SSL is enabled or not
+        if not is_ssl_enabled:
+            cert_file, key_file, _, _, _ = _get_cert_location(crt_postfix="cte_cert", is_pem=False, with_ca=False)
+            extendedkeyusage_conf = "data/ssl_certs/extendedkeyusage.txt"
+            create_self_signed_ssl_certs(
+                cert_file=cert_file, key_file=key_file, extendedkeyusage_conf=extendedkeyusage_conf
+            )
             message = f"\033[1;37mReplace {cert_file} and {key_file} files with your custom certificate and key files respectively to use custom SSL certificates.\033[0;37m"
             print(message)
-        else:
-            print("Invalid input... Valid inputs are 'http' or 'https'.\n")
     else:
-        DEFAULT_INPUTS["UI_PORT"]["default"] = ui_port
+        print("Invalid input... Valid inputs are 'http' or 'https'.\n")
 
     if not check_for_certs(crt_postfix="mongodb_rabbitmq_certs/tls_cert", with_ca=True, is_pem=True):
         print("Preparing certificates for secure MongoDB and RabbitMQ...")
@@ -2162,9 +2114,27 @@ def set_config_params():
                         print(f"\nSetting following random JWT secret - {CLOUD_EXCHANGE_CONFIG[key]}\n")
                         print("Please note down the above JWT secret for future reference. It will be required in Cloud Exchange HA configuration.")
                 if not CLOUD_EXCHANGE_CONFIG[key] and not AVAILABLE_INPUTS.get("JWT_SECRET", ""):
-                    CLOUD_EXCHANGE_CONFIG[key] = generate_random_password()
-                    print(f"\nSetting following random JWT secret - {CLOUD_EXCHANGE_CONFIG[key]}\n")
-                    print("Please note down the above JWT secret for future reference. It will be required in Cloud Exchange HA configuration.")
+                    # Try to get JWT from .env.keys (encrypted)
+                    secret_location = get_secret_location(AVAILABLE_INPUTS)
+                    if secret_location and os.path.exists(secret_location):
+                        try:
+                            with open(secret_location, "r") as f:
+                                for line in f:
+                                    if line.startswith("JWT_SECRET="):
+                                        encrypted_jwt = line.strip().split("=", 1)[1]
+                                        if encrypted_jwt and AVAILABLE_INPUTS.get("CE_SETUP_ID"):
+                                            decrypted_jwt = change_maintenance_password(encrypted_jwt, forward=False)
+                                            if decrypted_jwt:
+                                                CLOUD_EXCHANGE_CONFIG[key] = decrypted_jwt
+                                                print("Using existing JWT_SECRET from encrypted storage.")
+                                        break
+                        except Exception as e:
+                            print(f"Warning: Could not read JWT from .env.keys: {e}")
+                    # If still no JWT, generate new one
+                    if not CLOUD_EXCHANGE_CONFIG[key]:
+                        CLOUD_EXCHANGE_CONFIG[key] = generate_random_password()
+                        print(f"\nSetting following random JWT secret - {CLOUD_EXCHANGE_CONFIG[key]}\n")
+                        print("Please note down the above JWT secret for future reference. It will be required in Cloud Exchange HA configuration.")
                 elif not CLOUD_EXCHANGE_CONFIG[key] and AVAILABLE_INPUTS.get("JWT_SECRET", ""):
                     continue
                 AVAILABLE_INPUTS[key] = CLOUD_EXCHANGE_CONFIG[key]
@@ -2405,7 +2375,7 @@ def update_yaml_file(filename):
     )
     compose_data["services"]["mongodb-primary"][
         "entrypoint"
-    ][2] += " --bind_ip_all --replSet mongo_replica_set --keyFile /data/mongo_replica.key --tlsAllowInvalidHostnames"
+    ][2] = "source /opt/load_env.sh && docker-entrypoint.sh mongod --tlsMode preferTLS --tlsCertificateKeyFile /opt/tls_cert_key.pem --tlsCAFile /opt/tls_cert_ca.crt --tlsDisabledProtocols TLS1_0,TLS1_1 --bind_ip_all --replSet mongo_replica_set --keyFile /data/mongo_replica.key --tlsAllowInvalidHostnames --setParameter opensslCipherSuiteConfig='TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256' --setParameter opensslCipherConfig='ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305' & MONGO_PID=$$! && sleep 30 && /opt/mongo-autocompact.sh; wait $$MONGO_PID"
 
     # Update connection strings and add required variables
     compose_data["services"]["core"]["environment"].extend(
@@ -2793,11 +2763,7 @@ def get_os_name_and_major_version():
                     f"The recommended Ubuntu OS versions are {RECOMMENDED_UBUNTU_VERSION[0]} and {RECOMMENDED_UBUNTU_VERSION[1]}"
                 )
         elif "red hat" in pretty_name.lower():
-            recommended_version = (
-                RECOMMENDED_RHEL_VERSION[0]
-                if version_id.split(".")[0] == "8"
-                else RECOMMENDED_RHEL_VERSION[1]
-            )
+            recommended_version = RECOMMENDED_RHEL_VERSION[0]
             if compare_versions(version_id, recommended_version):
                 print_pass(f"RHEL OS Version {version_id}")
                 CHECKS["OS"] = Status.PASS
@@ -2808,7 +2774,7 @@ def get_os_name_and_major_version():
                 CHECKS["OS"] = Status.FAIL
             if version_id not in RECOMMENDED_RHEL_VERSION:
                 print_warning(
-                    f"The recommended RHEL OS versions are {RECOMMENDED_RHEL_VERSION[0]} and {RECOMMENDED_RHEL_VERSION[1]}"
+                    f"The recommended RHEL OS version is {RECOMMENDED_RHEL_VERSION[0]}."
                 )
         return os_name_and_major_version
     except Exception:
@@ -3016,31 +2982,35 @@ def setup_primary_volume(node_ip):
         glusterfs_base_port = GLUSTERFS_BASE_PORT
         glusterfs_max_port = GLUSTERFS_MAX_PORT
 
-    response = install_gluster(
+    response, status_code = install_gluster(
         handler=custom_handler,
         shared_directory_path=new_shared_directory_path,
         glusterfs_base_port=glusterfs_base_port,
         glusterfs_max_port=glusterfs_max_port,
         should_end_stream=False,
     )
-    if response[1] != 200:
-        print_fail("Failed to install glusterfs.")
+    if status_code != 200:
+        detail = response.get("detail") if isinstance(response, dict) else ""
+        if detail == "OS version check failed.":
+            print_fail("Setup cannot continue on an unsupported operating system.")
+        else:
+            print_fail("Failed to install glusterfs.")
         exit(1)
     # Verify gluster volume status
-    response = verify_start_create_volume(
+    response, status_code = verify_start_create_volume(
         handler=custom_handler, current_node_ip=node_ip
     )
-    if response[1] != 200:
+    if status_code != 200:
         print_fail("Failed to create gluster volume.")
         exit(1)
     # Verify volume mount
-    response = ensure_volume_mounted(
+    response, status_code = ensure_volume_mounted(
         handler=custom_handler,
         shared_directory_path=new_shared_directory_path,
         current_node_ip=node_ip,
         should_end_stream=False,
     )
-    if response[1] != 200:
+    if status_code != 200:
         print_fail("Failed to mount gluster volume at `/opt/shared/data`.")
         exit(1)
 
@@ -3049,17 +3019,50 @@ def remove_passwords_from_config():
     update_data = {
         "MAINTENANCE_PASSWORD": "",
         "CE_SSL_CERTIFICATE_PASSWORD": "",
+        "JWT_SECRET": "",
     }
     try:
         update_cloudexchange_config(updated_config=update_data)
         print(
-            "Removed MAINTENANCE_PASSWORD and CE_SSL_CERTIFICATE_PASSWORD from cloudexchange.config file."
+            "Removed MAINTENANCE_PASSWORD, CE_SSL_CERTIFICATE_PASSWORD and JWT_SECRET from cloudexchange.config file."
         )
     except Exception:
         print(
-            "Error encountered while removing MAINTENANCE_PASSWORD and CE_SSL_CERTIFICATE_PASSWORD "
+            "Error encountered while removing MAINTENANCE_PASSWORD, CE_SSL_CERTIFICATE_PASSWORD and JWT_SECRET "
             "from cloudexchange.config file."
         )
+
+
+def build_find_chmod_command(path, obj_type, mode):
+    """
+    Return a find command that applies chmod to matching entries.
+
+    Args:
+        path (str): Directory passed to find.
+        obj_type (str): Find -type value (e.g., 'd', 'f').
+        mode (str): Chmod mode to apply.
+    """
+    return (
+        f"{SUDO_PREFIX} find {path} "
+        f"-type {obj_type} -exec chmod {mode} {{}} +"
+    )
+
+
+def apply_permission_scheme(path, dir_mode, file_mode=None):
+    """
+    Apply directory-wide permissions, optionally overriding file perms.
+
+    Args:
+        path (str): Target directory.
+        dir_mode (str): Mode to apply recursively to the path first.
+        file_mode (str, optional): If provided and different from dir_mode,
+            file entries beneath the path are reset to this mode.
+    """
+    command = f"{SUDO_PREFIX} chmod -R {dir_mode} {path}"
+    set_directory_permission(path, command)
+    if file_mode and file_mode != dir_mode:
+        command = build_find_chmod_command(path, "f", file_mode)
+        set_directory_permission(f"{path} files", command)
 
 
 def run():
@@ -3119,9 +3122,19 @@ def run():
                 )
 
         read_cloud_exchange_config_file()
+        
+        # Fetch container info once for all execution paths
+        fetch_container_info()
+        # Sync container status from utils module to local variables
+        global is_ui_running, is_rabbitmq_running, is_mongodb_running
+        is_ui_running = utils.is_ui_running
+        is_rabbitmq_running = utils.is_rabbitmq_running
+        is_mongodb_running = utils.is_mongodb_running
+        
         if should_check_prerequisites is not None:
             set_proxy()
             check_prerequisites()
+            get_os_name_and_major_version()  # Validate the Recommended OS
             if isinstance(should_check_prerequisites, str) and should_check_prerequisites.strip() == "HA":
                 check_python_prerequisites()
             if (Status.FAIL in CHECKS.values()) or (
@@ -3138,7 +3151,6 @@ def run():
                 exit(1)
             exit(0)
 
-        fetch_container_info()
         check_management_service_running()
         create_env_if_not_exist()
         set_sudo_prefix()
