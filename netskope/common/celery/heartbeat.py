@@ -5,10 +5,10 @@ import os
 import socket
 import traceback
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 
 import requests
-from pymongo import MongoClient
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from requests.packages.urllib3.util.retry import Retry
@@ -27,6 +27,11 @@ from netskope.common.utils.handle_exception import (
     handle_status_code,
 )
 from netskope.common.utils.rabbitmq_helper import make_rabbitmq_api_call
+from netskope.common.utils.service_health_check import (
+    check_mongodb_service,
+    check_rabbitmq_service,
+    check_node_services,
+)
 
 from .main import APP
 
@@ -65,7 +70,11 @@ def heartbeat_logs():
     # RabbitMQ
     try:
         response = make_rabbitmq_api_call("/api/nodes")
-        if isinstance(response, list) and len(response) and not response[0].get("running", False):
+        if (
+            isinstance(response, list)
+            and len(response)
+            and not response[0].get("running", False)
+        ):
             return {"success": False}
     except Exception:
         logger.error(
@@ -100,7 +109,9 @@ def heartbeat_logs():
     try:
         params = {"skip_cluster": True}
         timestamp = datetime.now(UTC)
-        system_stats = make_management_server_call(endpoint="/system-stats", params=params, require_auth=False)
+        system_stats = make_management_server_call(
+            endpoint="/system-stats", params=params, require_auth=False
+        )
         connector.collection(Collections.CLUSTER_HEALTH).insert_one(
             {
                 "check_time": timestamp,
@@ -112,6 +123,7 @@ def heartbeat_logs():
             "Error occurred while processing response from management server.",
             error_code="CE_1042",
             details=traceback.format_exc(),
+            resolution="The Management Server is not reachable, please verify the following steps:\n Step 1: Check if the Management Server Service is Running by executing below mentioned command. If it's not running, try re-running the setup process to start it again.\n$ systemctl status cloud-exchange\n Step 2: Ensure that port 8000 is allowed in the firewall, as the Management Server runs on this port.",  # noqa
         )
     return {"success": True}
 
@@ -128,7 +140,9 @@ def prepare_string(down_list):
     return string
 
 
-def make_management_server_call(endpoint=None, token=None, params=None, payload=None, require_auth=True):
+def make_management_server_call(
+    endpoint=None, token=None, params=None, payload=None, require_auth=True
+):
     """
     Make a call to the management server.
 
@@ -199,78 +213,49 @@ def get_cluster_stats(verify=False):
 
     host_list = os.environ.get("HA_IP_LIST", "").split(",")
     timestamp = datetime.now(UTC)
-    try:
-        # Use root user and admin database. Cluster status will not be accessible.
-        connection_string = (
-            os.environ["MONGO_CONNECTION_STRING"].replace("://cteadmin", "://root").replace("/cte?", "/admin?")
-        )
-        client = MongoClient(connection_string)
-        cluster_status = client.admin.command({"replSetGetStatus": 1})
-        for instance in cluster_status.get("members", []):
-            ip = instance["name"].split(":")[0]
-            status_list["mongodb"][ip] = {
-                "name": instance["name"],
-                "status": instance["stateStr"],
-                "message": instance["lastHeartbeatMessage"],
-                "infoMessage": instance["infoMessage"],
-            }
-        client.close()
-    except Exception:
-        logger.error(
-            "Error occurred while connecting to MongoDB.",
-            error_code="CE_1126",
-            details=traceback.format_exc(),
-        )
 
-    try:
-        cluster_status = make_rabbitmq_api_call("/api/nodes")
-        for instance in cluster_status:
-            hostname = instance["name"].split("@")[1]
-            status_list["rabbitmq"][hostname] = {
-                "name": instance["name"],
-                "status": "Active" if instance["running"] else "Inactive",
-            }
-    except Exception:
-        logger.error(
-            "Error occurred while processing the response from RabbitMQ",
-            error_code="CE_1127",
-            details=traceback.format_exc(),
-        )
+    # Get MongoDB status for all nodes using utility function
+    mongodb_status = check_mongodb_service()
+    status_list["mongodb"] = mongodb_status
 
+    # Get RabbitMQ status for all nodes using utility function
+    rabbitmq_status = check_rabbitmq_service()
+    status_list["rabbitmq"] = rabbitmq_status
+
+    def check_node_health(ip):
+        """Check health status for a single node using utility function."""
+        node_status_dict = check_node_services(ip, verify=verify)
+        return ip, {"ui": node_status_dict["ui"], "core": node_status_dict["core"]}
+
+    # Parallel execution of node health checks
     with warnings.catch_warnings():
-        proxies = {"http": None, "https": None}
         warnings.simplefilter("ignore", InsecureRequestWarning)
-        for ip in host_list:
-            try:
-                ui_url = f"{UI_PROTOCOL}://{ip}:{os.environ['UI_PORT']}"
-                response = requests.get(f"{ui_url}/login", verify=verify, proxies=proxies)
-                if response.status_code != 200:
-                    status_list["ui"][ip] = {"status": "Inactive"}
-                    status_list["core"][ip] = {"status": "Unknown"}
-                    response.raise_for_status()
-                status_list["ui"][ip] = {"status": "Active"}
+        # Use ThreadPoolExecutor for parallel node health checks
+        # Max workers set to number of nodes, but cap at reasonable limit
+        max_workers = min(len(host_list), 10)  # Cap at 10 concurrent requests
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all node health check tasks
+            future_to_ip = {
+                executor.submit(check_node_health, ip): ip
+                for ip in host_list
+                if ip.strip()
+            }
 
+            # Collect results as they complete
+            for future in as_completed(future_to_ip):
+                ip = future_to_ip[future]
                 try:
-                    response = requests.get(f"{ui_url}/api/healthcheck", verify=verify, proxies=proxies)
-                    if response.status_code != 200:
-                        status_list["core"][ip] = {"status": "Inactive"}
-                        response.raise_for_status()
-                    status_list["core"][ip] = {"status": "Active"}
-                except Exception:
+                    result_ip, node_status = future.result()
+                    status_list["ui"][result_ip] = node_status["ui"]
+                    status_list["core"][result_ip] = node_status["core"]
+                except Exception as exc:
                     logger.error(
-                        f"Error occurred while checking the CORE status for '{ip}' node",
-                        error_code="CE_1128",
+                        f"Node health check generated an exception for '{ip}': {exc}",
+                        error_code="CE_1130",
                         details=traceback.format_exc(),
                     )
-                    status_list["core"][ip] = {"status": "Inactive"}
-            except Exception:
-                status_list["ui"][ip] = {"status": "Inactive"}
-                status_list["core"][ip] = {"status": "Unknown"}
-                logger.error(
-                    f"Error occurred while checking the UI status for '{ip}' node",
-                    error_code="CE_1129",
-                    details=traceback.format_exc(),
-                )
+                    status_list["ui"][ip] = {"status": "Inactive"}
+                    status_list["core"][ip] = {"status": "Unknown"}
 
     total = len(status_list["mongodb"])
 
@@ -295,16 +280,20 @@ def get_cluster_stats(verify=False):
             core_count += 1
 
     log_string = (
-        "UI({1}/{0}), MongoDB({2}/{0}), Core({3}/{0}) and RabbitMQ({4}/{0}) containers are in active state.".format(
-            total, ui_count, mongo_count, core_count, rmq_count
-        )
-    )
+        "UI({1}/{0}), MongoDB({2}/{0}), Core({3}/{0}) and RabbitMQ({4}/{0}) containers are in active state."
+    ).format(total, ui_count, mongo_count, core_count, rmq_count)
 
     service_status = [
         {"name": "Core", "active": True if core_count > 0 else False},
         {"name": "UI", "active": True if ui_count > 0 else False},
-        {"name": "MongoDB", "active": True if mongo_count >= math.floor(total / 2 + 1) else False},
-        {"name": "RabbitMQ", "active": True if rmq_count >= math.floor(total / 2 + 1) else False},
+        {
+            "name": "MongoDB",
+            "active": True if mongo_count >= math.floor(total / 2 + 1) else False,
+        },
+        {
+            "name": "RabbitMQ",
+            "active": True if rmq_count >= math.floor(total / 2 + 1) else False,
+        },
     ]
 
     transformed = {}
@@ -317,7 +306,10 @@ def get_cluster_stats(verify=False):
 
     for instance, value in transformed.items():
         down_list = []
-        if value.get("mongodb", {}).get("status", "").upper() not in ["PRIMARY", "SECONDARY"]:
+        if value.get("mongodb", {}).get("status", "").upper() not in [
+            "PRIMARY",
+            "SECONDARY",
+        ]:
             down_list.append("MongoDB")
 
         if value.get("rabbitmq", {}).get("status", "") != "Active":
@@ -334,12 +326,15 @@ def get_cluster_stats(verify=False):
     system_stats = {}
     params = {"skip_cluster": False}
     try:
-        system_stats = make_management_server_call(params=params, endpoint="/system-stats", require_auth=False)
+        system_stats = make_management_server_call(
+            params=params, endpoint="/system-stats", require_auth=False
+        )
     except Exception:
         logger.error(
             "Error occurred while processing response from management server.",
             error_code="CE_1042",
             details=traceback.format_exc(),
+            resolution="The Management Server is not reachable, please verify the following steps:\n Step 1: Check if the Management Server Service is Running by executing below mentioned command. If it's not running, try re-running the setup process to start it again.\n$ systemctl status cloud-exchange\n Step 2: Ensure that port 8000 is allowed in the firewall, as the Management Server runs on this port.",  # noqa
         )
     connector.collection(Collections.CLUSTER_HEALTH).insert_one(
         {

@@ -1,6 +1,5 @@
 """Handles the settings related endpoints."""
 
-import traceback
 import os
 import requests
 from requests.adapters import HTTPAdapter
@@ -11,8 +10,6 @@ from ...utils import (
     DBConnector,
     Collections,
     Logger,
-    UpdateManager,
-    UpdateException,
     flatten,
 )
 from .auth import issue_new_token
@@ -33,6 +30,11 @@ from netskope.common.utils.integrations_tasks_scheduler import (
 )
 from netskope.common.utils.proxy import get_proxy_params
 from netskope.common.utils.settings import VALID_INTEGRATIONS_GROUPS
+from netskope.common.utils.secrets_manager_schemas import (
+    get_all_providers,
+    get_provider_schema,
+    get_secret_path_schema,
+)
 from ...models import User, SettingsOut, SettingsIn, AccountSettingsIn
 from .auth import first_time_user, get_current_user
 from .. import __version__
@@ -43,41 +45,6 @@ db_connector = DBConnector()
 logger = Logger()
 UI_SERVICE_NAME = os.environ.get("UI_SERVICE_NAME", "ui")
 UI_PROTOCOL = os.environ.get("UI_PROTOCOL", "http")
-
-
-@router.get("/updates", tags=["Settings"], description="Check for updates.")
-async def check_updates(user: User = Security(get_current_user, scopes=["admin"])):
-    """Check for container updates and get changelogs."""
-    try:
-        manager = UpdateManager()
-        return {
-            "core": manager.get_changelog("core"),
-            "ui": manager.get_changelog("ui"),
-        }
-    except UpdateException:
-        logger.error(
-            "Error occurred while checking for updates.",
-            details=traceback.format_exc(),
-            error_code="CE_1003",
-            resolution="Ensure that, Docker hub(https://hub.docker.com/) is accessible from the Cloud Exchange.",
-        )
-        raise HTTPException(400, "Error occurred while checking for updates.")
-
-
-@router.get("/update", tags=["Settings"], description="Update core and ui containers.")
-async def update(user: User = Security(get_current_user, scopes=["admin"])):
-    """Update core and ui containers."""
-    try:
-        manager = UpdateManager()
-        manager.update()
-        return {"success": True}
-    except UpdateException:
-        logger.error(
-            "Error occurred while checking for updates.",
-            details=traceback.format_exc(),
-            error_code="CE_1048",
-        )
-        raise HTTPException(400, "Error occurred while checking for updates.")
 
 
 @router.get(
@@ -158,6 +125,8 @@ async def read_settings(
     out["analyticsServerConnectivity"] = settings_out.analyticsServerConnectivity
     out["username"] = user.username
     out["tourCompleted"] = settings_out.tourCompleted
+    if "settings_read" in user.scopes:
+        out["certExpiry"] = settings_out.certExpiry
     return out
 
 
@@ -199,7 +168,7 @@ def update_env(token, proxy):
     Raises:
         Exception: If there's an error during the API request
     """
-    url = f"{UI_PROTOCOL}://{UI_SERVICE_NAME}:3000/api/management/update-env"
+    url = f"{UI_PROTOCOL}://{UI_SERVICE_NAME}:3000/api/management/update-env"  # noqa: E231
     update_data = {
         "CORE_HTTP_PROXY": proxy.get("http", ""),
         "CORE_HTTPS_PROXY": proxy.get("https", ""),
@@ -217,7 +186,7 @@ def update_env(token, proxy):
 
     success, response = handle_exception(
         session.put,
-        custom_message="Could not update environment file.",
+        custom_message="Could not update environment file",
         url=url,
         json=update_data,
         headers=headers,
@@ -228,8 +197,9 @@ def update_env(token, proxy):
     if not success:
         logger.error(
             message="Error encountered while updating environment file.",
-            details=response.with_traceback(),
-            resolution="Make sure management server is active",
+            error_code="CE_1075",
+            details=str(response),
+            resolution="The Management Server is not reachable, please verify the following steps:\n Step 1: Check if the Management Server Service is Running by executing below mentioned command. If it's not running, try re-running the setup process to start it again.\n$ systemctl status cloud-exchange\n Step 2: Ensure that port 8000 is allowed in the firewall, as the Management Server runs on this port.",  # noqa
         )
         raise HTTPException(
             400, "Error occurred while updating environment file. Check logs."
@@ -313,16 +283,19 @@ async def update_settings(
         logger.debug("SSO configuration has been updated.")
     if settings.enableUpdateChecking is not None:
         logger.debug(
-            f"Periodic update checking has been "
+            f"Periodic plugin update checking has been "
             f"{'enabled' if settings.enableUpdateChecking else 'disabled'}."
         )
     if settings.platforms is not None:
         enabled_platforms = set([k for k, v in settings.platforms.items() if v])
         if enabled_platforms:
             regex = r"netskope_provider\.main$"
-            if db_connector.collection(Collections.NETSKOPE_TENANTS).count_documents(
-                {"plugin": {"$regex": regex, "$options": "i"}}
-            ) == 0:
+            if (
+                db_connector.collection(Collections.NETSKOPE_TENANTS).count_documents(
+                    {"plugin": {"$regex": regex, "$options": "i"}}
+                )
+                == 0
+            ):
                 raise HTTPException(
                     400,
                     "You need to configure atleast one Netskope tenant before enabling any module.",
@@ -334,8 +307,29 @@ async def update_settings(
             ) and not enabled_platforms.issubset(valid_group):
                 raise HTTPException(
                     400,
-                    "You can not use EDM and CFC with other Cloud Exchange"
-                    " integrations.",
+                    "EDM and CFC modules cannot be enabled along with other CE modules (CLS/CTE/CTO/CRE).",
+                )
+        # DLP modules (EDM/CFC) are not supported on VM-flavour, HA, or Medium profile deployments
+        dlp_modules = {"edm", "cfc"}
+        # Only block if a DLP module is being *newly* enabled (not when disabling or keeping as-is)
+        current_settings = db_connector.collection(Collections.SETTINGS).find_one({})
+        current_platforms = current_settings.get("platforms", {}) if current_settings else {}
+        currently_enabled_dlp = {m for m in dlp_modules if current_platforms.get(m, False)}
+        newly_enabling_dlp = enabled_platforms.intersection(dlp_modules) - currently_enabled_dlp
+        if newly_enabling_dlp:
+            is_vm_flavour = (
+                os.environ.get("CE_AS_VM", "False").strip().strip('"').lower() == "true"
+            )
+            is_ha_deployment = bool(os.environ.get("HA_IP_LIST"))
+            is_medium_profile = (
+                os.environ.get("CE_PROFILE", "").strip().strip('"').lower() == "medium"
+            )
+            if is_vm_flavour or is_ha_deployment or is_medium_profile:
+                raise HTTPException(
+                    400,
+                    "EDM and CFC modules are not supported on containerised HA deployment "
+                    "or CE as a VM standalone and HA deployment or medium profile deployment, please switch to "
+                    "containerised(Ubuntu and RHEL) standalone deployment with large profile.",
                 )
         message = "Module status updated."
         enabled = [p.upper() for p in settings.platforms if settings.platforms[p]]
@@ -520,3 +514,104 @@ async def get_ssoenable_status():
         )
     except Exception:
         return "false"
+
+
+@router.get(
+    "/settings/secrets-manager/providers",
+    tags=["Settings", "Secrets Manager"],
+    description="Get list of available secrets manager providers with their configuration schemas.",
+)
+async def get_secrets_manager_providers(
+    user: User = Security(get_current_user, scopes=["settings_read"]),
+):
+    """Get all available secrets manager providers and their schemas.
+
+    This endpoint returns the configuration schema for each provider,
+    which the UI uses to dynamically render the configuration form.
+
+    Returns:
+        dict: {
+            "providers": List of provider schemas with fields definitions
+        }
+    """
+    return {"providers": get_all_providers()}
+
+
+@router.get(
+    "/settings/secrets-manager/providers/{provider_id}",
+    tags=["Settings", "Secrets Manager"],
+    description="Get configuration schema for a specific secrets manager provider.",
+)
+async def get_secrets_manager_provider_schema(
+    provider_id: str,
+    user: User = Security(get_current_user, scopes=["settings_read"]),
+):
+    """Get the configuration schema for a specific provider.
+
+    Args:
+        provider_id: Provider identifier (e.g., 'hashicorp', 'azure')
+
+    Returns:
+        dict: Provider schema with fields and secret_path_schema
+
+    Raises:
+        HTTPException: 404 if provider not found
+    """
+    schema = get_provider_schema(provider_id)
+    if not schema:
+        raise HTTPException(404, f"Provider '{provider_id}' not found.")
+    return schema
+
+
+@router.get(
+    "/settings/secrets-manager/active-schema",
+    tags=["Settings", "Secrets Manager"],
+    description="Get the secret path schema for the currently active secrets manager provider.",
+)
+async def get_active_secret_path_schema(
+    user: User = Security(get_current_user, scopes=[]),
+):
+    """Get the secret path schema for the currently active provider.
+
+    This endpoint is used by plugin configuration and tenant pages to
+    determine how to render secret input fields based on the active provider.
+
+    Returns:
+        dict: {
+            "enabled": bool - whether secrets manager is enabled,
+            "provider": str - active provider ID (if enabled),
+            "provider_name": str - display name of active provider,
+            "schema": dict - secret path schema for the active provider
+        }
+    """
+    settings = db_connector.collection(Collections.SETTINGS).find_one({})
+    secrets_settings = settings.get("secretsManagerSettings", {})
+
+    if not secrets_settings.get("enabled", False):
+        return {
+            "enabled": False,
+            "provider": None,
+            "provider_name": None,
+            "schema": None,
+        }
+
+    params = secrets_settings.get("params", {})
+    provider_id = params.get("provider")
+
+    if not provider_id:
+        return {
+            "enabled": False,
+            "provider": None,
+            "provider_name": None,
+            "schema": None,
+        }
+
+    provider_schema = get_provider_schema(provider_id)
+    secret_path_schema = get_secret_path_schema(provider_id)
+
+    return {
+        "enabled": True,
+        "provider": provider_id,
+        "provider_name": provider_schema.get("name") if provider_schema else provider_id,
+        "schema": secret_path_schema,
+    }

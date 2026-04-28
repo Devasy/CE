@@ -470,6 +470,250 @@ class SecretsManagerHashicorpParamsOut(BaseModel):
     roleId: Union[str, None] = Field(None)
 
 
+def handle_azure_exceptions(fn):
+    """Handle exceptions for Azure Key Vault operations."""
+    # Lazy import Azure exceptions to handle case when SDK is not installed
+    try:
+        from azure.core.exceptions import (
+            ClientAuthenticationError,
+            HttpResponseError,
+            ServiceRequestError,
+        )
+        AZURE_EXCEPTIONS_AVAILABLE = True
+    except ImportError:
+        AZURE_EXCEPTIONS_AVAILABLE = False
+        ClientAuthenticationError = None
+        HttpResponseError = None
+        ServiceRequestError = None
+
+    @wraps(fn)
+    def decorated(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ValueError:
+            raise
+        except requests.exceptions.ConnectionError:
+            raise ValueError(
+                "Connection error occurred while validating credentials. Check Vault URL and network connectivity."
+            )
+        except Exception as e:
+            from netskope.common.utils.logger import Logger
+
+            logger = Logger()
+            error_msg = str(e)
+            logger.error(
+                "Error occurred while validating Azure Key Vault params.",
+                details=traceback.format_exc(),
+            )
+
+            # Handle Azure SDK specific exceptions
+            if AZURE_EXCEPTIONS_AVAILABLE:
+                if ClientAuthenticationError and isinstance(e, ClientAuthenticationError):
+                    raise ValueError(
+                        "Azure authentication failed. Verify Tenant ID, Client ID, and credentials are correct."
+                    )
+                if HttpResponseError and isinstance(e, HttpResponseError):
+                    if e.status_code == 401:
+                        raise ValueError(
+                            "Unauthorized. Check Client ID and Client Secret/Certificate."
+                        )
+                    elif e.status_code == 403:
+                        raise ValueError(
+                            "Access denied. Ensure the app has 'Secret List' and "
+                            "'Secret Get' permissions in Key Vault access policy."
+                        )
+                    elif e.status_code == 404:
+                        raise ValueError(
+                            "Key Vault not found. Verify the Vault URL is correct."
+                        )
+                    raise ValueError(f"Azure Key Vault error ({e.status_code}): {e.message}")
+                if ServiceRequestError and isinstance(e, ServiceRequestError):
+                    raise ValueError(
+                        "Failed to connect to Azure Key Vault. Check Vault URL and network connectivity."
+                    )
+
+            # Fallback for string-based error detection (in case exceptions aren't caught above)
+            if "AADSTS" in error_msg:
+                raise ValueError("Azure AD authentication failed. Check credentials.")
+            raise ValueError("Error occurred while validating params. Check logs for details.")
+
+    return decorated
+
+
+class AzureAuthMethod(str, Enum):
+    """Azure Key Vault supported auth methods."""
+
+    CLIENT_SECRET = "client_secret"
+    CERTIFICATE = "certificate"
+
+
+class SecretsManagerAzureParams(BaseModel):
+    """Azure Key Vault related params."""
+
+    provider: Literal["azure"] = "azure"
+    vaultUrl: str = Field(...)
+
+    @field_validator("vaultUrl", mode="before")
+    def validate_vault_url(cls, v):
+        """Validate Azure Key Vault URL."""
+        try:
+            AnyHttpUrl(v)
+        except Exception:
+            raise ValueError("Vault URL must be a valid URL starting with http:// or https://")
+        return v
+
+    tenantId: str = Field(...)
+    clientId: str = Field(...)
+    authMethod: AzureAuthMethod = Field(...)
+
+    # Client Secret auth fields
+    clientSecret: Annotated[str, Field(validate_default=True)] = Field("")
+
+    @field_validator("clientSecret")
+    @classmethod
+    def _validate_client_secret(cls, val, values, **kwargs):
+        """Validate client secret and authenticate."""
+        values = values.data
+        if "vaultUrl" not in values:
+            raise ValueError("Vault URL is required.")
+        if "tenantId" not in values:
+            raise ValueError("Tenant ID is required.")
+        if "clientId" not in values:
+            raise ValueError("Client ID is required.")
+        if "authMethod" not in values:
+            raise ValueError("Authentication Method is required.")
+        if values.get("authMethod") == AzureAuthMethod.CLIENT_SECRET and not val:
+            raise ValueError("Client Secret is required for Client Secret authentication.")
+        elif values.get("authMethod") == AzureAuthMethod.CLIENT_SECRET:
+
+            @handle_azure_exceptions
+            def validate_auth():
+                from ..utils.proxy import get_proxy_params
+                from netskope.common.utils.secrets_manager import (
+                    _build_azure_client_for_validation,
+                )
+
+                proxy = get_proxy_params(
+                    SettingsDB(**connector.collection(Collections.SETTINGS).find_one({}))
+                )
+                _build_azure_client_for_validation(
+                    vault_url=values["vaultUrl"],
+                    tenant_id=values["tenantId"],
+                    client_id=values["clientId"],
+                    client_secret=val,
+                    certificate=None,
+                    certificate_password=None,
+                    proxy=proxy,
+                )
+                return val
+
+            return validate_auth()
+        return ""
+
+    # Certificate auth fields - certificatePassword must be defined BEFORE certificate
+    # so it's available in values.data during certificate validation
+    certificatePassword: Union[str, None] = Field(None)
+
+    certificate: Annotated[str, Field(validate_default=True)] = Field("")
+
+    @field_validator("certificate")
+    @classmethod
+    def _validate_certificate(cls, val, values, **kwargs):
+        """Validate certificate and authenticate."""
+        values = values.data
+        if "vaultUrl" not in values:
+            raise ValueError("Vault URL is required.")
+        if "tenantId" not in values:
+            raise ValueError("Tenant ID is required.")
+        if "clientId" not in values:
+            raise ValueError("Client ID is required.")
+        if "authMethod" not in values:
+            raise ValueError("Authentication Method is required.")
+        if values.get("authMethod") == AzureAuthMethod.CERTIFICATE and not val:
+            raise ValueError("Certificate is required for Certificate authentication.")
+        elif values.get("authMethod") == AzureAuthMethod.CERTIFICATE:
+            @handle_azure_exceptions
+            def validate_auth():
+                from ..utils.proxy import get_proxy_params
+                from netskope.common.utils.secrets_manager import (
+                    _build_azure_client_for_validation,
+                )
+
+                proxy = get_proxy_params(
+                    SettingsDB(**connector.collection(Collections.SETTINGS).find_one({}))
+                )
+                _build_azure_client_for_validation(
+                    vault_url=values["vaultUrl"],
+                    tenant_id=values["tenantId"],
+                    client_id=values["clientId"],
+                    client_secret=None,
+                    certificate=val,
+                    certificate_password=values.get("certificatePassword"),
+                    proxy=proxy,
+                )
+                return val
+
+            return validate_auth()
+        return ""
+
+    @model_validator(mode="before")
+    def clear_fields(cls, values):
+        """Clear unused fields based on auth method."""
+        auth_method = values.get("authMethod")
+        if auth_method is None:
+            return values
+        if auth_method == AzureAuthMethod.CLIENT_SECRET:
+            values["certificate"] = ""
+            values["certificatePassword"] = None
+        elif auth_method == AzureAuthMethod.CERTIFICATE:
+            values["clientSecret"] = ""
+        return values
+
+
+class SecretsManagerAzureParamsDB(BaseModel):
+    """Azure Key Vault params for DB storage."""
+
+    provider: Literal["azure"] = "azure"
+    vaultUrl: str = Field(...)
+
+    @field_validator("vaultUrl")
+    def validate_vault_url(cls, v):
+        """Validate Azure Key Vault URL."""
+        try:
+            _ = AnyHttpUrl(v)
+        except Exception:
+            raise ValueError("Error: invalid or missing URL scheme for Vault URL")
+        return v
+
+    tenantId: str = Field(...)
+    clientId: str = Field(...)
+    authMethod: AzureAuthMethod = Field(...)
+    clientSecret: Union[str, None] = Field(None)
+    certificatePassword: Union[str, None] = Field(None)
+    certificate: Union[str, None] = Field(None)
+
+
+class SecretsManagerAzureParamsOut(BaseModel):
+    """Azure Key Vault params for API output (hides secrets)."""
+
+    provider: Literal["azure"] = "azure"
+    vaultUrl: str = Field(...)
+
+    @field_validator("vaultUrl")
+    def validate_vault_url(cls, v):
+        """Validate Azure Key Vault URL."""
+        try:
+            _ = AnyHttpUrl(v)
+        except Exception:
+            raise ValueError("Error: invalid or missing URL scheme for Vault URL")
+        return v
+
+    tenantId: str = Field(...)
+    clientId: str = Field(...)
+    authMethod: AzureAuthMethod = Field(...)
+    # Note: clientSecret and certificate are intentionally excluded
+
+
 def is_vault_used(value) -> bool:
     """Check if vault is used."""
     if isinstance(value, str) and value.startswith(SECRET_PREFIX):
@@ -493,18 +737,18 @@ class SecretsManagerSettings(BaseModel):
             return val
         connector = DBConnector()
         for repo in connector.collection(Collections.PLUGIN_REPOS).find({}):
-            if repo.get("password", "").startswith(SECRET_PREFIX):
+            if is_vault_used(repo.get("password")):
                 raise ValueError("Secrets manager can not be disabled while in use.")
         for tenant in connector.collection(Collections.NETSKOPE_TENANTS).find({}):
-            if (tenant.get("parameters", {}).get("v2token", "") or "").startswith(
-                SECRET_PREFIX
-            ) or (tenant.get("parameters", {}).get("token", "") or "").startswith(
-                SECRET_PREFIX
+            tenant_parameters = tenant.get("parameters", {})
+            if is_vault_used(tenant_parameters.get("v2token")) or is_vault_used(
+                tenant_parameters.get("token")
             ):
                 raise ValueError("Secrets manager can not be disabled while in use.")
         config_collections = (
             Collections.CONFIGURATIONS,
             Collections.CRE_CONFIGURATIONS,
+            Collections.CREV2_CONFIGURATIONS,
             Collections.ITSM_CONFIGURATIONS,
             Collections.CLS_CONFIGURATIONS,
             Collections.GRC_CONFIGURATIONS,
@@ -521,8 +765,10 @@ class SecretsManagerSettings(BaseModel):
         return val
 
     params: Union[
-        Annotated[SecretsManagerHashicorpParams, Field(validate_default=True)], None
-    ] = Field(None)
+        Annotated[SecretsManagerHashicorpParams, Field(validate_default=True)],
+        Annotated[SecretsManagerAzureParams, Field(validate_default=True)],
+        None,
+    ] = Field(None, discriminator="provider")
 
     @field_validator("params")
     @classmethod
@@ -535,19 +781,82 @@ class SecretsManagerSettings(BaseModel):
             return None
         return v
 
+    @model_validator(mode="before")
+    def validate_provider_switch(cls, values):
+        """Validate that provider cannot be switched while secrets are in use."""
+        if not values.get("enabled"):
+            return values
+        new_provider = values.get("params", {}).get("provider") if values.get("params") else None
+        if not new_provider:
+            return values
+
+        # Get current settings from DB
+        connector = DBConnector()
+        current_settings = connector.collection(Collections.SETTINGS).find_one({})
+        if not current_settings:
+            return values
+
+        current_sm_settings = current_settings.get("secretsManagerSettings", {})
+        if not current_sm_settings.get("enabled"):
+            return values
+
+        current_provider = current_sm_settings.get("params", {}).get("provider")
+        if not current_provider or current_provider == new_provider:
+            return values
+
+        # Provider is being changed - check if secrets are in use
+        def check_secrets_in_use():
+            for repo in connector.collection(Collections.PLUGIN_REPOS).find({}):
+                if is_vault_used(repo.get("password")):
+                    return True
+            for tenant in connector.collection(Collections.NETSKOPE_TENANTS).find({}):
+                tenant_parameters = tenant.get("parameters", {})
+                if is_vault_used(tenant_parameters.get("v2token")) or is_vault_used(
+                    tenant_parameters.get("token")
+                ):
+                    return True
+            config_collections = (
+                Collections.CONFIGURATIONS,
+                Collections.CRE_CONFIGURATIONS,
+                Collections.CREV2_CONFIGURATIONS,
+                Collections.ITSM_CONFIGURATIONS,
+                Collections.CLS_CONFIGURATIONS,
+                Collections.GRC_CONFIGURATIONS,
+                Collections.EDM_CONFIGURATIONS,
+                Collections.CFC_CONFIGURATIONS,
+            )
+            for collection in config_collections:
+                for config in connector.collection(collection).find({}):
+                    for _, value in config.get("parameters", {}).items():
+                        if is_vault_used(value):
+                            return True
+            return False
+
+        if check_secrets_in_use():
+            raise ValueError(
+                f"Cannot switch secrets manager provider from '{current_provider}' to '{new_provider}' "
+                "while secrets are in use. Remove all secret references first."
+            )
+
+        return values
+
 
 class SecretsManagerSettingsDB(BaseModel):
     """Secrets manager related settings."""
 
     enabled: bool = Field(False)
-    params: Union[SecretsManagerHashicorpParamsDB, None] = Field(None)
+    params: Union[
+        SecretsManagerHashicorpParamsDB, SecretsManagerAzureParamsDB, None
+    ] = Field(None, discriminator="provider")
 
 
 class SecretsManagerSettingsOut(BaseModel):
     """Secrets manager related settings."""
 
     enabled: bool = Field(False)
-    params: Union[SecretsManagerHashicorpParamsOut, None] = Field(None)
+    params: Union[
+        SecretsManagerHashicorpParamsOut, SecretsManagerAzureParamsOut, None
+    ] = Field(None, discriminator="provider")
 
 
 class PasswordPolicySettings(BaseModel):
@@ -598,6 +907,13 @@ class PasswordPolicySettings(BaseModel):
         return v
 
 
+class CertExpiry(BaseModel):
+    """Certificate expiry information."""
+
+    ui: Union[datetime, None] = Field(None)
+    mongodb_rabbitmq: Union[datetime, None] = Field(None)
+
+
 class SettingsOut(BaseModel):
     """The outgoing settings model."""
 
@@ -638,6 +954,7 @@ class SettingsOut(BaseModel):
     pluginsUpdatedAt: Union[datetime, None] = Field(None)
     tourCompleted: Dict[str, bool] = Field(None)
     passwordPolicy: PasswordPolicySettings = Field(PasswordPolicySettings())
+    certExpiry: Union[CertExpiry, None] = Field(None)
 
 
 class BeatStatusSettings(BaseModel):

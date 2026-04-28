@@ -55,19 +55,20 @@ def _make_rabbitmq_api_call_helper(rabbitmq_url, endpoint):
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=0.1)
     session.mount("https://", IgnoreHostnameAdapter(max_retries=retries))
-    success, response = handle_exception(
-        session.get,
-        custom_message="Error occurred while connecting to rabbitmq server.",
-        error_code="CE_1123",
-        log_level="debug",
-        url=url,
-        auth=(parsed_url.username, unquote_plus(parsed_url.password)),
-        proxies=proxies,
-        timeout=30,
-    )
-
-    import urllib3.connection
-    urllib3.connection.match_hostname = g_orig_match_hostname
+    try:
+        success, response = handle_exception(
+            session.get,
+            custom_message="Error occurred while connecting to rabbitmq server.",
+            error_code="CE_1123",
+            log_level="debug",
+            url=url,
+            auth=(parsed_url.username, unquote_plus(parsed_url.password)),
+            proxies=proxies,
+            timeout=30,
+        )
+    finally:
+        import urllib3.connection
+        urllib3.connection.match_hostname = g_orig_match_hostname
 
     if not success:
         raise response

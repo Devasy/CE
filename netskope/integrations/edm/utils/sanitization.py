@@ -16,6 +16,7 @@ class EdmSetting(object):
     TAG_NORM_IDS = 'normalize-ids'
     TAG_PRIM_2ND_IDS = 'primary-secondary-ids'
     TAG_STOPWORDS = 'stopwords'
+    TAG_REMOVE_QUOTES = 'remove-quotes'
 
     def __init__(self, json_cfg):
         """Init method."""
@@ -54,6 +55,12 @@ class EdmSetting(object):
         """Get if csv file has column headers."""
         if self.TAG_HAS_COL_HDR in self.json_cfg:
             return self.json_cfg[self.TAG_HAS_COL_HDR]
+        return False
+
+    def get_remove_quotes(self):
+        """Return True when CSV rows are fully quoted."""
+        if self.TAG_REMOVE_QUOTES in self.json_cfg:
+            return self.json_cfg[self.TAG_REMOVE_QUOTES]
         return False
 
     def get_lower_case_names(self):
@@ -189,9 +196,11 @@ def setup_columns_from_csv_file(filename, jcfg):
 
             with open(filename, 'r', encoding="UTF-8") as file_pointer:
                 hdr = file_pointer.readline()
+                use_quote_all = jcfg.get(EdmSetting.TAG_REMOVE_QUOTES, False)
+                quoting_mode = csv.QUOTE_ALL if use_quote_all else csv.QUOTE_NONE
                 data = csv.reader([hdr],
                                   delimiter=delim,
-                                  quoting=csv.QUOTE_NONE)
+                                  quoting=quoting_mode)
 
                 if data:
                     for row in data:
@@ -347,7 +356,7 @@ class EdmInputProcessor(object):
         """
         return self.setting
 
-    def write_row_to_file(self, outfile, delim, row):
+    def write_row_to_file(self, outfile, delim, row, quoting_mode=csv.QUOTE_NONE):
         """
         Write a row to a file with replacement row data.
 
@@ -355,14 +364,15 @@ class EdmInputProcessor(object):
         :param delim: csv file delimiter to use
         :param row: row data
         """
-        data = ''
-        i = 0
-        for cell in row:
-            if i > 0:
-                data += delim
+        cells = []
+        if quoting_mode == csv.QUOTE_ALL:
+            for cell in row:
+                escaped = cell.replace('"', '""')
+                cells.append(f'"{escaped}"')
+        else:
+            cells = row
 
-            data += cell
-            i += 1
+        data = delim.join(cells)
 
         outfile.write(data.encode('utf-8'))
         outfile.write(b'\n')
@@ -410,6 +420,8 @@ class EdmInputProcessor(object):
         encoding = self.setting.get_encoding()
         name_cols = self.setting.get_name_columns()
         num_cols = self.setting.get_id_columns()
+        quoting_mode = (csv.QUOTE_ALL if self.setting.get_remove_quotes()
+                        else csv.QUOTE_NONE)
 
         if len(outfile) > 0:
             goodfile = open(outfile+".good", "wb")
@@ -436,7 +448,7 @@ class EdmInputProcessor(object):
 
             data = csv.reader(char_encoder(file_pointer, encoding),
                               delimiter=delim,
-                              quoting=csv.QUOTE_NONE)
+                              quoting=quoting_mode)
 
             if data:
                 for row in data:
@@ -482,7 +494,7 @@ class EdmInputProcessor(object):
                         self.row_stats.total_modified += 1
 
                     # now write to good file
-                    self.write_row_to_file(goodfile, delim, row)
+                    self.write_row_to_file(goodfile, delim, row, quoting_mode)
 
         goodfile.close()
         badfile.close()

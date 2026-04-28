@@ -188,6 +188,14 @@ async def create_repo(
     try:
         repo_exists = connector.collection(Collections.PLUGIN_REPOS).find_one({"name": repo.name})
         repo_exists = repo_exists is not None
+
+        # Validate the new configuration before applying it
+        is_accessible, error_msg = manager.validate_repo_accessibility(repo)
+        if not is_accessible:
+            logger.error(f"Repository accessibility validation failed for {repo.name}.", details=error_msg)
+            raise HTTPException(400, error_msg)
+
+        # Now update the remote URL with validated credentials
         if manager.add_repo(repo, repo_exists=repo_exists):
             connector.collection(Collections.PLUGIN_REPOS).insert_one(
                 repo.model_dump()
@@ -199,6 +207,8 @@ async def create_repo(
                 400,
                 "Error occurred while adding plugin repository. Check logs.",
             )
+    except HTTPException:
+        raise
     except Exception:
         logger.error(
             f"Error occurred while adding {repo.name} plugin repository.",
@@ -217,7 +227,7 @@ async def update_repo(
         get_current_user, scopes=["settings_read", "settings_write"]
     ),
 ) -> PluginRepoOut:
-    """Create new plugin repo."""
+    """Update existing plugin repo."""
     plugin_repo = PluginRepo(
         **connector.collection(Collections.PLUGIN_REPOS).find_one(
             {"name": repo.name}
@@ -225,13 +235,31 @@ async def update_repo(
     )
     if repo.url != plugin_repo.url:
         raise HTTPException(403, "Repository url cannot be updated.")
-    origin_update, valid_creds = manager.update(repo, validate_creds=True)
-    if not (origin_update and valid_creds):
-        if origin_update and not valid_creds:
-            manager.update(plugin_repo)  # Reset Git creds
-        raise HTTPException(
-            400, "Error occurred while updating plugin repository. Check logs."
-        )
+
+    # Check if credentials or repo type changed
+    creds_changed = (
+        repo.repoType != plugin_repo.repoType or
+        (repo.repoType == "private" and (
+            repo.username != plugin_repo.username or
+            (repo.password and repo.password != plugin_repo.password)
+        ))
+    )
+
+    # Always validate if credentials or repo type changed
+    if creds_changed:
+        # Validate the new configuration before applying it
+        is_accessible, error_msg = manager.validate_repo_accessibility(repo)
+        if not is_accessible:
+            logger.error(f"Repository accessibility validation failed for {repo.name}.", details=error_msg)
+            raise HTTPException(400, error_msg)
+
+        # Now update the remote URL with validated credentials
+        origin_update, _ = manager.update(repo, validate_creds=False)
+        if not origin_update:
+            raise HTTPException(
+                400, "Error occurred while updating plugin repository. Check logs."
+            )
+
     updates = repo.model_dump()
     updates["updates"] = {"action": "update_repo"}
     connector.collection(Collections.PLUGIN_REPOS).update_one(
@@ -589,6 +617,8 @@ async def _disable_configurations(
                     metadata.get("configuration"),
                     plugin
                 ),
+                "active": configuration["active"],
+                "tenant": configuration["tenant"],
             }
         )
         await update_edm_configuration(
@@ -615,6 +645,7 @@ async def _disable_configurations(
                     plugin
                 ),
                 "active": configuration["active"],
+                "tenant": configuration["tenant"],
             }
         )
         await update_cfc_configuration(

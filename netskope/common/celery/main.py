@@ -39,11 +39,22 @@ try:
     ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
     ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
 
-    ssl_context.load_cert_chain(
-        certfile='/opt/certs/mongodb_rabbitmq_certs/tls_cert.crt',
-        keyfile='/opt/certs/mongodb_rabbitmq_certs/tls_cert_key.key'
+    # Restrict to secure ECDHE-based cipher suites for TLS 1.2/1.3
+    ssl_context.set_ciphers(
+        "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:"
+        "TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
     )
-    ssl_context.load_verify_locations('/opt/certs/mongodb_rabbitmq_certs/tls_cert_ca.crt')
+
+    ssl_context.load_cert_chain(
+        certfile="/opt/certs/mongodb_rabbitmq_certs/tls_cert.crt",
+        keyfile="/opt/certs/mongodb_rabbitmq_certs/tls_cert_key.key",
+    )
+    ssl_context.load_verify_locations(
+        "/opt/certs/mongodb_rabbitmq_certs/tls_cert_ca.crt"
+    )
 
     BROKER = os.environ["RABBITMQ_CONNECTION_STRING"]
     BACKEND = BROKER.replace("amqps://", "rpc://").replace("amqp://", "rpc://")
@@ -141,7 +152,7 @@ try:
             routing_key=RABBITMQ_QUORUM_QUEUE_NAME.format(i),
             durable=True,
             queue_arguments={"x-queue-type": "quorum"},
-            exchange=Exchange('CE_EXCHANGE', type='topic')
+            exchange=Exchange("CE_EXCHANGE", type="topic"),
         )
         for i in [3, 6, 9]
     ]

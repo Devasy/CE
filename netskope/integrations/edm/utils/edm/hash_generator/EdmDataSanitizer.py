@@ -15,6 +15,8 @@ import re
 import json
 import argparse
 
+CSV_QUOTE_MODE = csv.QUOTE_NONE
+
 
 class EdmSetting(object):
     """
@@ -25,6 +27,7 @@ class EdmSetting(object):
     TAG_DELIMITER = 'delimiter'
     TAG_ENCODING = 'encoding'
     TAG_HAS_COL_HDR = 'has-column-header'
+    TAG_REMOVE_QUOTES = 'remove-quotes'
     TAG_NAMES_LOWERCASE = 'names-lowercase'
     TAG_IDS_STRIP_ZERO = 'ids-strip-leading-zeros'
     TAG_NORM_IDS = 'normalize-ids'
@@ -76,6 +79,14 @@ class EdmSetting(object):
         """
         if self.TAG_HAS_COL_HDR in self.jsonCfg:
             return self.jsonCfg[self.TAG_HAS_COL_HDR]
+        return False
+
+    def getRemoveQuotes(self):
+        """
+            get if csv file has quotes to remove
+        """
+        if self.TAG_REMOVE_QUOTES in self.jsonCfg:
+            return self.jsonCfg[self.TAG_REMOVE_QUOTES]
         return False
 
     def getLowerCaseNames(self):
@@ -274,7 +285,7 @@ def setupColumnsFromCsvFile(filename, jcfg):
                 hdr = f.readline()
                 data = csv.reader([hdr],
                                 delimiter=delim,
-                                quoting=csv.QUOTE_NONE)
+                                quoting=CSV_QUOTE_MODE)
 
                 if data:
                     for row in data:
@@ -494,6 +505,11 @@ class EdmInputChecker(object):
         numCols = self.setting.geIdColumns()
         prim2ndCols = self.setting.getPrimary2ndColumns()
 
+        quoting = CSV_QUOTE_MODE
+        removeQuotes = self.setting.getRemoveQuotes()
+        if removeQuotes:
+            quoting = csv.QUOTE_ALL
+
         with open(filename, 'rb') as f:
 
             # if first row is column, remember and skip
@@ -504,7 +520,7 @@ class EdmInputChecker(object):
 
             data = csv.reader(char_encoder(f, encoding),
                               delimiter=delim,
-                              quoting=csv.QUOTE_NONE)
+                              quoting=quoting)
 
             if data:
                 for row in data:
@@ -703,6 +719,11 @@ class EdmInputProcessor(object):
         nameCols = self.setting.getNameColumns()
         numCols = self.setting.geIdColumns()
 
+        quoting = CSV_QUOTE_MODE
+        removeQuotes = self.setting.getRemoveQuotes()
+        if removeQuotes:
+            quoting = csv.QUOTE_ALL
+
         if len(outfile) > 0:
             goodfile = open(outfile+".good", "wb")
             badfile = open(outfile+".bad", "wb")
@@ -728,7 +749,7 @@ class EdmInputProcessor(object):
 
             data = csv.reader(char_encoder(f, encoding),
                               delimiter=delim,
-                              quoting=csv.QUOTE_NONE)
+                              quoting=quoting)
 
             if data:
                 for row in data:

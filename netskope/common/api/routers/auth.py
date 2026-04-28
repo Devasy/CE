@@ -195,7 +195,7 @@ class OAuth2PasswordRequestForm:
 
     def __init__(
         self,
-        grant_type: str = Form("password", regex="password|client_credentials"),
+        grant_type: str = Form("password", pattern="password|client_credentials"),
         username: str = Form(None),
         password: str = Form(None),
         client_id: str = Form(None),

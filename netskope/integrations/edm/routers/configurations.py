@@ -31,6 +31,10 @@ from ..models import (
     ConfigurationUpdate,
     ConfigurationNameValidationIn,
 )
+from ..models.plugin import (
+    find_active_zip_name_conflict,
+    get_zip_name_from_configuration,
+)
 from ..plugin_base import PluginBase, ValidationResult
 from ..utils import FILE_PATH, MANUAL_UPLOAD_PATH, UPLOAD_PATH
 from netskope.integrations import trim_space_parameters_fields
@@ -46,7 +50,7 @@ def log_changes(configuration, updated_configuration):
     """Log changes based on the incoming request."""
     if configuration.active is not None:
         logger.debug(
-            f"Configuration '{configuration.name}' is {'enabled' if configuration.active else 'disabled'}."
+            f"Configuration '{configuration.name}' is {'enabled' if updated_configuration.active else 'disabled'}."
         )
     if configuration.pollInterval or configuration.pollIntervalUnit:
         logger.debug(
@@ -235,14 +239,15 @@ def _clean_sample_files(
                     )
                     files_list = ["sample.csv", "sample.good", "sample.bad"]
                 elif source_type == "manual_upload":
-                    csv_name = os.path.splitext(configuration["fileName"])[0]
+                    csv_name = configuration["fileName"]
+                    csv_name_prefix = os.path.splitext(configuration["fileName"])[0]
                     logger.debug(
-                        f"Deleting sample file(s) for manual uploaded file: {csv_name}.csv"
+                        f"Deleting sample file(s) for manual uploaded file: {csv_name}."
                     )
                     files_list = [
-                        f"sample_{csv_name}.csv",
-                        f"sample_{csv_name}.good",
-                        f"sample_{csv_name}.bad",
+                        f"sample_{csv_name}",
+                        f"sample_{csv_name_prefix}.good",
+                        f"sample_{csv_name_prefix}.bad",
                     ]
                 deleted_files_list = []
                 for filename in files_list:
@@ -521,7 +526,7 @@ def _validate_configuration_step(step, configuration):
     try:
         return plugin.validate_step(step)
     except Exception as e:
-        logger.info(
+        logger.error(
             f"Exception occurred while executing validate for step {step}",
             details=traceback.format_exc(),
             error_code="EDM_1043",
@@ -545,7 +550,7 @@ def _validate_entire_configuration(plugin, configuration):
         try:
             result = plugin.validate_step(step)
         except Exception as e:
-            logger.info(
+            logger.error(
                 f"Exception occurred while executing validate for step {step}",
                 details=traceback.format_exc(),
                 error_code="EDM_1044",
@@ -677,6 +682,20 @@ async def update_configuration(
 
     # validate configuration if active
     if updated_configuration.active is True:
+        if not configuration_db_dict["active"]:
+            conflict_name = find_active_zip_name_conflict(
+                updated_configuration.name,
+                exclude_config=updated_configuration.name,
+            )
+            if conflict_name:
+                zip_name = get_zip_name_from_configuration(updated_configuration.name)
+                raise HTTPException(
+                    400,
+                    (
+                        f"Cannot enable configuration '{updated_configuration.name}' because "
+                        f"active configuration '{conflict_name}' already uses EDM zip '{zip_name}'."
+                    ),
+                )
         plugin = PluginClass(
             configuration.name,
             SecretDict(updated_configuration.parameters),

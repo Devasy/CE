@@ -27,6 +27,7 @@ class EntityFieldType(str, Enum):
     NUMBER = "number"
     LIST = "list"
     DATETIME = "datetime"
+    BOOLEAN = "boolean"
     CALCULATED = "calculated"
     IPV4 = "ipv4"
     IPV6 = "ipv6"
@@ -48,10 +49,16 @@ class ReferenceTypeParams(BaseModel):
 class CalculatedTypeParams(BaseModel):
     """Calculated type parameters."""
 
-    expression: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=1)
-    ]
+    expression: Annotated[str, StringConstraints(strip_whitespace=True)]
     dependencies: list[str] = Field([], validate_default=True)
+
+    @field_validator("expression")
+    @classmethod
+    def validate_expression(cls, value: str) -> str:
+        """Validate presence of expression with a friendly message."""
+        if not value or not value.strip():
+            raise ValueError("Calculated fields require an expression.")
+        return value
 
     @field_validator("dependencies")
     @classmethod
@@ -60,9 +67,7 @@ class CalculatedTypeParams(BaseModel):
         if not info.data.get("expression", "").strip():
             return []
         try:
-            parsed_expr = parser.parse(
-                info.data["expression"].replace("$", "")
-            )
+            parsed_expr = parser.parse(info.data["expression"].replace("$", ""))
         except Exception:
             raise ValueError("Invalid expression provided.")
         return parsed_expr.variables()
@@ -125,7 +130,18 @@ class RangeMapTypeParams(BaseModel):
     field: str
 
 
-# END Type params
+class NormalizedType(str, Enum):
+    """Normalized String types."""
+
+    LOWER = "lowercase"
+    UPPER = "uppercase"
+    TITLE = "titlecase"
+
+
+class NormalizedTypeParams(BaseModel):
+    """Normalized String parameters."""
+
+    normalization: Union[None, NormalizedType]
 
 
 class EntityTypeCoalesceStrategy(str, Enum):
@@ -147,6 +163,7 @@ class EntityField(BaseModel):
         ReferenceTypeParams,
         ValueMapTypeParams,
         RangeMapTypeParams,
+        NormalizedTypeParams,
     ]
     unique: bool
     coalesceStrategy: Optional[EntityTypeCoalesceStrategy]
@@ -154,8 +171,18 @@ class EntityField(BaseModel):
     @validator("coalesceStrategy")
     def validate_coalesce_strategy(cls, v, values, **kwargs):
         """Validate that strategy is provided if unique is set to False."""
-        if values["unique"]:
+        if values["unique"] or values.get("type") == EntityFieldType.BOOLEAN:
             return None
+        if (
+            values.get("type") == EntityFieldType.STRING
+            and values.get("params")
+            and values.get("params").normalization is not None
+        ) or values.get("type") in [
+            EntityFieldType.VALUE_MAP_NUMBER,
+            EntityFieldType.VALUE_MAP_STRING,
+            EntityFieldType.RANGE_MAP,
+        ]:
+            return v
         if not values["unique"] and v is None:
             raise ValueError(
                 "coalesceStrategy must be provided if unique is set to False."
@@ -173,7 +200,9 @@ class EntityFieldIn(BaseModel):
     @classmethod
     def validate_name(cls, v, info: ValidationInfo):
         """Validate that name is unique."""
-        return ("_".join(info.data["label"].strip().lower().split(" "))).replace(".", "_")
+        return ("_".join(info.data["label"].strip().lower().split(" "))).replace(
+            ".", "_"
+        )
 
     type: EntityFieldType
     params: Union[
@@ -182,6 +211,7 @@ class EntityFieldIn(BaseModel):
         ReferenceTypeParams,
         ValueMapTypeParams,
         RangeMapTypeParams,
+        NormalizedTypeParams,
     ] = None
     unique: bool
     coalesceStrategy: Optional[EntityTypeCoalesceStrategy]
@@ -189,8 +219,18 @@ class EntityFieldIn(BaseModel):
     @validator("coalesceStrategy")
     def validate_coalesce_strategy(cls, v, values, **kwargs):
         """Validate that strategy is provided if unique is set to False."""
-        if values["unique"]:
+        if values["unique"] or values.get("type") == EntityFieldType.BOOLEAN:
             return None
+        if (
+            values.get("type") == EntityFieldType.STRING
+            and values.get("params")
+            and values.get("params").normalization is not None
+        ) or values.get("type") in [
+            EntityFieldType.VALUE_MAP_NUMBER,
+            EntityFieldType.VALUE_MAP_STRING,
+            EntityFieldType.RANGE_MAP,
+        ]:
+            return v
         if not values["unique"] and v is None:
             raise ValueError(
                 "coalesceStrategy must be provided if unique is set to False."
@@ -220,13 +260,9 @@ class EntityIn(BaseModel):
     def validate_name(cls, v):
         """Validate that name is unique."""
         if not re.match(r"^[a-zA-Z ]+$", v):
-            raise ValueError(
-                "Only alphabets and spaces are allowed in entity name."
-            )
+            raise ValueError("Only alphabets and spaces are allowed in entity name.")
         if (
-            connector.collection(Collections.CREV2_ENTITIES).find_one(
-                {"name": v}
-            )
+            connector.collection(Collections.CREV2_ENTITIES).find_one({"name": v})
             is not None
         ):
             raise ValueError(f"Entity with name '{v}' already exists.")
@@ -269,9 +305,7 @@ class EntityUpdate(BaseModel):
         """Validate that name is unique."""
         v = v.strip()
         if (
-            connector.collection(Collections.CREV2_ENTITIES).find_one(
-                {"name": v}
-            )
+            connector.collection(Collections.CREV2_ENTITIES).find_one({"name": v})
             is None
         ):
             raise ValueError(f"Entity with name '{v}' does not exist.")
@@ -306,7 +340,5 @@ class EntityUpdate(BaseModel):
 def get_entity_by_name(entity: str) -> Entity:
     """Get entity from name."""
     return Entity(
-        **connector.collection(Collections.CREV2_ENTITIES).find_one(
-            {"name": entity}
-        )
+        **connector.collection(Collections.CREV2_ENTITIES).find_one({"name": entity})
     )

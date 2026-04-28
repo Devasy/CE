@@ -67,7 +67,7 @@ def historical_appdata(
         {"name": tenant_name}
     )
     if tenant is None:
-        logger.info(
+        logger.error(
             f"Tenant with name '{tenant_name}' no longer exists. Skipping historical appdata pulling task.",
             error_code="ARE_1023",
         )

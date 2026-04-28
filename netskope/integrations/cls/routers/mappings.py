@@ -183,6 +183,8 @@ async def update_mapping_file(
 
 
 @router.get("/transformationFields", tags=["CLS Mapping Files"])
-def get_transformation_field():
+def get_transformation_field(
+    user: User = Security(get_current_user, scopes=["cls_read"]),
+):
     """Get tranformation field."""
     return transformation

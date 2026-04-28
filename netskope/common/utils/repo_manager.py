@@ -114,12 +114,15 @@ class RepoManager(metaclass=Singleton):
                 self._repos.append(repo)
         else:
             self.logger.debug(f"Cloning new plugin repo {repo.name}.")
-            url = urlparse(str(repo.url))
-            from . import resolve_secret
+            url = str(repo.url)
 
-            url = url._replace(
-                netloc=f"{quote_plus(repo.username)}:{quote_plus(resolve_secret(repo.password))}@{url.netloc}"
-            ).geturl()
+            # For private repos, add authentication to URL
+            if repo.repoType == "private" and repo.username and repo.password:
+                from . import resolve_secret
+                parsed_url = urlparse(url)
+                auth = f"{quote_plus(repo.username)}:{quote_plus(resolve_secret(repo.password))}"
+                url = parsed_url._replace(netloc=f"{auth}@{parsed_url.netloc}").geturl()
+
             clone_process = Popen(
                 ["git", "clone", f"{url}", "-q", "--", self.get_dir(repo)],
                 stdin=PIPE,
@@ -563,7 +566,11 @@ class RepoManager(metaclass=Singleton):
         return True
 
     def validate_git_credentials(self, repo: PluginRepo) -> bool:
-        """Validate git credentials."""
+        """Validate git credentials after remote URL has been updated.
+
+        This validates that the repository is accessible with the configured credentials.
+        Works for both public and private repos to catch misconfigurations.
+        """
         proc_update = Popen(
             ["git", "fetch"],
             cwd=self.get_dir(repo),
@@ -576,22 +583,79 @@ class RepoManager(metaclass=Singleton):
             self.logger.error(
                 f"Max retry exceeded while validating credentials for repo {repo.name}."
             )
+            return False
         if proc_update.returncode != 0:
+            stderr_msg = stderr.decode("utf-8") if stderr else ""
             self.logger.error(
-                f"Error occrred while validating credentials for repo {repo.name}."
+                f"Error occurred while validating credentials for repo {repo.name}."
             )
-            self.logger.error(stderr)
+            self.logger.error(stderr_msg)
             return False
         return True
 
+    def validate_repo_accessibility(self, repo: PluginRepo) -> tuple[bool, str]:
+        """Validate repository accessibility before cloning or updating.
+
+        For private repositories we first ensure the URL isn't publicly accessible,
+        then verify the provided credentials work.
+        """
+        url = str(repo.url)
+
+        # For private repositories, ensure credentials are provided and embed them in the URL.
+        if repo.repoType == "private":
+            if repo.username and repo.password:
+                from . import resolve_secret
+
+                parsed_url = urlparse(url)
+                auth = f"{quote_plus(repo.username)}:{quote_plus(resolve_secret(repo.password))}"
+                url = parsed_url._replace(netloc=f"{auth}@{parsed_url.netloc}").geturl()
+            else:
+                return (
+                    False,
+                    "Username and password are required for private repositories.",
+                )
+
+        proc_check = Popen(
+            ["git", "ls-remote", url, "HEAD"],
+            stdout=PIPE,
+            stderr=PIPE,
+        )
+        try:
+            _, stderr = popen_retry_mount(proc_check, False)
+        except MaxRetryExceededException:
+            self.logger.error(
+                f"Max retry exceeded while validating repository accessibility for {repo.name}."
+            )
+            return (
+                False,
+                "Repository validation timed out. Please check the URL and try again.",
+            )
+
+        if proc_check.returncode != 0:
+            if repo.repoType == "private":
+                return (
+                    False,
+                    "Invalid credentials or repository not accessible. Please check username, password, and URL.",
+                )
+            return (
+                False,
+                "Repository not accessible. Please check the URL or provide credentials if it's a private repository.",
+            )
+
+        return True, ""
+
     def update(self, repo: PluginRepo, validate_creds=False) -> tuple[bool, bool]:
         """Update plugin repo."""
-        from . import resolve_secret
+        url = str(repo.url)
 
-        url = urlparse(str(repo.url))
-        url = url._replace(
-            netloc=f"{quote_plus(repo.username)}:{quote_plus(resolve_secret(repo.password))}@{url.netloc}"
-        ).geturl()
+        # For private repos, add authentication to URL
+        if repo.repoType == "private" and repo.username and repo.password:
+            from . import resolve_secret
+            parsed_url = urlparse(url)
+            url = parsed_url._replace(
+                netloc=f"{quote_plus(repo.username)}:{quote_plus(resolve_secret(repo.password))}@{parsed_url.netloc}"
+            ).geturl()
+
         proc_update = Popen(
             ["git", "remote", "set-url", "origin", url],
             cwd=self.get_dir(repo),

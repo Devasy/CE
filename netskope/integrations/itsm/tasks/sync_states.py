@@ -50,8 +50,8 @@ def _end_life(name, success):
         {"name": name},
         {
             "$set": {
-                "lastRunAt": datetime.now(),
-                "lastRunSuccess": success,
+                "lastRunAt.sync": datetime.now(),
+                "lastRunSuccess.sync": success,
             }
         },
     )
@@ -159,7 +159,7 @@ def sync_states(name: str):
 
     PluginClass = helper.find_by_id(configuration.plugin)  # NOSONAR
     if PluginClass is None:
-        logger.info(
+        logger.error(
             f"Plugin with ID {configuration.plugin} does not exist. Skipping itsm.sync_states task.",
             error_code="CTO_1018",
         )

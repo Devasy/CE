@@ -320,7 +320,7 @@ def manual_upload_task(config_id: str, configuration_name: str):
                 classifier_id=classifierID,
                 classifier_name=classifierName,
                 training_type=trainingType,
-                status=StatusType.COMPLETED,
+                status=StatusType.SUCCESS,
                 update_last_shared=True,
             )
             if invalid_same_files:
@@ -330,16 +330,23 @@ def manual_upload_task(config_id: str, configuration_name: str):
                     classifier_name=classifierName,
                     training_type=trainingType,
                     destination_plugin_name=destination,
-                    status=StatusType.COMPLETED,
+                    status=StatusType.SUCCESS,
                     update_last_shared=False,
                 )
+
+            # Refresh config to get updated file statuses after all updates
+            updated_config = connector.collection(
+                Collections.CFC_MANUAL_UPLOAD_CONFIGURATIONS
+            ).find_one({"_id": manual_upload_config.get("_id")})
+            updated_files = updated_config.get("files", [])
+
+            # Calculate final status based on individual file outcomes
+            final_status_value = CFCFileUtils.calculate_status_from_files(updated_files)
+            final_status = StatusType(final_status_value)
+
             _update_config_status(
                 config_id=manual_upload_config.get("_id"),
-                status=(
-                    StatusType.COMPLETED
-                    if not pending_upload
-                    else StatusType.PARTIALLY_COMPLETED
-                ),
+                status=final_status,
             )
             _update_error_state(
                 configuration_name, error_state["error"], error_state["errorMessage"]

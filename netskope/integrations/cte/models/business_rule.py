@@ -1,7 +1,7 @@
 """Business rule related schemas."""
 import json
 from datetime import datetime
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Optional
 from pydantic import field_validator, StringConstraints, BaseModel, Field
 from jsonschema import validate, ValidationError
 from netskope.common.utils import (
@@ -225,6 +225,7 @@ class ActionWithoutParams(BaseModel):
 
     label: str
     value: str
+    patch_supported: Optional[bool] = None
 
 
 class Filters(BaseModel):

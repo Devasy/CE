@@ -29,8 +29,13 @@ from ..models import (
     EntityTypeCoalesceStrategy,
     EntityMappingField,
     get_entity_by_name,
+    NormalizedType
 )
-from .evaluate_records import evaluate_records
+from .evaluate_records import (
+    evaluate_records,
+    _get_normalized_field_value,
+    _get_normalized_fields
+)
 
 RECORDS_BATCH_SIZE = 1000
 MAX_ENTITY_SIZE_WITH_VALUE_MAP = 14 * 1024 * 1024  # More than 14MB
@@ -58,6 +63,7 @@ def fetch_records(
     sub_type: str = None,
 ):
     """Fetch records from third party plugins."""
+    initial_record_ids: dict[str, list] = {}
     try:
         logger.debug(f"Starting fetching records for {configuration}.")
         configuration_db = _get_configuration(configuration)
@@ -69,32 +75,41 @@ def fetch_records(
                     f"name {configuration}."
                 ),
             }
-        configuration = configuration_db
-        plugin = _get_plugin(configuration)
+        plugin = _get_plugin(configuration_db)
         if not plugin:
-            _end_life(configuration.name, False)
+            _end_life(configuration_db.name, False)
             return {
                 "success": False,
-                "message": f"Plugin {configuration.plugin} does not exist.",
+                "message": f"Plugin {configuration_db.plugin} does not exist.",
             }
-        if not configuration.active:
-            logger.debug(f"{configuration.name} is not active.")
+        if not configuration_db.active:
+            logger.debug(f"{configuration_db.name} is not active.")
             return {
                 "success": False,
-                "message": f"{configuration.name} is not active.",
+                "message": f"{configuration_db.name} is not active.",
             }
         if isinstance(data, bytes):
             data = (
-                parse_events(data, tenant_config_name=configuration.tenant, data_type=data_type, sub_type=sub_type)
-                if configuration.tenant
-                else parse_events(data, configuration=configuration, data_type=data_type, sub_type=sub_type)
+                parse_events(
+                    data,
+                    tenant_config_name=configuration_db.tenant,
+                    data_type=data_type,
+                    sub_type=sub_type,
+                )
+                if configuration_db.tenant
+                else parse_events(
+                    data,
+                    configuration=configuration_db,
+                    data_type=data_type,
+                    sub_type=sub_type,
+                )
             )
-        for mapped_entity in configuration.mappedEntities:
+        for mapped_entity in configuration_db.mappedEntities:
             logger.debug(
                 f"Fetching records for {mapped_entity.destination} "
-                f"from {configuration.name}."
+                f"from {configuration_db.name}."
             )
-            plugin.last_run_at = configuration.checkpoints.get(
+            plugin.last_run_at = configuration_db.checkpoints.get(
                 mapped_entity.entity
             )  # get the entity specific checkpoint
             if data:
@@ -109,14 +124,14 @@ def fetch_records(
                 success = False
                 logger.error(
                     f"Error occurred while fetching records for "
-                    f"{mapped_entity.destination} from {configuration.name}.",
+                    f"{mapped_entity.destination} from {configuration_db.name}.",
                     details=traceback.format_exc(),
                 )
-                _end_life(configuration.name, False)
+                _end_life(configuration_db.name, False)
             if success:
                 # update storage and checkpoint
                 connector.collection(Collections.CREV2_CONFIGURATIONS).update_one(
-                    {"name": configuration.name},
+                    {"name": configuration_db.name},
                     {
                         "$set": {
                             "storage": plugin.storage,
@@ -127,22 +142,22 @@ def fetch_records(
                 if not records:
                     logger.debug(
                         f"No new records found for {mapped_entity.destination} "
-                        f"from {configuration.name}."
+                        f"from {configuration_db.name}."
                     )
                     continue
                 logger.debug(
                     f"Fetched {len(records)} records for "
-                    f"{mapped_entity.destination} from {configuration.name}."
+                    f"{mapped_entity.destination} from {configuration_db.name}."
                 )
                 mapped_records = _map_records(records, mapped_entity.fields)
                 if not mapped_records:
                     continue
                 stored_records = _store_records(
-                    mapped_entity.destination, mapped_records
+                    mapped_entity.destination, mapped_records, configuration_db.name
                 )
                 logger.debug(
                     f"Stored {len(stored_records)} records for "
-                    f"{mapped_entity.destination} from {configuration.name}."
+                    f"{mapped_entity.destination} from {configuration_db.name}."
                 )
                 _update_calculated_fields(
                     mapped_entity.destination, mapped_entity.fields, stored_records
@@ -153,24 +168,30 @@ def fetch_records(
                 logger.debug(
                     f"Updated calculated fields for {mapped_entity.destination}."
                 )
-        _end_life(configuration.name, True)
+                if stored_records:
+                    initial_record_ids.setdefault(mapped_entity.destination, []).extend(
+                        record["_id"] for record in stored_records
+                    )
+        _end_life(configuration_db.name, True)
     except Exception:
         logger.error(
-            f"Error occurred while storing records for {configuration.name}.",
+            f"Error occurred while storing records for {configuration_db.name}.",
             details=traceback.format_exc(),
         )
-        _end_life(configuration.name, False)
-    logger.debug(f"Finished fetching records for {configuration.name}.")
-    if isinstance(configuration, ConfigurationDB) and not configuration.tenant:
+        _end_life(configuration, False)
+    logger.debug(f"Finished fetching records for {configuration_db.name}.")
+    if isinstance(configuration_db, ConfigurationDB) and not configuration_db.tenant:
         # is not a netskope configuration; do the update records
         try:
-            return update_records(configuration.name)
+            return update_records(
+                configuration_db.name,
+                initial_record_ids if initial_record_ids else None,
+            )
         except Exception:
             logger.error(
-                f"Error occurred while updating records for {configuration.name}.",
+                f"Error occurred while updating records for {configuration_db.name}.",
                 details=traceback.format_exc(),
             )
-
 
 def _update_mapped_fields(
     destination: str,
@@ -428,7 +449,7 @@ def _update_calculated_fields(
 
 def _get_unique_fields(entity: Entity) -> list[str]:
     """Get unique fields."""
-    return [field.name for field in filter(lambda x: x.unique, entity.fields)]
+    return [field for field in filter(lambda x: x.unique, entity.fields)]
 
 
 def _required_fields_exist(record: dict, fields: list[str]) -> bool:
@@ -451,7 +472,10 @@ def _required_fields_exist(record: dict, fields: list[str]) -> bool:
 @APP.task(name="cre.update_records", acks_late=False)
 @integration("cre")
 @track()
-def update_records(configuration: str):
+def update_records(
+    configuration: str,
+    initial_record_ids: Optional[dict[str, list]] = None,
+):
     """Update records."""
     logger.debug(f"Starting updating records for {configuration}.")
     configuration_db = _get_configuration(configuration)
@@ -462,25 +486,24 @@ def update_records(configuration: str):
                 f"Could not find CRE configuration with name {configuration}."
             ),
         }
-    configuration = configuration_db
-    plugin = _get_plugin(configuration)
+    plugin = _get_plugin(configuration_db)
     if not plugin:
-        _end_life(configuration.name, success=False)
+        _end_life(configuration_db.name, success=False)
         return {
             "success": False,
-            "message": f"Plugin {configuration.plugin} does not exist.",
+            "message": f"Plugin {configuration_db.plugin} does not exist.",
         }
-    if not configuration.active:
-        logger.debug(f"{configuration.name} is not active.")
+    if not configuration_db.active:
+        logger.debug(f"{configuration_db} is not active.")
         return {
             "success": False,
-            "message": f"{configuration.name} is not active.",
+            "message": f"{configuration_db.name} is not active.",
         }
     success = True
-    for mapped_entity in configuration.mappedEntities:
+    for mapped_entity in configuration_db.mappedEntities:
         logger.debug(
             f"Updating records for {mapped_entity.destination} "
-            f"from {configuration.name}."
+            f"from {configuration_db.name}."
         )
         plugin_entity = next(
             filter(
@@ -496,12 +519,15 @@ def update_records(configuration: str):
         field_mappings = {
             field.source: field.destination for field in mapped_entity.fields
         }
+        normalized_entity_fields = _get_normalized_fields(get_entity_by_name(mapped_entity.destination))
         records = connector.collection(
             f"{Collections.CREV2_ENTITY_PREFIX.value}{mapped_entity.destination}"
         ).find({}, {field_mappings[field]: True for field in required_fields})
         mapped_records = [
             {
-                source: record.get(destination)
+                source: _get_normalized_field_value(record.get(destination), configuration_db.name)
+                if destination in normalized_entity_fields
+                else record.get(destination)
                 for source, destination in field_mappings.items()
             }
             | {"_id": record["_id"]}
@@ -518,11 +544,19 @@ def update_records(configuration: str):
             logger.info(
                 f"Skipped {before_count - after_count} record(s) due to "
                 f"missing values for the required field(s) in "
-                f"{mapped_entity.destination} from {configuration.name}."
+                f"{mapped_entity.destination} from {configuration_db.name}."
             )
+        extra_record_ids = []
+        if initial_record_ids and mapped_entity.destination in initial_record_ids:
+            extra_record_ids = initial_record_ids.pop(mapped_entity.destination)
+
         try:
             records = plugin.update_records(
                 mapped_entity.entity, mapped_records
+            )
+            connector.collection(Collections.CREV2_CONFIGURATIONS).update_one(
+                {"name": configuration_db.name},
+                {"$set": {"storage": plugin.storage or {}}},
             )
         except Exception:
             success = False
@@ -533,12 +567,12 @@ def update_records(configuration: str):
             continue
         logger.debug(
             f"Fetched {len(records)} record updates for "
-            f"{mapped_entity.destination} from {configuration.name}."
+            f"{mapped_entity.destination} from {configuration_db.name}."
         )
         try:
             mapped_records = _map_records(records, mapped_entity.fields)
             stored_records = _store_records(
-                mapped_entity.destination, mapped_records
+                mapped_entity.destination, mapped_records, configuration_db.name
             )
             _update_calculated_fields(
                 mapped_entity.destination, mapped_entity.fields, stored_records
@@ -546,14 +580,21 @@ def update_records(configuration: str):
             _update_mapped_fields(
                 mapped_entity.destination, mapped_entity.fields, stored_records
             )
-            execute_celery_task(
-                evaluate_records.apply_async,
-                "cre.evaluate_records",
-                args=[
-                    mapped_entity.destination,
-                    list(map(lambda x: x["_id"], stored_records)),
-                ],
-            )
+            record_ids_to_evaluate: set = set(extra_record_ids)
+            if stored_records:
+                record_ids_to_evaluate.update(
+                    record["_id"] for record in stored_records
+                )
+
+            if record_ids_to_evaluate:
+                execute_celery_task(
+                    evaluate_records.apply_async,
+                    "cre.evaluate_records",
+                    args=[
+                        mapped_entity.destination,
+                        list(record_ids_to_evaluate),
+                    ],
+                )
 
         except Exception:
             success = False
@@ -562,11 +603,24 @@ def update_records(configuration: str):
                 details=traceback.format_exc(),
             )
 
-    _end_life(configuration.name, success=success)
+    _end_life(configuration_db.name, success=success)
     return {"success": success}
 
 
-def _store_records(destination: str, records: list) -> list[dict]:
+def get_normalized_value(value: Optional[str], normalized_type: NormalizedType) -> Optional[str]:
+    """Get normalized value."""
+    if not isinstance(value, str):
+        return value
+    if normalized_type == NormalizedType.LOWER:
+        return value.lower()
+    elif normalized_type == NormalizedType.UPPER:
+        return value.upper()
+    elif normalized_type == NormalizedType.TITLE:
+        return value.capitalize()
+    return value
+
+
+def _store_records(destination: str, records: list, config_name: str = None) -> list[dict]:
     """Store records in destination."""
     entity = get_entity_by_name(destination)
     updated_records = []
@@ -581,7 +635,81 @@ def _store_records(destination: str, records: list) -> list[dict]:
         for key, value in list(record.items()):
             if key not in fields:
                 continue
-            if fields[key].type == EntityFieldType.LIST:
+            if fields[key].type == EntityFieldType.STRING and fields[key].params and fields[key].params.normalization:
+
+                normalized_value = get_normalized_value(
+                    value,
+                    fields[key].params.normalization
+                )
+                set_fields[key] = {
+                    "$cond": {
+                        "if": {"$eq": [{"$ifNull": [f"${key}", None]}, None]},
+                        "then": {
+                            "value": normalized_value,
+                            "plugins": [{"config": config_name, "value": value}]
+                        },
+                        "else": {
+                            "value": {
+                                "$cond": {
+                                    "if": {"$eq": [{"$ifNull": [f"${key}.value", None]}, None]},
+                                    "then": normalized_value,
+                                    "else": f"${key}.value"
+                                }
+                            },
+                            "plugins": {
+                                "$let": {
+                                    "vars": {
+                                        "hasConfiguredPlugin": {
+                                            "$gt": [
+                                                {
+                                                    "$size": {
+                                                        "$filter": {
+                                                            "input": {"$ifNull": [f"${key}.plugins", []]},
+                                                            "as": "plugin",
+                                                            "cond": {"$eq": ["$$plugin.config", config_name]}
+                                                        }
+                                                    }
+                                                },
+                                                0
+                                            ]
+                                        }
+                                    },
+                                    "in": {
+                                        "$cond": {
+                                            "if": "$$hasConfiguredPlugin",
+                                            "then": {
+                                                "$map": {
+                                                    "input": f"${key}.plugins",
+                                                    "as": "plugin",
+                                                    "in": {
+                                                        "$cond": {
+                                                            "if": {"$eq": ["$$plugin.config", config_name]},
+                                                            "then": {"config": "$$plugin.config", "value": value},
+                                                            "else": "$$plugin"
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            "else": {
+                                                "$concatArrays": [
+                                                    {"$ifNull": [f"${key}.plugins", []]},
+                                                    [{"config": config_name, "value": value}]
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            elif fields[key].type == EntityFieldType.BOOLEAN:
+                if value is not None and not isinstance(value, bool):
+                    raise ValueError(
+                        f"Invalid value for {key}. Expected boolean, got {type(value).__name__}."
+                    )
+                set_fields[key] = value
+            elif fields[key].type == EntityFieldType.LIST:
                 if (
                     fields[key].coalesceStrategy
                     == EntityTypeCoalesceStrategy.MERGE
@@ -617,7 +745,14 @@ def _store_records(destination: str, records: list) -> list[dict]:
                 "_id": record["_id"]
             }  # _id is not needed in update; pop it
         else:
-            find = {field: record.get(field) for field in unique_fields}
+            find = {}
+            for field in unique_fields:
+                if field.type == EntityFieldType.STRING and field.params and field.params.normalization:
+                    find[f"{field.name}.value"] = get_normalized_value(
+                        record.get(field.name), field.params.normalization
+                    )
+                else:
+                    find[field.name] = record.get(field.name)
         if not find:
             # if no condition, a new record must be created.
             # `{}` will match with the first record which is not intentd.
@@ -754,7 +889,7 @@ def import_records(entity: str, records: list[dict]) -> int:
         entity (str): Entity to import in.
         records (list[dict]): List of records to be imported.
     """
-    stored_records = _store_records(entity, records)
+    stored_records = _store_records(entity, records, "csv")
     logger.debug(
         f"Stored {len(stored_records)} imported records for {entity}."
     )
