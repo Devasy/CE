@@ -15,7 +15,6 @@ from ..models import SettingsDB
 from ..utils import (
     RepoManager,
     Notifier,
-    UpdateManager,
     Logger,
     DBConnector,
     Collections,
@@ -75,6 +74,8 @@ def check_beta_plugin_upgrades() -> None:
                     Collections.CONFIGURATIONS,
                     Collections.ITSM_CONFIGURATIONS,
                     Collections.CREV2_CONFIGURATIONS,
+                    Collections.EDM_CONFIGURATIONS,
+                    Collections.CFC_CONFIGURATIONS,
                 ]
                 for collection in config_collections:
                     plugins = db_connector.collection(collection).find({})
@@ -128,34 +129,12 @@ def check_beta_plugin_upgrades() -> None:
 def check_updates() -> dict:
     """Check for plugin updates for all repos."""
     settings = SettingsDB(**connector.collection(Collections.SETTINGS).find_one({}))
-    out = {"system": True, "plugins": True}
-    check_beta_plugin_upgrades()
+    out = {"plugins": True}
 
     if settings.enableUpdateChecking is False:
         return out
-    logger.info("Checking for system and plugin updates.")
-    try:
-        update_manager = UpdateManager()
-        if (
-            update_manager.get_changelog("core") is not None
-            or update_manager.get_changelog("ui") is not None
-        ):
-            logger.info(
-                "New system update is available. Navigate to Settings > General: Click on 'Check For Update' button."
-            )
-            notifier.info(
-                "New system update is available. Navigate to Settings > General: Click on 'Check For Update' button."
-            )
-
-        out["system"] = True
-    except Exception:
-        logger.error(
-            "Error occurred while checking for system updates.",
-            details=traceback.format_exc(),
-            error_code="CE_1005",
-            resolution="""Ensure that https://hub.docker.com is accessible from the Cloud Exchange.""",
-        )
-        out["system"] = False
+    logger.info("Checking for plugin updates.")
+    check_beta_plugin_upgrades()
     try:
         out["plugins"] = True
         for repo in manager.repos:

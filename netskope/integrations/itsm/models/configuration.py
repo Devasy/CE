@@ -12,6 +12,22 @@ helper = PluginHelper()
 connector = DBConnector()
 
 
+class TaskFields(BaseModel):
+    """Locking related fields."""
+
+    pull: Union[datetime, None] = Field(None)
+    sync: Union[datetime, None] = Field(None)
+    update: Union[datetime, None] = Field(None)
+
+
+class TaskStatusFields(BaseModel):
+    """Task status fields."""
+
+    pull: Union[bool, None] = Field(None)
+    sync: Union[bool, None] = Field(None)
+    update: Union[bool, None] = Field(None)
+
+
 def validate_tenant(cls, v, values, **kwargs):
     """Make sure that the tenant exists."""
     values = values.data
@@ -131,8 +147,8 @@ class ConfigurationOut(BaseModel):
     parameters: dict = Field({})
     pollIntervalUnit: PollIntervalUnit = Field(...)
     pollInterval: int = Field(...)
-    lastRunAt: Union[datetime, None] = None
-    lastRunSuccess: Union[bool, None] = None
+    lastRunAt: TaskFields = Field(TaskFields())
+    lastRunSuccess: TaskStatusFields = Field(TaskStatusFields())
     receivingSupported: bool = True
     sharingSupported: bool = False
     updateIncidents: bool = Field(False)
@@ -153,9 +169,9 @@ class ConfigurationDB(BaseModel):
     updateIncidents: bool = Field(False)
 
     checkpoint: Union[datetime, None] = None
-    lastRunAt: Union[datetime, None] = None
-    lastRunSuccess: Union[bool, None] = None
-    lockedAt: Union[datetime, None] = None
+    lastRunAt: TaskFields = Field(TaskFields())
+    lastRunSuccess: TaskStatusFields = Field(TaskStatusFields())
+    lockedAt: TaskFields = Field(TaskFields())
     lockedAtAudit: Union[datetime, None] = None
 
 

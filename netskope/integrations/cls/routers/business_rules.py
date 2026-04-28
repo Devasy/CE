@@ -31,7 +31,10 @@ from ..models import (
     BusinessRuleDB,
     ConfigurationDB,
 )
-from ..utils import schedule_or_delete_third_party_pull_task
+from ..utils import (
+    schedule_or_delete_third_party_pull_task,
+    schedule_or_delete_cls_pull_logs_tasks,
+)
 
 helper = PluginHelper()
 router = APIRouter()
@@ -58,6 +61,7 @@ async def create_business_rule(
 ) -> BusinessRuleOut:
     """Create a business rule."""
     connector.collection(Collections.CLS_BUSINESS_RULES).insert_one(rule.model_dump())
+    schedule_or_delete_cls_pull_logs_tasks()
     logger.debug(f"CLS business rule {rule.name} successfully created.")
     return rule
 
@@ -233,26 +237,6 @@ async def update_business_rule(
                 start_time = end_time - timedelta(
                     hours=source.get("parameters", {}).get("days", 7)
                 )
-                # adding schedular task
-                if (
-                    connector.collection(Collections.SCHEDULES).find_one(
-                        {"name": f"cls.{key}"}
-                    )
-                    is None
-                ):
-                    connector.collection(Collections.SCHEDULES).insert_one(
-                        {
-                            "_cls": "PeriodicTask",
-                            "name": f"cls.{key}",
-                            "enabled": True,
-                            "args": [key],
-                            "task": "common.pull_logs",
-                            "interval": {
-                                "every": 30,
-                                "period": "seconds",
-                            },
-                        }
-                    )
                 if start_time == end_time:
                     logger.info(f"Historical data pull has been skipped for '{value}' plugin,"
                                 " because it is disabled from the configuration.")
@@ -277,6 +261,7 @@ async def update_business_rule(
     rule_out = BusinessRuleOut(**after_dict)
     schedule_or_delete_common_pull_tasks()
     schedule_or_delete_third_party_pull_task()
+    schedule_or_delete_cls_pull_logs_tasks()
     logger.debug(f"CLS business rule {rule.name} updated.")
     return rule_out
 
@@ -296,6 +281,7 @@ async def delete_business_rule(
     connector.collection(Collections.CLS_BUSINESS_RULES).delete_one({"name": rule.name})
     schedule_or_delete_common_pull_tasks()
     schedule_or_delete_third_party_pull_task()
+    schedule_or_delete_cls_pull_logs_tasks()
     logger.debug(f"Business rule {rule.name} has been successfully deleted.")
     return {"success": True}
 

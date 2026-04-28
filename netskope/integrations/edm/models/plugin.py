@@ -18,6 +18,25 @@ from netskope.common.utils import Collections, DBConnector
 from netskope.integrations.edm.utils import validate_poll_interval
 
 connector = DBConnector()
+ZIP_NAME_SANITIZE_PATTERN = re.compile(r"[\s\-_]")
+
+
+def get_zip_name_from_configuration(config_name: str) -> str:
+    """Return the EDM zip name derived from configuration name."""
+    sanitized = ZIP_NAME_SANITIZE_PATTERN.sub("_", config_name.strip())
+    return f"{sanitized}_data"
+
+
+def find_active_zip_name_conflict(config_name: str, exclude_config: str | None = None) -> str | None:
+    """Check if another active configuration maps to the same EDM zip name."""
+    target_zip_name = get_zip_name_from_configuration(config_name)
+    query = {"active": True}
+    if exclude_config:
+        query["name"] = {"$ne": exclude_config}
+    for config in connector.collection(Collections.EDM_CONFIGURATIONS).find(query, {"name": 1}):
+        if get_zip_name_from_configuration(config["name"]) == target_zip_name:
+            return config["name"]
+    return None
 
 
 def validate_tenant(cls, v):
@@ -126,16 +145,24 @@ class ConfigurationIn(BaseModel):
     @classmethod
     def _validate_unique_name(cls, v: str):
         """Validate that the configuration name is unique."""
-        if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9 _\-]*[a-zA-Z0-9])*$", v):
+        if not re.match(r"^[a-zA-Z0-9 ]+$", v):
             raise ValueError(
-                "Configuration name should start and end with an alpha-numeric character "
-                "and can include alpha-numeric characters, dashes, underscores and spaces."
+                "Configuration name must contain only alphanumeric characters and spaces (a-z, A-Z, 0-9). "
+                "Hyphens and underscores are not allowed."
             )
         if (
             connector.collection(Collections.EDM_CONFIGURATIONS).find_one({"name": v})
             is not None
         ):
             raise ValueError(f"Configuration with name='{v}' already exists.")
+        conflict_name = find_active_zip_name_conflict(v)
+        if conflict_name:
+            raise ValueError(
+                (
+                    f"Configuration '{conflict_name}' file name is already in use. "
+                    "Please change the configuration name."
+                )
+            )
         return v
 
     active: bool = Field(True, description="Indicates if the plugin is active or not.")
@@ -252,10 +279,10 @@ class ValidationConfigurationIn(BaseModel):
     def _validate_config_name(cls, v, info: FieldValidationInfo):
         """Validate that the configuration name is unique."""
         if not info.data.get("configuration_edit", False):
-            if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9 _\-]*[a-zA-Z0-9])*$", v):
+            if not re.match(r"^[a-zA-Z0-9 ]+$", v):
                 raise ValueError(
-                    "Configuration name should start and end with an alpha-numeric character "
-                    "and can include alpha-numeric characters, dashes, underscores and spaces."
+                    "Configuration name must contain only alphanumeric characters and spaces (a-z, A-Z, 0-9). "
+                    "Hyphens and underscores are not allowed."
                 )
             if (
                 connector.collection(Collections.EDM_CONFIGURATIONS).find_one(
@@ -264,6 +291,14 @@ class ValidationConfigurationIn(BaseModel):
                 is not None
             ):
                 raise ValueError(f"Configuration with name='{v}' already exists.")
+            conflict_name = find_active_zip_name_conflict(v)
+            if conflict_name:
+                raise ValueError(
+                    (
+                        f"Configuration '{conflict_name}' file name is already in use. "
+                        "Please change the configuration name."
+                    )
+                )
             return v
         return v
 
@@ -302,14 +337,22 @@ class ConfigurationNameValidationIn(BaseModel):
     @classmethod
     def _validate_unique_name(cls, v: str):
         """Validate that the configuration name is unique."""
-        if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9 _\-]*[a-zA-Z0-9])*$", v):
+        if not re.match(r"^[a-zA-Z0-9 ]+$", v):
             raise ValueError(
-                "Configuration name should start and end with an alpha-numeric character "
-                "and can include alpha-numeric characters, dashes, underscores and spaces."
+                "Configuration name must contain only alphanumeric characters and spaces (a-z, A-Z, 0-9). "
+                "Hyphens and underscores are not allowed."
             )
         if (
             connector.collection(Collections.EDM_CONFIGURATIONS).find_one({"name": v})
             is not None
         ):
             raise ValueError(f"Configuration with name='{v}' already exists.")
+        conflict_name = find_active_zip_name_conflict(v)
+        if conflict_name:
+            raise ValueError(
+                (
+                    f"Configuration '{conflict_name}' file name is already in use. "
+                    "Please change the configuration name."
+                )
+            )
         return v

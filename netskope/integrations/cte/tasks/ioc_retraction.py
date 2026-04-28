@@ -55,7 +55,7 @@ def ioc_retraction():
                 configuration_db.plugin
             )
             if PluginClass is None:
-                logger.info(
+                logger.error(
                     f"Could not find the plugin with id='{configuration_db.plugin}'. "
                     "Skipping the IoCs retraction execution.",
                     error_code="CTE_1001",

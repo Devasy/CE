@@ -57,7 +57,7 @@ async def create_tenant(
         tenant = TenantDB(**tenant.model_dump())
     PluginClass = plugin_helper.find_by_id(tenant.plugin)
     if PluginClass is None:
-        logger.info(
+        logger.error(
             f"Error occurred while creating the tenant. Could not find the provider plugin with id='{tenant.plugin}'.",
         )
         raise ValueError(
@@ -109,7 +109,7 @@ async def update_tenant(
         {"name": tenant.name}
     )
     if not tenant_db_dict:
-        logger.info(
+        logger.error(
             f"Error occurred while updating the tenant. Tenant with name '{tenant.name}' does not exist."
         )
         raise ValueError(
@@ -239,7 +239,7 @@ async def delete_tenant(
     tenant = TenantDB(**tenant)
     PluginClass = plugin_helper.find_by_id(tenant.plugin)
     if PluginClass is None:
-        logger.info(
+        logger.error(
             f"Error occurred while deleting the tenant. Could not find the provider plugin with id='{tenant.plugin}'.",
         )
         raise ValueError(

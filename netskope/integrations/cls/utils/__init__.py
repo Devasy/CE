@@ -105,3 +105,46 @@ def schedule_or_delete_third_party_pull_task() -> None:
     for task in pull_tasks_to_be_removed:
         # remove all the pull tasks that were not encountered in SIEM mappings
         scheduler.delete(task)
+
+
+def schedule_or_delete_cls_pull_logs_tasks() -> None:
+    """Schedule or delete CE Logs pull tasks based on SIEM mappings."""
+    pull_logs_tasks_to_be_removed = [
+        schedule["name"]
+        for schedule in connector.collection(Collections.SCHEDULES).find(
+            {"task": "common.pull_logs"}
+        )
+    ]
+
+    settings = connector.collection(Collections.SETTINGS).find_one({})
+    cls_enabled = settings and settings.get("platforms", {}).get("cls", False)
+
+    for rule in connector.collection(Collections.CLS_BUSINESS_RULES).find({}):
+        rule = BusinessRuleDB(**rule)
+        for source, destinations in rule.siemMappings.items():
+            if not destinations:
+                continue
+            configuration = connector.collection(
+                Collections.CLS_CONFIGURATIONS
+            ).find_one({"name": source})
+            if configuration is None:
+                continue
+            configuration = ConfigurationDB(**configuration)
+            if not PluginHelper.is_syslog_service_plugin(configuration.plugin):
+                continue
+
+            schedule_name = f"cls.{source}"
+            if schedule_name in pull_logs_tasks_to_be_removed:
+                pull_logs_tasks_to_be_removed.remove(schedule_name)
+
+            if cls_enabled:
+                scheduler.upsert(
+                    name=schedule_name,
+                    task_name="common.pull_logs",
+                    poll_interval=30,
+                    poll_interval_unit="seconds",
+                    args=[source],
+                )
+
+    for task in pull_logs_tasks_to_be_removed:
+        scheduler.delete(task)

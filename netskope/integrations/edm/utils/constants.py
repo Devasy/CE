@@ -15,6 +15,7 @@ CONFIG_TEMPLATE = {
 }
 
 EDM_HASH_CONFIG = {
+    "delimiter": ",",
     "parse_column_names": True,
     "skip_hash": False,
     "edk_lic_dir": "/opt/netskope/integrations/edm/utils/edm/" + "hash_generator/edk",

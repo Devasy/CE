@@ -1130,7 +1130,7 @@ def execute_historical(
     )
 
     if rule_dict is None:
-        logger.info(
+        logger.error(
             f"Business rule {rule} no longer exists. Skipping historical data pull.",
             error_code="CLS_1010",
         )
@@ -1141,7 +1141,7 @@ def execute_historical(
         {"name": source}
     )
     if source_dict is None:
-        logger.info(
+        logger.error(
             f"CLS configuration {source} no longer exists. Skipping historical data pull.",
             error_code="CLS_1011",
         )
@@ -1150,7 +1150,7 @@ def execute_historical(
         {"name": destination}
     )
     if destination_dict is None:
-        logger.info(
+        logger.error(
             f"CLS configuration {destination} no longer exists. Skipping historical data pull.",
             error_code="CLS_1012",
         )

@@ -42,6 +42,7 @@ from ..utils.tickets import (
     _get_duplicate,
     _filter_data_items,
 )
+from .configurations import _get_available_mapping_fields
 from ..tasks.pull_data_items import sync_alerts_and_events
 
 router = APIRouter()
@@ -267,8 +268,13 @@ async def test_queue_business_rule(
     user: User = Security(get_current_user, scopes=["cto_read"]),
 ):
     """Test the queue configuration."""
-    if not mappings:
-        raise HTTPException(400, "Please provide mapping information.")
+    available_fields = _get_available_mapping_fields(configuration)
+    supports_field_mappings = len(available_fields) > 0
+
+    if supports_field_mappings and not mappings:
+        raise HTTPException(status_code=400, detail="Please provide mapping information.")
+    elif not supports_field_mappings and not mappings:
+        raise HTTPException(status_code=400, detail="Test Queue is not supported.")
     rule_db = connector.collection(Collections.ITSM_BUSINESS_RULES).find_one(
         {"name": rule}
     )
@@ -301,6 +307,7 @@ async def test_queue_business_rule(
         configuration_db.checkpoint,
         logger,
     )
+
     try:
         queue = Queue(
             **{"label": label, "value": value, "defaultMappings": {"mappings": mappings}}

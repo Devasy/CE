@@ -43,7 +43,7 @@ def log_changes(configuration, updated_configuration):
     """Log changes based on the incoming request."""
     if configuration.active is not None:
         logger.debug(
-            f"Configuration '{configuration.name}' is {'enabled' if configuration.active else 'disabled'}."
+            f"Configuration '{configuration.name}' is {'enabled' if updated_configuration.active else 'disabled'}."
         )
     if configuration.pollInterval or configuration.pollIntervalUnit:
         logger.debug(
@@ -151,7 +151,7 @@ def _validate_configuration_step(step, configuration, configuration_db=None):
     try:
         return plugin.validate_step(step)
     except Exception as e:
-        logger.info(
+        logger.error(
             f"Exception occurred while executing validate for step {step}",
             details=traceback.format_exc(),
             error_code="CFC_1058",
@@ -320,7 +320,7 @@ def _validate_entire_configuration(plugin, configuration):
         try:
             result = plugin.validate_step(step)
         except Exception as e:
-            logger.info(
+            logger.error(
                 f"Exception occurred while executing validate for step {step}",
                 details=traceback.format_exc(),
                 error_code="CFC_1059",
@@ -457,6 +457,7 @@ async def update_configuration(
     Returns:
         ConfigurationOut: The newly updated configuration.
     """
+    request_configuration = configuration
     # to trim extra spaces for parameters fields.
     trim_space_parameters_fields(configuration.parameters)
     update_payload = filter_out_none_values(configuration.model_dump())
@@ -538,7 +539,7 @@ async def update_configuration(
                 poll_interval_unit=configuration.pollIntervalUnit,
                 args=[configuration.name],
             )
-    log_changes(existing_configuration, configuration)
+    log_changes(request_configuration, configuration)
     metadata = plugin_helper.find_by_id(configuration.plugin).metadata
 
     return {

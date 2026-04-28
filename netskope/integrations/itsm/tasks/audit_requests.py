@@ -12,6 +12,7 @@ from netskope.common.utils import (
     PluginHelper,
     track,
 )
+from netskope.common.utils.secrets_manager import SecretDict
 from netskope.integrations.itsm.models import (
     BusinessRuleDB,
     ConfigurationDB,
@@ -69,7 +70,7 @@ def audit_requests():
             continue
         configuration = ConfigurationDB(**configuration)
         if not configuration.active:
-            logger.info(
+            logger.debug(
                 f"Ticket Orchestrator configuration {name} is disabled. Skipping the task creation process.",
                 error_code="CTO_1050",
             )
@@ -123,7 +124,7 @@ def audit_requests():
                 PluginClass = helper.find_by_id(configuration.plugin)  # NOSONAR S117
                 plugin = PluginClass(
                     configuration.name,
-                    configuration.parameters,
+                    SecretDict(configuration.parameters),
                     configuration.storage,
                     configuration.checkpoint,
                     logger,

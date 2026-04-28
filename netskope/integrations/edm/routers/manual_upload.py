@@ -5,8 +5,9 @@ import shutil
 import traceback
 from typing import Annotated
 from uuid import uuid4
+from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, Security, UploadFile
+from fastapi import APIRouter, File, HTTPException, Security, UploadFile, Query
 
 from netskope.common.api.routers.auth import get_current_user
 from netskope.common.celery.scheduler import execute_celery_task
@@ -23,6 +24,7 @@ from netskope.integrations.edm.tasks.manual_upload_task import (
     execute_manual_upload_task,
 )
 from netskope.integrations.edm.utils import MANUAL_UPLOAD_PATH, ManualUploadManager, MANUAL_UPLOAD_PREFIX
+from netskope.integrations.edm.utils.validators import validate_edm_filename
 
 from .configurations import _clean_sample_files
 
@@ -31,7 +33,7 @@ logger = Logger()
 db_connector = DBConnector()
 
 
-def _get_columns_name(csv_path):
+def _get_columns_name(csv_path, delimiter=","):
     """Get column names from provided csv file.
 
     Args:
@@ -42,7 +44,7 @@ def _get_columns_name(csv_path):
     """
     with open(csv_path, "r", newline="") as file:
         # Create a CSV reader
-        csv_reader = csv.reader(file)
+        csv_reader = csv.reader(file, delimiter=delimiter)
         first_row = next(csv_reader, None)
         if first_row:
             return first_row
@@ -50,37 +52,53 @@ def _get_columns_name(csv_path):
             return None
 
 
-def _create_sample_csv_files(csv_file_path, num_rows=20):
-    """
-    Create a new CSV file from an existing CSV file with a specified number of rows.
+def _create_sample_csv_files(csv_file_path, delimiter=",", num_rows=20, remove_quotes=False):
+    """Create a new CSV file from an existing CSV file with a specified number of rows.
+
+    Opens files in binary mode (rb/wb) so the output is never re-quoted or modified
+    by a csv.writer — mirroring EdmDataSanitizer.py's parseCSV approach.
 
     Args:
-        input_file (str): Path to the input CSV file.
-        output_file (str): Path to the output CSV file to be created.
-        num_rows (int): Number of rows to copy from the input file to the output file.
+        csv_file_path (str): Path to the input CSV file.
+        delimiter (str): CSV delimiter character.
+        num_rows (int): Number of data rows to copy (excluding header).
+        remove_quotes (bool): When True uses QUOTE_ALL reader mode, else QUOTE_NONE.
     """
     try:
-        input_file = csv_file_path
+        encoding = "utf-8"
+        csv_file_name = Path(csv_file_path).name
+        output_file = f"{Path(csv_file_path).parent}/sample_{csv_file_name}"
+        quoting_mode = csv.QUOTE_ALL if remove_quotes else csv.QUOTE_NONE
 
-        csv_file_name = os.path.basename(csv_file_path)
-        output_file = f"{os.path.dirname(csv_file_path)}/sample_{os.path.splitext(csv_file_name)[0]}.csv"
-        with open(input_file, "r", newline="") as in_csvfile, open(
-            output_file, "w", newline=""
-        ) as out_csvfile:
-            reader = csv.reader(in_csvfile)
-            writer = csv.writer(out_csvfile)
+        # Local generator: feeds decoded text lines to csv.reader while keeping
+        # the original raw bytes available for lossless write-back (mirrors
+        # EdmDataSanitizer.py's char_encoder + CURLINE pattern).
+        cur_line_box = [None]  # mutable container so the loop below can read it
 
-            # Write the header row (optional, remove if not needed)
-            header = next(reader)
-            writer.writerow(header)
+        def _char_encoder(binary_file):
+            while True:
+                line = binary_file.readline()
+                if not line:
+                    return
+                cur_line_box[0] = line  # raw bytes snapshot of the current line
+                yield line.decode(encoding)
 
-            # Write the specified number of rows
-            for _ in range(num_rows):
-                try:
-                    row = next(reader)
-                    writer.writerow(row)
-                except StopIteration:
+        with open(csv_file_path, "rb") as in_csvfile, open(output_file, "wb") as out_csvfile:
+
+            # Header: read raw bytes once, write them back untouched.
+            hdr_raw = in_csvfile.readline()
+            out_csvfile.write(hdr_raw)
+
+            # Data rows: csv.reader parses fields; rows are written by rejoining
+            # fields with the delimiter — no csv.writer, so quoting is never added.
+            reader = csv.reader(_char_encoder(in_csvfile), delimiter=delimiter, quoting=quoting_mode)
+
+            for i, row in enumerate(reader):
+                if i >= num_rows:
                     break
+                out_csvfile.write(delimiter.join(row).encode(encoding))
+                out_csvfile.write(b"\n")
+
         return output_file
     except Exception as error:
         logger.error(
@@ -90,7 +108,7 @@ def _create_sample_csv_files(csv_file_path, num_rows=20):
         raise error
 
 
-def validate_csv_file_records(csv_file_path: str, record_count: int = 0) -> dict:
+def validate_csv_file_records(csv_file_path: str, delimiter=",", record_count: int = 0) -> dict:
     """Validate the content of a CSV file.
 
     Args:
@@ -108,7 +126,7 @@ def validate_csv_file_records(csv_file_path: str, record_count: int = 0) -> dict
     try:
         with open(csv_file_path, "r", encoding="UTF-8") as csv_file_object:
             # Create a CSV reader object to iterate through the CSV file.
-            csv_reader = csv.reader(csv_file_object)
+            csv_reader = csv.reader(csv_file_object, delimiter=delimiter)
 
             for row in csv_reader:
                 row_count += 1
@@ -142,7 +160,7 @@ def validate_csv_file_records(csv_file_path: str, record_count: int = 0) -> dict
             if row_count < 2:
                 return {
                     "validate": False,
-                    "message": "At least 1 record must be present in the CSV file in addition to header row.",
+                    "message": "At least 1 record must be present in the file in addition to header row.",
                 }
         return {"validate": True}
     except Exception as error:
@@ -180,7 +198,7 @@ def _validate_file_name_destination(configuration: ManualUploadConfigurationDB):
     return True, "Create new entry.", None
 
 
-def _generate_manual_config_name():
+def _generate_manual_config_name(delimiter: str = ","):
     """Generate unique manual configuration name as uuid."""
     name = None
     while (
@@ -196,6 +214,7 @@ def _generate_manual_config_name():
 @router.post("/upload", tags=["EDM Manual Upload"], description="Manual Upload")
 async def store_manual_upload(
     file: Annotated[UploadFile, File()],
+    delimiter: Annotated[str, Query()] = ",",
     _: User = Security(get_current_user, scopes=["edm_write"]),
 ):
     """Store uploaded CSV.
@@ -208,16 +227,37 @@ async def store_manual_upload(
     """
     try:
         # validating file
-        if file.content_type != "text/csv":
+        if file.content_type not in ["text/csv", "text/plain"]:
             raise HTTPException(
                 400,
-                "Invalid file type supported. Only CSV file type is supported.",
+                "Invalid file type supported. Only CSV and text file type is supported.",
             )
-        name = _generate_manual_config_name()
+        # Validation on file extension
+        file_path = Path(file.filename)
+        if file_path.suffix.lower().replace(".", "") not in ["csv", "txt"]:
+            raise HTTPException(
+                400,
+                "Invalid file type supported. Only CSV and text file type is supported.",
+            )
+        # Validate filename characters for EDM compatibility
+        is_valid, error_msg = validate_edm_filename(file.filename)
+        if not is_valid:
+            raise HTTPException(400, error_msg)
+        if len(delimiter) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Delimiter should be a single character.",
+            )
+        name = _generate_manual_config_name(delimiter)
         file_name = file.filename
         destination_path = f"{MANUAL_UPLOAD_PATH}/{name}"
 
-        manual_upload_object = ManualUploadManager(name=name, file_name=file_name, logger=logger)
+        manual_upload_object = ManualUploadManager(
+            name=name,
+            file_name=file_name,
+            logger=logger,
+            configuration={"delimiter": delimiter},
+        )
 
         manual_upload_object.create_directory(destination_path)
 
@@ -227,7 +267,7 @@ async def store_manual_upload(
             with open(csv_path, "wb") as file_obj:
                 shutil.copyfileobj(file.file, file_obj)
 
-        result = validate_csv_file_records(csv_path)
+        result = validate_csv_file_records(csv_path, delimiter=delimiter)
         if not result.get("validate", False):
             if os.path.isfile(csv_path):
                 shutil.rmtree(os.path.dirname(csv_path))
@@ -236,7 +276,7 @@ async def store_manual_upload(
                 detail=f"{result.get('message','')} Upload a valid csv.",
             )
 
-        columns = _get_columns_name(csv_path)
+        columns = _get_columns_name(csv_path, delimiter=delimiter)
 
         if columns:
             response = {"status": True, "message": "", "data": {"columns": columns, "name": name}}
@@ -261,6 +301,69 @@ async def store_manual_upload(
         raise HTTPException(
             500, "Error occurred While storing uploaded csv."
         ) from error
+
+
+@router.get(
+    "/columns",
+    tags=["EDM Manual Upload"],
+    description="Get updated columns for an already uploaded CSV using a delimiter",
+)
+async def get_uploaded_columns(
+    name: Annotated[str, Query(...)],
+    fileName: Annotated[str, Query(...)],
+    delimiter: Annotated[str, Query()] = ",",
+    _: User = Security(get_current_user, scopes=["edm_write"]),
+):
+    """Return columns detected from a previously uploaded CSV using the provided delimiter.
+
+    Blocks when the configuration is in-progress.
+    """
+    try:
+        # If configuration exists and is in-progress, block the request
+        config = db_connector.collection(Collections.EDM_MANUAL_UPLOAD_CONFIGURATIONS).find_one({"name": name})
+        if config:
+            status = config.get("status")
+            # Allow only when status is one of COMPLETED, FAILED, or SCHEDULED
+            if status not in [StatusType.COMPLETED, StatusType.FAILED, StatusType.SCHEDULED]:
+                raise HTTPException(
+                    400,
+                    detail="Operation not allowed while configuration is in-progress. Please try again later.",
+                )
+
+        csv_file_path = f"{MANUAL_UPLOAD_PATH}/{name}/{fileName}"
+        if not os.path.isfile(csv_file_path):
+            raise HTTPException(404, detail="Uploaded CSV not found.")
+
+        # Validate the file content with the new delimiter
+        if len(delimiter) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Delimiter should be a single character.",
+            )
+        result = validate_csv_file_records(csv_file_path, delimiter=delimiter)
+        if not result.get("validate", False):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{result.get('message','')} Upload a valid csv.",
+            )
+
+        columns = _get_columns_name(csv_file_path, delimiter=delimiter)
+        if not columns:
+            raise HTTPException(
+                status_code=400,
+                detail="Provided csv file does not have records. Upload a valid csv.",
+            )
+        return {"status": True, "message": "", "data": {"columns": columns, "name": name}}
+    except HTTPException as error:
+        logger.debug(str(error))
+        raise error
+    except Exception as error:
+        logger.error(
+            "Error occurred while fetching columns for uploaded csv.",
+            details=traceback.format_exc(),
+            error_code="EDM_1046",
+        )
+        raise HTTPException(500, "Error occurred while fetching columns for uploaded csv.") from error
 
 
 @router.post(
@@ -288,7 +391,11 @@ async def sanitized_uploaded_file(
             f"{MANUAL_UPLOAD_PATH}/{configuration.name}/{csv_name}"
         )
 
-        sample_csv_file = _create_sample_csv_files(csv_file_path)
+        sample_csv_file = _create_sample_csv_files(
+            csv_file_path,
+            delimiter=configuration.parameters.get("delimiter"),
+            remove_quotes=configuration.parameters.get("remove_quotes", False),
+        )
 
         manual_upload_object = ManualUploadManager(
             name=configuration.name, file_name=csv_name,

@@ -2,7 +2,17 @@
 import hvac
 import requests
 import traceback
+from typing import Optional
 from urllib.parse import unquote
+
+from azure.identity import ClientSecretCredential, CertificateCredential
+from azure.keyvault.secrets import SecretClient
+from azure.core.exceptions import (
+    ClientAuthenticationError,
+    ResourceNotFoundError,
+    HttpResponseError,
+)
+from azure.core.pipeline.transport import RequestsTransport
 
 from netskope.common.utils.db_connector import DBConnector, Collections
 from netskope.common.utils.singleton import Singleton
@@ -13,6 +23,8 @@ from netskope.common.models.settings import (
     SecretsManagerSettings,
     SecretsManagerHashicorpParams,
     HashicorpAuthMethod,
+    SecretsManagerAzureParams,
+    AzureAuthMethod,
     SECRET_PREFIX,
     PLAINTEXT_PREFIX,
 )
@@ -48,6 +60,8 @@ class SecretManager(metaclass=Singleton):
             return self
         if settings.params.provider == "hashicorp":
             self.client = self._build_hashicorp_client(settings.params, proxy=proxy)
+        elif settings.params.provider == "azure":
+            self.client = self._build_azure_client(settings.params, proxy=proxy)
         return self
 
     def _build_hashicorp_client(
@@ -101,6 +115,55 @@ class SecretManager(metaclass=Singleton):
                     details=traceback.format_exc(),
                 )
             return client
+
+    def _build_azure_client(
+        self, settings: SecretsManagerAzureParams, proxy: dict = {}
+    ) -> SecretClient:
+        """Build the Azure Key Vault client.
+
+        Args:
+            settings (SecretsManagerAzureParams): Parameters.
+            proxy (dict, defaults to {}): Proxy to use. Format: {"http": "url", "https": "url"}
+
+        Returns:
+            SecretClient: Initialized Azure Key Vault client.
+        """
+        # Create transport with proxy support if proxy is configured
+        transport = None
+        if proxy and (proxy.get("http") or proxy.get("https")):
+            session = requests.Session()
+            session.proxies = {
+                "http": proxy.get("http", ""),
+                "https": proxy.get("https", ""),
+            }
+            transport = RequestsTransport(session=session)
+            logger.debug(f"Azure client using proxy: {proxy.get('https') or proxy.get('http')}")
+
+        credential = None
+        if settings.authMethod == AzureAuthMethod.CLIENT_SECRET:
+            credential = ClientSecretCredential(
+                tenant_id=settings.tenantId,
+                client_id=settings.clientId,
+                client_secret=settings.clientSecret,
+                transport=transport,
+            )
+        elif settings.authMethod == AzureAuthMethod.CERTIFICATE:
+            # Certificate content is passed directly as PEM string
+            credential = CertificateCredential(
+                tenant_id=settings.tenantId,
+                client_id=settings.clientId,
+                certificate_data=settings.certificate.encode("utf-8"),
+                password=settings.certificatePassword.encode("utf-8")
+                if settings.certificatePassword
+                else None,
+                transport=transport,
+            )
+        else:
+            raise NotImplementedError(f"Unsupported Azure auth method: {settings.authMethod}")
+
+        client = SecretClient(vault_url=settings.vaultUrl, credential=credential, transport=transport)
+        logger.debug(f"Azure Key Vault client initialized for {settings.vaultUrl}")
+        return client
 
     def resolve(self, path: str) -> str:
         """Resolve a secret.
@@ -196,6 +259,59 @@ class SecretManager(metaclass=Singleton):
                         ),
                         details=traceback.format_exc(),
                     )
+        elif self.settings.params.provider == "azure":
+            try:
+                # Azure format: secret:{secretName}
+                # The path comes without the "secret:" prefix, so it's just {secretName}
+                secret_name = unquote(path)
+                secret = self.client.get_secret(secret_name)
+                if secret is None or secret.value is None:
+                    raise CouldNotResolve(f"Azure secret '{secret_name}' not found or empty.")
+                return secret.value
+            except ResourceNotFoundError:
+                logger.error(
+                    f"Azure Key Vault secret '{secret_name}' not found.",
+                    details=traceback.format_exc(),
+                )
+                raise CouldNotResolve(f"Azure secret '{secret_name}' not found.")
+            except ClientAuthenticationError:
+                # Try to re-initialize and retry
+                settings = SecretManager.load_settings()
+                self.initialize(
+                    settings.secretsManagerSettings, proxy=get_proxy_params(settings)
+                )
+                if not self.settings.enabled:
+                    raise SecretsManagerDisabledException()
+                try:
+                    secret = self.client.get_secret(secret_name)
+                    if secret is None or secret.value is None:
+                        raise CouldNotResolve(f"Azure secret '{secret_name}' not found or empty.")
+                    return secret.value
+                except ClientAuthenticationError:
+                    logger.error(
+                        "Azure Key Vault authentication failed. Update credentials in "
+                        "Settings > General > Secrets Manager.",
+                        details=traceback.format_exc(),
+                    )
+                    raise CouldNotResolve("Azure authentication failed.")
+                except ResourceNotFoundError:
+                    logger.error(
+                        f"Azure Key Vault secret '{secret_name}' not found.",
+                        details=traceback.format_exc(),
+                    )
+                    raise CouldNotResolve(f"Azure secret '{secret_name}' not found.")
+            except HttpResponseError as ex:
+                logger.error(
+                    f"Azure Key Vault error: {ex.message}",
+                    details=traceback.format_exc(),
+                )
+                raise CouldNotResolve(f"Azure Key Vault error: {ex.message}")
+            except Exception as ex:
+                logger.error(
+                    f"Error occurred while resolving Azure secret. {repr(ex)}",
+                    details=traceback.format_exc(),
+                )
+                raise CouldNotResolve(f"Azure error: {repr(ex)}")
         else:
             raise NotImplementedError("Unsupported provider.")
         return path
@@ -269,3 +385,83 @@ class SecretDict(dict):
     def get(self, k, *args, **kwargs):
         """Get item from dict and resolve if it's a secret."""
         return self._resolve_and_return(super(SecretDict, self).get(k, *args, **kwargs))
+
+
+def _build_azure_client_for_validation(
+    vault_url: str,
+    tenant_id: str,
+    client_id: str,
+    client_secret: Optional[str] = None,
+    certificate: Optional[str] = None,
+    certificate_password: Optional[str] = None,
+    proxy: dict = {},
+) -> SecretClient:
+    """Build Azure Key Vault client for validation purposes.
+
+    This function is called during settings validation to verify credentials.
+
+    Args:
+        vault_url: Azure Key Vault URL
+        tenant_id: Azure AD Tenant ID
+        client_id: App Registration Client ID
+        client_secret: Client secret (for client_secret auth)
+        certificate: PEM certificate content (for certificate auth)
+        certificate_password: Certificate password (optional)
+        proxy: Proxy settings. Format: {"http": "url", "https": "url"}
+
+    Returns:
+        SecretClient: Validated Azure Key Vault client
+
+    Raises:
+        ValueError: If authentication fails
+    """
+    # Create transport with proxy support if proxy is configured
+    transport = None
+    if proxy and (proxy.get("http") or proxy.get("https")):
+        session = requests.Session()
+        session.proxies = {
+            "http": proxy.get("http", ""),
+            "https": proxy.get("https", ""),
+        }
+        transport = RequestsTransport(session=session)
+        logger.debug(f"Azure validation using proxy: {proxy.get('https') or proxy.get('http')}")
+
+    credential = None
+    try:
+        if client_secret:
+            credential = ClientSecretCredential(
+                tenant_id=tenant_id,
+                client_id=client_id,
+                client_secret=client_secret,
+                transport=transport,
+            )
+        elif certificate:
+            credential = CertificateCredential(
+                tenant_id=tenant_id,
+                client_id=client_id,
+                certificate_data=certificate.encode("utf-8"),
+                password=certificate_password.encode("utf-8")
+                if certificate_password
+                else None,
+                transport=transport,
+            )
+        else:
+            raise ValueError("Either client_secret or certificate must be provided.")
+
+        client = SecretClient(vault_url=vault_url, credential=credential, transport=transport)
+        # Try to list secrets (limited to 1) to validate the connection
+        # This will fail if credentials are invalid
+        list(client.list_properties_of_secrets(max_page_size=1))
+        logger.debug(f"Azure Key Vault validation successful for {vault_url}")
+        return client
+    except ClientAuthenticationError as ex:
+        raise ValueError(f"Azure authentication failed: {str(ex)}")
+    except HttpResponseError as ex:
+        if ex.status_code == 403:
+            raise ValueError(
+                "Access denied. Ensure the app has 'Secret List' and 'Secret Get' "
+                "permissions in the Key Vault access policy."
+            )
+        raise ValueError(f"Azure Key Vault error: {ex.message}")
+    except Exception as ex:
+        raise ValueError(f"Azure validation failed: {str(ex)}")

@@ -472,6 +472,24 @@ async def import_records_entity(
                         map(lambda x: x.strip(), record[key].split(",")),
                     )
                 )
+            elif fields_types[value] == EntityFieldType.BOOLEAN:
+                try:
+                    raw_value = record[key]
+                    if isinstance(raw_value, bool):
+                        out[value] = raw_value
+                    else:
+                        normalized = str(raw_value).strip().lower()
+                        if normalized == "true":
+                            out[value] = True
+                        elif normalized == "false":
+                            out[value] = False
+                        else:
+                            raise ValueError()
+                except Exception as ex:
+                    raise HTTPException(
+                        400,
+                        f'Invalid value for {value}. "{record[key]}" is not a valid boolean.',
+                    ) from ex
             elif fields_types[value] == EntityFieldType.STRING:
                 out[value] = record[key]
             else:

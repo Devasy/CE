@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import re
+from packaging.version import Version, InvalidVersion
+from packaging.specifiers import SpecifierSet, InvalidSpecifier
 import psutil
 import requests
 from netskope_api.iterator.netskope_iterator import NetskopeIterator
@@ -44,8 +46,6 @@ from ..utils import (
 from .main import APP
 from netskope.common.utils.const import MAX_ANALYTICS_LENGTH
 
-ANALYTICS_BASE_URL = os.getenv("ANALYTICS_BASE_URL")
-TOKEN = os.getenv("ANALYTICS_TOKEN")
 PROMOTION_BANNERS_FILE_LOCATION = os.getenv("PROMOTION_BANNERS_FILE_LOCATION")
 core_version = api.__version__
 ui_version = api.__version__
@@ -297,17 +297,25 @@ def get_active_plugins_data(
             hashed_plugin_id = hashlib.sha256(folder_id.encode()).hexdigest()[:4]
             plugin_state = 0
             if isinstance(configuration.get("lastRunSuccess"), dict):
-                pull_success = configuration.get("lastRunSuccess").get(
-                    "pull", False
-                )
+                last_run_success = configuration.get("lastRunSuccess")
+                # CTE and CTO common field
+                pull_success = last_run_success.get("pull", False)
                 plugin_state = plugin_state | (
                     PLUGINS_STATE_MAPPING["PULL"] if pull_success else 0
                 )
-                share_success = configuration.get("lastRunSuccess").get(
-                    "share", False
-                )
+                # CTE field
+                share_success = last_run_success.get("share", False)
                 plugin_state = plugin_state | (
                     PLUGINS_STATE_MAPPING["SHARE"] if share_success else 0
+                )
+                # CTO fields
+                sync_success = last_run_success.get("sync", False)
+                plugin_state = plugin_state | (
+                    PLUGINS_STATE_MAPPING["SYNC"] if sync_success else 0
+                )
+                update_success = last_run_success.get("update", False)
+                plugin_state = plugin_state | (
+                    PLUGINS_STATE_MAPPING["UPDATE"] if update_success else 0
                 )
                 plugin_state = convert_to_hex(plugin_state, length=1)
             if not provider:
@@ -840,6 +848,53 @@ def share_analytics_in_user_agent():
         )
 
 
+def is_banner_applicable_for_version(ce_versions_spec, current_version):
+    """Check if a banner should be displayed for the current CE version.
+
+    Args:
+        ce_versions_spec: Version specifier string from the banner JSON (e.g. '>=5.0.0,<7.0.0').
+                          If None or empty, the banner applies to all versions.
+        current_version:  The running CE version string (e.g. '6.1.0', '7.0.1-beta').
+
+    Returns:
+        bool: True if the banner should be displayed, False otherwise.
+    """
+    if not ce_versions_spec:
+        return True
+
+    def normalize_version(ver_str):
+        """Normalize a version string, converting beta notation to PEP 440 pre-release."""
+        ver_str = ver_str.strip()
+        base_match = re.match(r"^(\d+\.\d+\.\d+)", ver_str)
+        if base_match and "beta" in ver_str.lower():
+            base = base_match.group(1)
+            beta_num = re.search(r"beta[.\-]?(\d+)", ver_str.lower())
+            return f"{base}b{beta_num.group(1) if beta_num else '0'}"
+        return ver_str
+
+    def normalize_specifier(spec_str):
+        """Normalize all version strings inside a specifier expression."""
+        # Match operator + version pairs, e.g. '>=6.1.0-beta.1'
+        return re.sub(
+            r"(>=|<=|==|!=|~=|>|<)(\S+?)(?=,|$)",
+            lambda m: m.group(1) + normalize_version(m.group(2)),
+            spec_str,
+        )
+
+    try:
+        normalized_version = normalize_version(current_version)
+        normalized_spec_str = normalize_specifier(ce_versions_spec)
+        spec = SpecifierSet(normalized_spec_str, prereleases=True)
+        version = Version(normalized_version)
+        return version in spec
+    except (InvalidSpecifier, InvalidVersion, Exception) as e:
+        logger.info(
+            f"Invalid ce_versions specifier '{ce_versions_spec}' in promotional banner: {e}. "
+            "Defaulting to showing the banner for all versions."
+        )
+        return True
+
+
 def pull_cloud_exchange_banners():
     """Get banners from GitHub.
 
@@ -879,10 +934,28 @@ def pull_cloud_exchange_banners():
             response = json.loads(response)
         list_of_banner_ids = []
         for banner in response:
+            is_applicable_to_ce = is_banner_applicable_for_version(
+                banner.get("ce_versions"), CE_VERSION
+            )
             list_of_banner_ids.append(banner.get("id"))
             already_exist_banner = connector.collection(
                 Collections.NOTIFICATIONS
             ).find_one({"id": banner.get("id")})
+
+            if not is_applicable_to_ce:
+                if not already_exist_banner:
+                    # Not applicable to this CE version and not in DB — skip entirely.
+                    logger.info(f"Banner {banner.get('id')} is not applicable to this CE version.")
+                    continue
+                else:
+                    # Not applicable but already exists — just mark it acknowledged.
+                    connector.collection(Collections.NOTIFICATIONS).update_one(
+                        {"id": banner.get("id")},
+                        {"$set": {"acknowledged": True}},
+                    )
+                    continue
+
+            # Banner IS applicable to this CE version — upsert with full fields.
             connector.collection(Collections.NOTIFICATIONS).update_one(
                 {"id": banner.get("id")},
                 {
@@ -905,7 +978,7 @@ def pull_cloud_exchange_banners():
             {"is_promotion": True, "id": {"$nin": list_of_banner_ids}}
         )
     except Exception as e:
-        logger.info(f"Unable to pull promotion banners from Github: {e}")
+        logger.debug(f"Unable to pull promotion banners from Github: {e}")
 
 
 @APP.task(name="common.share_usage_analytics")

@@ -1,6 +1,6 @@
 """All the routers."""
 
-from . import business_rules, configurations, entities, records, action_logs
+from . import business_rules, configurations, entities, records, action_logs, dashboard
 
 ROUTERS = [
     configurations.router,
@@ -8,4 +8,5 @@ ROUTERS = [
     records.router,
     business_rules.router,
     action_logs.router,
+    dashboard.router,
 ]

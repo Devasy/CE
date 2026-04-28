@@ -1,5 +1,6 @@
 """Perform action on sync interval or specific time."""
 
+import sys
 import traceback
 from functools import partial
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from netskope.common.utils import (
     track,
     integration,
     Logger,
+    has_source_info_args,
 )
 from netskope.common.models import SettingsDB
 from netskope.common.celery.main import APP
@@ -103,8 +105,31 @@ def perform_action():
     def _execute_single_action(plugin, action):
         """Execute a single action."""
         is_revert = getattr(action["params"], "performRevert", False)
+
+        # Guard condition: Check if plugin supports revert parameter when attempting revert
+        if is_revert and not has_source_info_args(plugin, "execute_action", ["revert"]):
+            logger.info(
+                f"Plugin does not support revert parameter for {action['params'].value} action. "
+                f"Skipping revert for record with id {action['record'].get('_id', 'unknown')}. "
+            )
+            action["log_func"](
+                updates={
+                    "revertActionParameters": {
+                        "revertActionStatus": RevertActionStatus.FAILED,
+                        "revertPerformedAt": datetime.now(),
+                    },
+                    "action.performRevert": False
+                }
+            )
+            return
+
         try:
-            plugin.execute_action(action["params"])
+            if is_revert:
+                # Call with revert=True parameter
+                plugin.execute_action(action["params"], revert=True)
+            else:
+                # Normal action execution
+                plugin.execute_action(action["params"])
             if is_revert:
                 logger.info(
                     f"Successfully reverted {action['params'].value} action on record "
@@ -133,7 +158,13 @@ def perform_action():
                     }
                 )
         except Exception:
-            if is_revert:
+            # Check if this is a NotImplementedError for revert that wasn't caught above
+            if isinstance(sys.exc_info()[1], NotImplementedError) and is_revert:
+                logger.info(
+                    f"Revert not implemented for {action['params'].value} action. "
+                    f"Marking action as failed and skipping revert."
+                )
+            elif is_revert:
                 logger.error(
                     f"Failed to revert {action['params'].value} action on "
                     f"record with id {action['record'].get('_id', 'unknown')}.",
@@ -165,6 +196,59 @@ def perform_action():
     for metadata, actions in actions_batch.items():
         configuration, _ = metadata
         plugin = get_plugin_from_configuration_name(configuration)
+
+        # Check if any action in the batch is a revert action
+        has_revert_actions = getattr(actions[0]["params"], "performRevert", False)
+
+        # Guard condition: If batch contains revert actions, check plugin support
+        # Check both execute_action (for fallback to individual) and execute_actions (for batch)
+        if has_revert_actions:
+            supports_execute_action_revert = has_source_info_args(plugin, "execute_action", ["revert"])
+            supports_execute_actions_revert = has_source_info_args(plugin, "execute_actions", ["revert"])
+
+            # If plugin has execute_actions implemented, it must support revert parameter
+            # If not implemented, will fall back to execute_action which must support revert
+            if plugin.execute_actions != PluginBase.execute_actions:
+                # Plugin has execute_actions implemented
+                if not supports_execute_actions_revert:
+                    logger.info(
+                        "Plugin does not support revert parameter in execute_actions. "
+                        "Skipping batch revert",
+                    )
+                    # Mark all revert actions as failed
+                    for action in actions:
+                        if getattr(action["params"], "performRevert", False):
+                            action["log_func"](
+                                updates={
+                                    "revertActionParameters": {
+                                        "revertActionStatus": RevertActionStatus.FAILED,
+                                        "revertPerformedAt": datetime.now(),
+                                    },
+                                    "action.performRevert": False
+                                }
+                            )
+                    continue
+            else:
+                # Will fall back to individual execute_action calls
+                if not supports_execute_action_revert:
+                    logger.info(
+                        "Plugin does not support revert parameter in execute_action. "
+                        "Skipping revert for all actions in batch. ",
+                    )
+                    # Mark all revert actions as failed
+                    for action in actions:
+                        if getattr(action["params"], "performRevert", False):
+                            action["log_func"](
+                                updates={
+                                    "revertActionParameters": {
+                                        "revertActionStatus": RevertActionStatus.FAILED,
+                                        "revertPerformedAt": datetime.now(),
+                                    },
+                                    "action.performRevert": False
+                                }
+                            )
+                    continue
+
         if plugin.execute_actions == PluginBase.execute_actions:
             # method has not been implemented in the plugin
             # execute the actions individually instead
@@ -173,16 +257,28 @@ def perform_action():
         else:
             try:
                 action_type = actions[0]["params"].value
+                is_batch_revert = getattr(actions[0]["params"], "performRevert", False)
                 logger.info(
-                    f"Performing {action_type} action on batch with {len(actions)} records."
+                    f"{'Reverting' if is_batch_revert else 'Performing'} {action_type} action on "
+                    f"batch with {len(actions)} records."
                 )
                 # Execute actions with either full action objects or just params based on plugin flag
+                # Pass revert parameter if this is a batch revert operation
                 if hasattr(plugin, "provide_action_id") and plugin.provide_action_id:
-                    result = plugin.execute_actions(
-                        [{"params": action["params"], "id": action["id"]} for action in actions]
-                    )
+                    if is_batch_revert:
+                        result = plugin.execute_actions(
+                            [{"params": action["params"], "id": action["id"]} for action in actions],
+                            revert=True
+                        )
+                    else:
+                        result = plugin.execute_actions(
+                            [{"params": action["params"], "id": action["id"]} for action in actions]
+                        )
                 else:
-                    result = plugin.execute_actions([action["params"] for action in actions])
+                    if is_batch_revert:
+                        result = plugin.execute_actions([action["params"] for action in actions], revert=True)
+                    else:
+                        result = plugin.execute_actions([action["params"] for action in actions])
 
                 # Handle partial success reporting
                 if result and isinstance(result, ActionResult):
@@ -245,6 +341,15 @@ def perform_action():
                         f"batch with {len(actions)} records."
                     )
             except NotImplementedError:
+                # Check if this is a revert operation that's not implemented
+                is_batch_revert = getattr(actions[0]["params"], "performRevert", False)
+                if is_batch_revert:
+                    action_type = actions[0]["params"].value
+                    logger.info(
+                        f"Batch revert not implemented for {action_type} action. "
+                        f"Falling back to individual execution. "
+                    )
+                # Fall back to individual execution
                 for action in actions:
                     _execute_single_action(plugin, action)
             except Exception:
@@ -254,6 +359,7 @@ def perform_action():
                     error_code="CRE_1037",
                     details=traceback.format_exc(),
                 )
+
                 for action in actions:  # mark all as failed if there is an error
                     is_revert = getattr(action["params"], "performRevert", False)
                     if is_revert:

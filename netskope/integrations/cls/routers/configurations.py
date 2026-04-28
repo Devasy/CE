@@ -150,14 +150,6 @@ async def create_configuration(
     }
 
 
-def log_changes(configuration, updated_configuration):
-    """Log changes based on the incoming request."""
-    if configuration.active is not None:
-        logger.debug(
-            f"Configuration '{configuration.name}' is {'enabled' if configuration.active else 'disabled'}."
-        )
-
-
 def filter_out_none_values(data: dict) -> dict:
     """Filter out keys with None values from a dict.
 

@@ -62,8 +62,8 @@ def _end_life(name, success):
         {"name": name},
         {
             "$set": {
-                "lastRunAt": datetime.now(),
-                "lastRunSuccess": success,
+                "lastRunAt.pull": datetime.now(),
+                "lastRunSuccess.pull": success,
                 # "lockedAt": None,
             }
         },
@@ -122,7 +122,7 @@ def _create_tickets_for_rule(
                 Collections.ITSM_CONFIGURATIONS
             ).find_one({"name": name})
             if configuration is None:
-                logger.info(
+                logger.error(
                     f"Ticket Orchestrator configuration {name} no longer exists.",
                     error_code="CTO_1010",
                 )
@@ -177,6 +177,10 @@ def _create_tickets_for_rule(
                 logger.info(
                     f"No tasks created for configuration {configuration.name}."
                 )
+            connector.collection(Collections.ITSM_CONFIGURATIONS).update_one(
+                {"name": configuration.name},
+                {"$set": {"storage": plugin.storage}},
+            )
         except NotImplementedError:
             logger.error(
                 f"Could not create tasks for the given {data_type}s with configuration {configuration.name}. "
@@ -450,7 +454,7 @@ def sync_alerts_and_events(rule: str, configuration: str, days: int):
         {"name": rule}
     )
     if rule is None:
-        logger.info(
+        logger.error(
             f"Business rule {rule} no longer exists. Skipping itsm.sync_alerts_and_events task.",
             error_code="CTO_1014",
         )
@@ -498,7 +502,7 @@ def pull_data_items(
         return False
     PluginClass = helper.find_by_id(configuration.plugin)  # NOSONAR
     if PluginClass is None:
-        logger.info(
+        logger.error(
             f"Plugin with ID {configuration.plugin} does not exist. Skipping itsm.pull_data_items task.",
             error_code="CTO_1015",
         )
@@ -693,7 +697,7 @@ def pull_historical_events(
         {"name": configuration_name}
     )
     if configuration is None:
-        logger.info(
+        logger.error(
             f"ITSM configuration {configuration} no longer exists. Skipping historical event data pull.",
             error_code="CTO_1037",
         )

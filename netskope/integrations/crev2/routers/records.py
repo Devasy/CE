@@ -42,6 +42,8 @@ def build_schema_from_entity(entity: Entity) -> dict:
             return "list"
         elif field_type == EntityFieldType.DATETIME:
             return "datetime"
+        elif field_type == EntityFieldType.BOOLEAN:
+            return "boolean"
         else:
             return "text"
 

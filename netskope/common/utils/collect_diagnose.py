@@ -1,20 +1,23 @@
 """Collect diagnose data."""
 
-from datetime import datetime
-from bson import json_util
 import asyncio
+import itertools
 import re
 import sys
-import itertools
-from netskope.common.utils import (
-    Logger,
-    PluginHelper,
-    DBConnector,
-    SecretDict,
-    Collections,
-)
+from copy import deepcopy
+from datetime import datetime
+
+from bson import json_util
+
 from netskope.common.api.routers.dashboard import get_status
 from netskope.common.api.routers.status import cluster_status
+from netskope.common.utils import (
+    Collections,
+    DBConnector,
+    Logger,
+    PluginHelper,
+    SecretDict,
+)
 from netskope.integrations.cte.routers.dashboard import (
     pull_statistics,
     sharing_statistics,
@@ -55,6 +58,10 @@ def collect_plugin_parameters(plugin, collection=None):
         )
     ]
     password_keys = [entry["key"] for entry in filtered_configuration]
+
+    # Deep copy plugin parameters before removing sensitive data
+    deep_copy_plugin = deepcopy(plugin)
+
     for key in password_keys:
         if "parameters" in plugin and key in plugin["parameters"]:
             plugin["parameters"].pop(key)
@@ -63,17 +70,17 @@ def collect_plugin_parameters(plugin, collection=None):
         item for item in metadata["configuration"] if item.get("type") == "dynamic_step"
     ]
     plug_obj = PluginClass(
-        plugin.get("name"),
-        SecretDict(plugin.get("parameters")),
+        deep_copy_plugin.get("name"),
+        SecretDict(deep_copy_plugin.get("parameters")),
         {},
         None,
         logger,
-        use_proxy=plugin.get("useProxy"),
+        use_proxy=deep_copy_plugin.get("useProxy"),
     )
     for dynamic_step in filtered_dynamic_steps:
-        if dynamic_step and plugin.get("pluginType", "") != "receiver":
+        if dynamic_step and deep_copy_plugin.get("pluginType", "") != "receiver":
             main = plug_obj.get_fields(
-                dynamic_step.get("name"), plugin.get("parameters")
+                dynamic_step.get("name"), deep_copy_plugin.get("parameters")
             )
             find_sensitive_data(dynamic_step, main, metadata, plugin, exclude_key_regex)
     filtered_steps = [
@@ -86,7 +93,7 @@ def collect_plugin_parameters(plugin, collection=None):
     has_api_call = any(
         item.get("has_api_call") is True for item in metadata["configuration"]
     )
-    if has_api_call and plugin.get("pluginType", "") != "receiver":
+    if has_api_call and deep_copy_plugin.get("pluginType", "") != "receiver":
         api_call = plug_obj.get_dynamic_fields()
         find_sensitive_data(api_call, api_call, metadata, plugin, exclude_key_regex)
     plugin.pop("_id"),
