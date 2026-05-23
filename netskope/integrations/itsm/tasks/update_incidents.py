@@ -43,8 +43,8 @@ def _end_life(name, success):
         {"name": name},
         {
             "$set": {
-                "lastRunAt": datetime.now(),
-                "lastRunSuccess": success,
+                "lastRunAt.update": datetime.now(),
+                "lastRunSuccess.update": success,
             }
         },
     )
@@ -121,7 +121,7 @@ def update_incidents(
 
     PluginClass = helper.find_by_id(configuration.plugin)  # NOSONAR
     if PluginClass is None:
-        logger.info(
+        logger.error(
             f"Plugin with ID {configuration.plugin} does not exist. Skipping itsm.update_incidents task.",
             error_code="CTO_1034",
         )
@@ -149,7 +149,7 @@ def update_incidents(
         success_count = 0
         failed_count = 0
         if results is None or not results.success:
-            logger.info(
+            logger.error(
                 f"Could not update incidents for configuration {configuration.name}. "
                 f"{re.sub(r'token=([0-9a-zA-Z]*)', 'token=********&', results.message)}",
                 details=re.sub(
