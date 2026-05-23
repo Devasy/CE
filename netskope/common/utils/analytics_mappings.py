@@ -38,6 +38,8 @@ MODULES_MAPPING_NUMBERS = {
 PLUGINS_STATE_MAPPING = {
     "PULL": 1,
     "SHARE": 2,
+    "SYNC": 4,
+    "UPDATE": 8,
 }
 
 PLUGIN_STATS = {False: "0", True: "1", None: "e"}
