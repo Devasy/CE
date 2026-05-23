@@ -9,6 +9,7 @@ from datetime import datetime, UTC
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from netskope.common.utils.rabbitmq_helper import make_rabbitmq_api_call
+from netskope.common.utils.db_connector import DBConnector, Collections
 from netskope.common.utils.const import (
     MONGODB_RABBITMQ_CERT_LOCATION,
     MONGODB_RABBITMQ_CERT_BANNER_ID,
@@ -18,6 +19,7 @@ from netskope.common.utils.const import (
 
 logger = Logger()
 notifier = Notifier()
+db_connector = DBConnector()
 
 
 def check_disk_free_alarm():
@@ -55,11 +57,12 @@ def check_certs_validity():
     """Check validity of containers certificates."""
     # Check MongoDB and RabbitMQ certificate
     try:
-        _post_or_ack_certificate_banner(
+        expiry_date = _post_or_ack_certificate_banner(
             "MongoDB and RabbitMQ",
             MONGODB_RABBITMQ_CERT_LOCATION,
             MONGODB_RABBITMQ_CERT_BANNER_ID,
         )
+        _store_cert_expiry("mongodb_rabbitmq", expiry_date)
     except Exception:
         logger.error(
             "Error occurred while checking MongoDB and RabbitMQ certificate.",
@@ -67,11 +70,15 @@ def check_certs_validity():
             details=traceback.format_exc(),
         )
         notifier.update_banner_acknowledged(MONGODB_RABBITMQ_CERT_BANNER_ID, True)
+        _store_cert_expiry("mongodb_rabbitmq", None)
 
     # Check UI certificate
     try:
         if os.environ.get("UI_PROTOCOL", "https").lower() != "http":
-            _post_or_ack_certificate_banner("UI", UI_CERT_LOCATION, UI_CERT_BANNER_ID)
+            expiry_date = _post_or_ack_certificate_banner("UI", UI_CERT_LOCATION, UI_CERT_BANNER_ID)
+            _store_cert_expiry("ui", expiry_date)
+        else:
+            _store_cert_expiry("ui", None)
     except Exception:
         logger.error(
             "Error occurred checking UI certificate.",
@@ -79,6 +86,26 @@ def check_certs_validity():
             details=traceback.format_exc(),
         )
         notifier.update_banner_acknowledged(UI_CERT_BANNER_ID, True)
+        _store_cert_expiry("ui", None)
+
+
+def _store_cert_expiry(cert_type, expiry_date):
+    """Store certificate expiry information in database.
+
+    Args:
+        cert_type (str): Type of certificate ('ui' or 'mongodb_rabbitmq')
+        expiry_date (datetime): Certificate expiry date or None
+    """
+    try:
+        db_connector.collection(Collections.SETTINGS).update_one(
+            {},
+            {"$set": {f"certExpiry.{cert_type}": expiry_date}},
+        )
+    except Exception:
+        logger.error(
+            f"Error storing {cert_type} certificate expiry.",
+            details=traceback.format_exc(),
+        )
 
 
 def _post_or_ack_certificate_banner(container_name, cert_path, banner_id):
@@ -111,24 +138,23 @@ def _post_or_ack_certificate_banner(container_name, cert_path, banner_id):
         if expiry_date < current_time:
             error_message = (
                 f"The certificate for {container_name} has already expired. "
-                "Please renew it immediately by following the instructions in the Netskope Cloud Exchange [documentation](https://docs.netskope.com/en/generate-and-install-ssl-certificates-in-cloud-exchange) "  # noqa
-                "to ensure continued service."
+                "Please renew it by navigating to Settings → General page in the Netskope Cloud Exchange."
             )
             logger.error(error_message, error_code="CE_1073")
             notifier.banner_error(banner_id, error_message)
-            return
+            return expiry_date
 
         # Check if the certificate expires within the next 30 days
         if (expiry_date - current_time).days <= 30:
             warning_message = (
                 f"The certificate for {container_name} will expire in {(expiry_date - current_time).days + 1} days. "
-                "Please renew it by following the instructions in the Netskope Cloud Exchange documentation [documentation](https://docs.netskope.com/en/generate-and-install-ssl-certificates-in-cloud-exchange) "  # noqa
-                "to ensure uninterrupted service and security."
+                "Please renew it by navigating to Settings → General page in the Netskope Cloud Exchange."
             )
             logger.warn(warning_message, error_code="CE_1074")
             notifier.banner_warning(banner_id, warning_message)
-            return
+            return expiry_date
 
         notifier.update_banner_acknowledged(banner_id, True)
+        return expiry_date
     except Exception as e:
         raise Exception(f"Failed to parse certificate {cert_path}: {str(e)}")

@@ -1,9 +1,9 @@
 """Repo related models."""
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional, Literal
 
 from ..utils import DBConnector, Collections
-from pydantic import field_validator, BaseModel, HttpUrl, Field
+from pydantic import field_validator, BaseModel, HttpUrl, Field, model_validator
 
 
 connector = DBConnector()
@@ -14,8 +14,9 @@ class PluginRepo(BaseModel):
 
     name: str
     url: str
-    username: str
-    password: str
+    repoType: Literal["public", "private"] = Field("public")
+    username: Optional[str] = Field(None)
+    password: Optional[str] = Field(None)
     isDefault: bool = Field(False)
     plugins: Dict = Field({})
     plugin_migrates: List = Field([])
@@ -56,8 +57,18 @@ class PluginRepoIn(BaseModel):
             raise ValueError("Error: invalid or missing URL scheme")
         return v
 
-    username: str
-    password: str
+    repoType: Literal["public", "private"] = Field("public")
+    username: Optional[str] = Field(None)
+    password: Optional[str] = Field(None)
+
+    @model_validator(mode="after")
+    def validate_credentials(self):
+        """Validate that private repos have credentials."""
+        if self.repoType == "private":
+            if not self.username or not self.password:
+                raise ValueError("Username and password are required for private repositories.")
+        return self
+
     isDefault: bool = Field(False)
     plugins: Dict = Field({})
     plugin_migrates: List = Field([])
@@ -91,8 +102,18 @@ class PluginRepoUpdate(BaseModel):
             raise ValueError("Error: invalid or missing URL scheme")
         return v
 
-    username: str
-    password: str
+    repoType: Literal["public", "private"] = Field("public")
+    username: Optional[str] = Field(None)
+    password: Optional[str] = Field(None)
+
+    @model_validator(mode="after")
+    def validate_credentials(self):
+        """Validate that private repos have credentials."""
+        if self.repoType == "private":
+            if not self.username or not self.password:
+                raise ValueError("Username and password are required for private repositories.")
+        return self
+
     plugins: Dict = Field({})
     plugin_migrates: List = Field([])
 
@@ -102,7 +123,8 @@ class PluginRepoOut(BaseModel):
 
     name: str
     url: str = Field("")
-    username: str = Field("")
+    repoType: str = Field("public")
+    username: Optional[str] = Field(None)
     hasUpdates: bool = False
     isDefault: bool = Field(False)
     plugins: Dict = Field({})
