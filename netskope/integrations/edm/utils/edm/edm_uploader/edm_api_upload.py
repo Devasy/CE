@@ -9,6 +9,7 @@ import tarfile
 import json
 import hashlib
 import fnmatch
+import time
 import uuid
 from pathlib import Path
 import requests
@@ -30,7 +31,7 @@ class DlpEdmStagingApi:
 
     - create_edm_upload(edm_filename, tgz_filename): Creates an EDM file upload session by
         sending a POST request to the DLP EDM Staging API with the provided EDM filename,
-        file size, and SHA1 hash.
+        file size, and SHA256 hash.
     - upload_edm_part(fileid, uploadid, partnum, data): Uploads a part of an EDM file to
         the specified upload ID.
     - complete_edm_upload(fileid, uploadid, parts): Completes an EDM file upload by sending
@@ -59,7 +60,8 @@ class DlpEdmStagingApi:
         self.auth_token = auth_token
         self.server = server
         self.port = port
-
+        self.max_retries = 5
+        self.retry_interval = 5  # seconds
 
     def _get_url_prefix(self):
         """
@@ -91,7 +93,7 @@ class DlpEdmStagingApi:
         Returns:
             str: The file hash.
         """
-        hasher = hashlib.sha1()
+        hasher = hashlib.sha256()
         rbufsize = 1024 * 1024
 
         with open(filename, 'rb') as fp:
@@ -106,7 +108,7 @@ class DlpEdmStagingApi:
     def create(self, edm_filename, tgz_filename, keep_staging=False, description=None):
         """
         Creates an EDM file upload session by sending a POST request to the DLP EDM Staging
-        API with the provided EDM filename, file size, and SHA1 hash.
+        API with the provided EDM filename, file size, and SHA256 hash.
 
         Args:
             edm_filename (str): The filename of the EDM file being uploaded.
@@ -117,7 +119,7 @@ class DlpEdmStagingApi:
             tuple: A tuple containing the HTTP status code, the JSON response data, and the response message.
         """
         # curl -vvv -XPOST -H "Content-Type: application/json" -H "netskope-api-token: 123abc"
-        #   -d "{\"edm_filename\":\"test\", \"sha1\": \"111111111\", \"size\": 100}"
+        #   -d "{\"edm_filename\":\"test\", \"sha256\": \"111111111\", \"size\": 100}"
         #   "https://<tenant url>/api/v2/services/dlp/edm/file/staging"
         # returns: {'fileid': 'test_upload.csv', 'msg': 'good', 'status': 'success', 'uploadid': 'MDE2....'}
 
@@ -127,8 +129,8 @@ class DlpEdmStagingApi:
         message = ""
 
         fsize = os.path.getsize(tgz_filename)
-        fsha1 = self._get_file_hash(tgz_filename)
-        payload = {"edm_filename": edm_filename, "tgz_filename": tgz_filename, "sha1": fsha1, "size": fsize}
+        fsha256 = self._get_file_hash(tgz_filename)
+        payload = {"edm_filename": edm_filename, "tgz_filename": tgz_filename, "sha256": fsha256, "size": fsize}
 
         if description:
             payload['description'] = description
@@ -516,7 +518,7 @@ class StagingManager:
             None
         """
         status_code, resp, msg = self.client.list_files()
-        if status_code > 300:
+        if status_code >= 300:
             print(f"List staging file error")
             if resp:
                 print(f"Error response: {resp}")
@@ -541,7 +543,7 @@ class StagingManager:
             return False, "Missing file id", {}
 
         status_code, resp, msg = self.client.get_status(file_id)
-        if status_code > 300:
+        if status_code >= 300:
             return False, f"Error response: {resp}" if resp else f"Error response: {msg}", {}
 
         print(f"Get staging file {file_id} status succeeded")
@@ -578,7 +580,7 @@ class StagingManager:
                                                     self.keep_staging_file,
                                                     self.description)
 
-        if status_code > 300:
+        if status_code >= 300:
             return False, f"Error response: {resp}" if resp else f"Error response: {msg}", {
                 "status_code": status_code,
                 "message": msg,
@@ -610,9 +612,19 @@ class StagingManager:
                 payload = fp.read(max_part_size)
                 if not payload:
                     break
-                status_code, resp, msg = self.client.upload_part(fileid, uploadid, partnum, payload)
+                status_code = 500
+                count = 0
+                while count < self.client.max_retries:
+                    status_code, resp, msg = self.client.upload_part(fileid, uploadid, partnum, payload)
+                    if status_code < 300 or status_code == 401 or status_code == 403:
+                        break
+                    count += 1
+                    if count >= self.client.max_retries:
+                        break
+                    logger.warn(f"Upload staging file part {partnum} failed, retrying in {self.client.retry_interval} seconds...")
+                    time.sleep(self.client.retry_interval)
 
-                if status_code > 300:
+                if status_code >= 300:
                     return False, f"Error response: {resp}" if resp else f"Error response: {msg}", {
                         "status_code": status_code,
                         "message": msg,
@@ -634,14 +646,13 @@ class StagingManager:
         # completed the staging process
         status_code, resp, msg = self.client.complete(fileid, uploadid, etags)
 
-        if status_code > 300:
+        if status_code >= 300:
             return False, f"Error response: {resp}" if resp else f"Error response: {msg}", {
                 "status_code": status_code,
                 "message": msg,
                 "response": resp
             }
-
-        logger.info(f"Upload EDM tgz file {filename} completed, status: {resp}")
+        logger.info(f"Upload EDM tgz file {filename} completed.")
         # apply automatically
         apply_status, apply_msg, context = self.apply(fileid)
         return True, apply_msg, {
@@ -666,7 +677,7 @@ class StagingManager:
             return False, "Missing file id while deleting Edm staging file", {}
 
         status_code, msg = self.client.abort(file_id)
-        if status_code > 300:
+        if status_code >= 300:
             return False, f"Error response while deleting Edm staging file: {msg}", {
                 "status_code": status_code,
                 "message": msg,
@@ -692,7 +703,7 @@ class StagingManager:
             return False, "Missing file id while applying", {}
 
         status_code, resp, msg = self.client.apply(file_id)
-        if status_code > 300:
+        if status_code >= 300:
             return False, f"Error response while applying Edm staging file: {resp}" if resp else f"Error response while applying Edm staging file: {msg}", {
                 "status_code": status_code,
                 "message": msg,

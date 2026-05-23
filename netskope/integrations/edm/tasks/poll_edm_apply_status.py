@@ -144,27 +144,28 @@ def poll_edm_hash_upload_status():
                 connector.collection(Collections.EDM_HASHES_STATUS).delete_one(
                     {"_id": hash["_id"]}
                 )
-            if apply_status == StatusType.FAILED:
-                del_result, del_message, _ = staging_manager.delete(hash_db.file_id)
-                if not del_result:
+                if response:
+                    del_result, del_message, _ = staging_manager.delete(hash_db.file_id)
+                    if not del_result:
+                        logger.error(
+                            "Error occurred while cleaning the uploaded EDM Hash staging file "
+                            f"for file id {hash_db.file_id}.",
+                            error_code="EDM_1041",
+                            details=(
+                                f"Tenant: '{hash_db.fileUploadedAtTenant}'"
+                                f"\nError: {del_message}"
+                            )
+                        )
+                if apply_status == StatusType.FAILED:
                     logger.error(
-                        "Error occurred while cleaning the uploaded EDM Hash staging file "
-                        f"for file id {hash_db.file_id}.",
-                        error_code="EDM_1041",
+                        "Error occurred while applying the uploaded EDM Hashes "
+                        f"for file id {hash_db.file_id}",
+                        error_code="EDM_1042",
                         details=(
                             f"Tenant: '{hash_db.fileUploadedAtTenant}'"
-                            f"\nError: {del_message}"
+                            f"\nError: {message}"
                         )
                     )
-                logger.error(
-                    "Error occurred while applying the uploaded EDM Hashes "
-                    f"for file id {hash_db.file_id}",
-                    error_code="EDM_1042",
-                    details=(
-                        f"Tenant: '{hash_db.fileUploadedAtTenant}'"
-                        f"\nError: {message}"
-                    )
-                )
         except Exception:
             logger.error(
                 message=f"Error occurred while checking for the status of the uploaded EDM Hashes "

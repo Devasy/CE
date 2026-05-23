@@ -31,6 +31,8 @@ import os
 import sys
 import csv
 import signal
+import re
+from pathlib import Path
 import multiprocessing as mp
 import traceback
 import tarfile
@@ -59,6 +61,7 @@ PBKDF2_ITER = 10000
 PBKDF2_KEY_LEN = 20
 
 STATUS_MODULO = 100000
+MAX_FILENAME_LEN = 240
 
 class PddHashException(Exception):
     """
@@ -132,28 +135,20 @@ def utf8_encoder(unicode_csv_data, stop_position=None):
             return
         yield line.decode(FILE_ENCODING)
 
-def unicode_csv_reader(unicode_csv_data, stop=None):
+def unicode_csv_reader(unicode_csv_data, stop=None, use_quoting=False):
     """
         Copied from python docs. csv module doesn't handle Unicode so
         converting it to UTF-8 and back.
     """
+    quoting_mode = csv.QUOTE_NONE
+    if use_quoting:
+        quoting_mode = csv.QUOTE_ALL
     csv_reader = csv.reader(utf8_encoder(unicode_csv_data, stop), \
                             delimiter=CSV_DELIM, \
-                            quoting=csv.QUOTE_NONE)
+                            quoting=quoting_mode)
 
     for row in csv_reader:
         yield row
-
-def _remove_double_quotes(entry):
-    """
-        If an entry starts and ends with double quotes, then remove them.
-        :type entry: str
-        :return: str
-    """
-    if len(entry) > 1 and entry.startswith('"') and entry.endswith('"'):
-        entry = entry[1:-1]
-
-    return entry
 
 def _process_row(row, row_num, hash_salt, out_fps, dict_objs=None,
                  dict_cins=[], norm_nums=[], norm_strs=[],
@@ -185,12 +180,9 @@ def _process_row(row, row_num, hash_salt, out_fps, dict_objs=None,
     if dict_objs:
         for i, entry in enumerate(row):
 
-            # strip leading and trailing spaces and double quotes.
+            # strip leading and trailing spaces.
             if entry:
                 entry = entry.strip()
-                # strip leading and trailing double quotes.
-                if remove_quotes:
-                    entry = _remove_double_quotes(entry)
 
             if not entry:
                 continue
@@ -212,12 +204,9 @@ def _process_row(row, row_num, hash_salt, out_fps, dict_objs=None,
     if isinstance(out_fps, list):
         for i, entry in enumerate(row):
 
-            # strip leading and trailing spaces and double quotes.
+            # strip leading and trailing spaces.
             if entry:
                 entry = entry.strip()
-                # strip leading and trailing double quotes.
-                if remove_quotes:
-                    entry = _remove_double_quotes(entry)
 
             if not entry:
                 continue
@@ -349,7 +338,7 @@ def process_chunk(inp_file, out_dir, hash_salt, start_row, chunknum,
 
         with open(inp_file, 'rb') as input_fp:
             input_fp.seek(start)
-            for idx, row in enumerate(unicode_csv_reader(input_fp, stop), start=1):
+            for idx, row in enumerate(unicode_csv_reader(input_fp, stop, use_quoting=args.get("remove_quotes", False)), start=1):
                 # Exclude lines of invalid length
                 if len(row) != numcols:
                     # Note that the row # may not be the row # in the file
@@ -471,7 +460,7 @@ class PddHash(object):
             Initialize the column names from the first line of the input file.
         """
         with open(self.input_file, 'rb') as input_fp:
-            cols = next(unicode_csv_reader(input_fp))
+            cols = next(unicode_csv_reader(input_fp, use_quoting=self.args.get("remove_quotes", False)))
             for c in cols:
                 self.column_names.append(c.strip())
 
@@ -1023,9 +1012,17 @@ def generate_edm_hash(conf_name, edm_conf):
 
 
     base_name = os.path.basename(input_file)
-    if len(base_name) > 240:
-        error_msg = "Filename too long (support 240 chars)"
+    if len(base_name) > MAX_FILENAME_LEN:
+        error_msg = f"Filename too long (support {MAX_FILENAME_LEN} chars)"
         logger.error(error_msg)
+        raise PddHashException(error_msg)
+
+    # Check if base filename (without extension) contains only alphanumeric and underscore
+    base_name_no_ext = os.path.splitext(base_name)[0]
+    if not re.match(r'^[a-zA-Z0-9_]+$', base_name_no_ext):
+        error_msg = f"Invalid filename '{base_name}'. Filename must contain only alphanumeric characters and underscores [a-zA-Z0-9_]"
+        logger.error(error_msg)
+        raise PddHashException(error_msg)
 
 
     col_names = []

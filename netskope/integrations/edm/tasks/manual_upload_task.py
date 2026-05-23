@@ -137,7 +137,7 @@ def execute_manual_upload_task(configuration_name, shared_with, file_name):
         )
         if is_unsanitized_data:
             file_path = Path(configuration_db.fileName)
-            if "csv" in file_path.suffix.lower():
+            if file_path.suffix.lower().replace(".", "") in ["csv", "txt"]:  # Validation on the extensions again here
                 os.rename(
                     csv_file_path,
                     f"{MANUAL_UPLOAD_PATH}/{configuration_db.name}/{file_path.stem}.good",
