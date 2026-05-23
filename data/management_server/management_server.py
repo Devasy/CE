@@ -14,19 +14,26 @@ import string
 import time
 import traceback
 import urllib
+import shutil
+import subprocess
+import ssl
+import zipfile
+import uuid
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from json import JSONDecodeError
 from urllib.parse import parse_qs, urlencode, urlparse
 from datetime import datetime, timedelta
+
 try:
     # Try to import UTC from datetime (Python 3.11+)
     from datetime import UTC
 except ImportError:
     # Fall back to timezone.utc for older versions (Python 3.8-3.10)
     from datetime import timezone
+
     UTC = timezone.utc
 
-import ssl
 
 import utils
 from utils import (
@@ -53,13 +60,12 @@ from utils import (
     validate_network_address,
     GLUSTERFS_BASE_PORT,
     GLUSTERFS_MAX_PORT,
+    fetch_container_info,
 )
 
 SECRET_KEY = os.getenv("JWT_SECRET")
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 API_PREFIX = "/api/management"
-SECRET_FILE_NAME = ".env.keys"
-RECOMMENDED_HOST_OS = ["Ubuntu 20", "Ubuntu 22", "RHEL 8", "RHEL 9"]
 AVAILABLE_INPUTS = {}
 UPDATES_ALLOWED_ON_ENV = [
     "HA_ENABLED",
@@ -83,10 +89,519 @@ SETTINGS_WRITE = "settings_write"
 ME_ROLE = "me"
 CERT_DIR = "./data/ssl_certs/mongodb_rabbitmq_certs/"
 JWT_ALGORITH = "HS256"
-JWT_ALGORITH_LIB_MAP = {
-    "HS256": hashlib.sha256
-}
+JWT_ALGORITH_LIB_MAP = {"HS256": hashlib.sha256}
 DEFAULT_USER = "management"
+DIAGNOSE_OUTPUT_DIR_DEFAULT = "./data/diagnose_output"
+CURRENT_DIAGNOSE_JOB = None
+TLSV2_CIPHER_STRING = (
+    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384"
+    ":ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
+)
+_diagnose_job_lock = threading.Lock()
+
+
+def _get_diagnose_output_dir():
+    """
+    Get the diagnose output directory based on HA mode.
+
+    In HA mode, uses the shared NFS directory for cross-node access.
+    In standalone mode, uses the local default directory.
+
+    Returns:
+        str: Path to the diagnose output directory
+    """
+    shared_dir_base_path = "/".join(
+        (AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY", "").strip().rstrip("/").split("/"))[:-1]
+    )
+
+    if shared_dir_base_path:
+        diagnose_output_dir = os.path.join(shared_dir_base_path, "data", "diagnose_output")
+    else:
+        diagnose_output_dir = DIAGNOSE_OUTPUT_DIR_DEFAULT
+    logger.debug(f"Diagnose Directory : {diagnose_output_dir}")
+    return diagnose_output_dir
+
+
+def _get_diagnose_job_metadata_path(job_id, output_dir=None):
+    """
+    Get the path to the job metadata file for a given job_id.
+
+    Args:
+        job_id: The diagnose job ID
+        output_dir: Optional output directory, defaults to _get_diagnose_output_dir()
+
+    Returns:
+        str: Path to the metadata JSON file
+    """
+    if output_dir is None:
+        output_dir = _get_diagnose_output_dir()
+    return os.path.join(output_dir, f".diagnose_job_{job_id}.json")
+
+
+def _save_diagnose_job_metadata(job_data, output_dir=None):
+    """
+    Save diagnose job metadata to a file for persistence across restarts.
+
+    Args:
+        job_data: Dictionary containing job state
+        output_dir: Optional output directory
+    """
+    if not job_data or not job_data.get("job_id"):
+        logger.warning("Cannot save metadata: job_data is empty or missing job_id", extra={"node": utils.NODE_IP})
+        return
+
+    try:
+        if output_dir is None:
+            output_dir = _get_diagnose_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+
+        metadata_path = _get_diagnose_job_metadata_path(job_data["job_id"], output_dir)
+        logger.info(f"Attempting to save metadata to: {metadata_path}", extra={"node": utils.NODE_IP})
+        with open(metadata_path, "w") as f:
+            json.dump(job_data, f, indent=2)
+        logger.info(f"Successfully saved diagnose job metadata: {metadata_path}", extra={"node": utils.NODE_IP})
+    except Exception as e:
+        logger.error(f"Failed to save diagnose job metadata to {metadata_path}: {e}", extra={"node": utils.NODE_IP})
+        raise e
+
+
+def _load_diagnose_job_metadata(job_id, output_dir=None):
+    """
+    Load diagnose job metadata from file.
+
+    Args:
+        job_id: The diagnose job ID to load
+        output_dir: Optional output directory
+
+    Returns:
+        dict or None: Job metadata if found and valid, None otherwise
+    """
+    try:
+        if output_dir is None:
+            output_dir = _get_diagnose_output_dir()
+
+        metadata_path = _get_diagnose_job_metadata_path(job_id, output_dir)
+        if not os.path.exists(metadata_path):
+            return None
+
+        with open(metadata_path, "r") as f:
+            job_data = json.load(f)
+
+        # Validate the loaded data has required fields
+        if job_data.get("job_id") == job_id:
+            return job_data
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to load diagnose job metadata for {job_id}: {e}", extra={"node": utils.NODE_IP})
+        return None
+
+
+def _delete_diagnose_job_metadata(job_id, output_dir=None):
+    """
+    Delete diagnose job metadata file.
+
+    Args:
+        job_id: The diagnose job ID
+        output_dir: Optional output directory
+    """
+    try:
+        if output_dir is None:
+            output_dir = _get_diagnose_output_dir()
+
+        metadata_path = _get_diagnose_job_metadata_path(job_id, output_dir)
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
+            logger.info(f"Deleted diagnose job metadata: {metadata_path}", extra={"node": utils.NODE_IP})
+    except Exception as e:
+        logger.warning(f"Failed to delete diagnose job metadata: {e}", extra={"node": utils.NODE_IP})
+
+
+def _cleanup_all_diagnose_files(output_dir=None, exclude_job_id=None):
+    """
+    Clean up all diagnose job files (metadata and zip files) in the output directory.
+
+    Ensures only one diagnose job's files exist at a time. Called when starting a new job.
+
+    Args:
+        output_dir: Optional output directory
+        exclude_job_id: Optional job_id to exclude from cleanup (keep this one)
+    """
+    try:
+        if output_dir is None:
+            output_dir = _get_diagnose_output_dir()
+
+        if not os.path.exists(output_dir):
+            return
+
+        for filename in os.listdir(output_dir):
+            should_delete = False
+
+            # Check for metadata files: .diagnose_job_{job_id}.json
+            if filename.startswith(".diagnose_job_") and filename.endswith(".json"):
+                should_delete = True
+            # Check for diagnose zip files: diagnose_*.zip
+            elif filename.startswith("diagnose_") and filename.endswith(".zip"):
+                should_delete = True
+            # Check for cluster zip files: cluster_*.zip
+            elif filename.startswith("cluster_") and filename.endswith(".zip"):
+                should_delete = True
+
+            if should_delete:
+                # Skip if this file belongs to the excluded job
+                if exclude_job_id and exclude_job_id in filename:
+                    continue
+                try:
+                    filepath = os.path.join(output_dir, filename)
+                    os.remove(filepath)
+                    logger.info(f"Cleaned up old diagnose file: {filename}", extra={"node": utils.NODE_IP})
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup {filename}: {e}", extra={"node": utils.NODE_IP})
+    except Exception as e:
+        logger.warning(f"Failed to cleanup diagnose files: {e}", extra={"node": utils.NODE_IP})
+
+
+def _find_diagnose_file_by_job_id(job_id, output_dir=None):
+    """
+    Search for a diagnose zip file by job_id in the filename.
+
+    Filename patterns:
+        - diagnose_{job_id}_{timestamp}.zip (standalone)
+        - cluster_{job_id}_{timestamp}.zip (HA mode)
+
+    Args:
+        job_id: The diagnose job ID to search for
+        output_dir: Optional output directory
+
+    Returns:
+        tuple: (file_path, file_name) if found, (None, None) otherwise
+    """
+    try:
+        if output_dir is None:
+            output_dir = _get_diagnose_output_dir()
+
+        if not os.path.exists(output_dir):
+            return None, None
+
+        # Search for files matching the pattern with job_id
+        for filename in os.listdir(output_dir):
+            if filename.endswith(".zip") and job_id in filename:
+                # Verify it matches expected patterns
+                if filename.startswith("diagnose_") or filename.startswith("cluster_"):
+                    file_path = os.path.join(output_dir, filename)
+                    if os.path.exists(file_path):
+                        return file_path, filename
+
+        return None, None
+    except Exception as e:
+        logger.warning(f"Error searching for diagnose file: {e}", extra={"node": utils.NODE_IP})
+        return None, None
+
+
+def _find_latest_diagnose_file(output_dir=None):
+    """
+    Find the most recent diagnose zip file in the output directory.
+
+    This is used as a fallback when no job_id is provided.
+
+    Args:
+        output_dir: Optional output directory
+
+    Returns:
+        tuple: (file_path, file_name, job_id) if found, (None, None, None) otherwise
+    """
+    try:
+        if output_dir is None:
+            output_dir = _get_diagnose_output_dir()
+
+        if not os.path.exists(output_dir):
+            return None, None, None
+
+        latest_file = None
+        latest_mtime = 0
+        latest_job_id = None
+
+        for filename in os.listdir(output_dir):
+            if filename.endswith(".zip") and (filename.startswith("diagnose_") or filename.startswith("cluster_")):
+                file_path = os.path.join(output_dir, filename)
+                mtime = os.path.getmtime(file_path)
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_file = file_path
+                    # Extract job_id from filename: prefix_{job_id}_{timestamp}.zip
+                    parts = filename.rsplit("_", 1)[0]  # Remove timestamp.zip
+                    if "_" in parts:
+                        # Get the UUID part (after prefix_)
+                        job_id_part = parts.split("_", 1)[1] if "_" in parts else None
+                        # UUID is 36 chars, check if it looks like one
+                        if job_id_part and len(job_id_part) >= 36:
+                            latest_job_id = job_id_part[:36]
+
+        if latest_file:
+            return latest_file, os.path.basename(latest_file), latest_job_id
+        return None, None, None
+    except Exception as e:
+        logger.warning(f"Error finding latest diagnose file: {e}", extra={"node": utils.NODE_IP})
+        return None, None, None
+
+
+def _recover_diagnose_job_state(job_id=None):
+    """
+    Attempt to recover diagnose job state from file system after restart.
+
+    This function checks for:
+    1. Metadata file for the specific job_id (if provided)
+    2. Zip file matching the job_id pattern
+    3. Latest available diagnose file (if no job_id)
+
+    Args:
+        job_id: Optional specific job ID to recover
+
+    Returns:
+        dict or None: Recovered job state if found
+    """
+    output_dir = _get_diagnose_output_dir()
+
+    # Check if output directory exists
+    if not os.path.exists(output_dir):
+        return None
+
+    # If job_id provided, try to recover that specific job
+    if job_id:
+        # First check metadata file
+        job_data = _load_diagnose_job_metadata(job_id, output_dir)
+        if job_data:
+            # Verify the file still exists
+            file_path = job_data.get("file_path")
+            if file_path and os.path.exists(file_path):
+                logger.info(f"Recovered diagnose job {job_id} from metadata", extra={"node": utils.NODE_IP})
+                return job_data
+            # File doesn't exist - clean up stale metadata
+            _delete_diagnose_job_metadata(job_id, output_dir)
+
+        # Fallback: search for file by job_id in filename
+        file_path, file_name = _find_diagnose_file_by_job_id(job_id, output_dir)
+        if file_path:
+            recovered_job = {
+                "job_id": job_id,
+                "status": "completed",
+                "message": "Recovered after restart",
+                "file_path": file_path,
+                "file_name": file_name,
+                "error": None,
+                "node_summary": None,
+            }
+            logger.info(f"Recovered diagnose job {job_id} from filename", extra={"node": utils.NODE_IP})
+            return recovered_job
+
+    # No specific job_id - search for latest metadata file first (for running jobs)
+    latest_metadata_file = None
+    latest_metadata_mtime = 0
+
+    try:
+        for filename in os.listdir(output_dir):
+            if filename.startswith(".diagnose_job_") and filename.endswith(".json"):
+                file_path = os.path.join(output_dir, filename)
+                mtime = os.path.getmtime(file_path)
+                if mtime > latest_metadata_mtime:
+                    latest_metadata_mtime = mtime
+                    latest_metadata_file = filename
+
+        if latest_metadata_file:
+            # Extract job_id from .diagnose_job_{job_id}.json
+            extracted_job_id = latest_metadata_file.replace(".diagnose_job_", "").replace(".json", "")
+
+            job_data = _load_diagnose_job_metadata(extracted_job_id, output_dir)
+            if job_data:
+                # For running jobs, file_path will be None
+                if job_data.get("status") == "running":
+                    logger.info(f"Recovered running diagnose job {extracted_job_id}", extra={"node": utils.NODE_IP})
+                    return job_data
+                # For completed jobs, verify file exists
+                elif job_data.get("file_path") and os.path.exists(job_data["file_path"]):
+                    logger.info(f"Recovered completed diagnose job {extracted_job_id}", extra={"node": utils.NODE_IP})
+                    return job_data
+                else:
+                    _delete_diagnose_job_metadata(extracted_job_id, output_dir)
+    except Exception as e:
+        logger.warning(f"Error searching metadata files: {e}", extra={"node": utils.NODE_IP})
+
+    # Fallback: search for latest zip file (for completed jobs without metadata)
+    file_path, file_name, extracted_job_id = _find_latest_diagnose_file(output_dir)
+    if file_path and extracted_job_id:
+        # Try to load metadata for this job
+        job_data = _load_diagnose_job_metadata(extracted_job_id, output_dir)
+        if job_data and job_data.get("file_path") and os.path.exists(job_data["file_path"]):
+            logger.info(f"Recovered latest diagnose job {extracted_job_id}", extra={"node": utils.NODE_IP})
+            return job_data
+
+        # Clean up stale metadata if file path doesn't match or doesn't exist
+        if job_data:
+            _delete_diagnose_job_metadata(extracted_job_id, output_dir)
+
+        # Create minimal recovered state
+        recovered_job = {
+            "job_id": extracted_job_id,
+            "status": "completed",
+            "message": "Recovered after restart",
+            "file_path": file_path,
+            "file_name": file_name,
+            "error": None,
+            "node_summary": None,
+        }
+        logger.info(f"Recovered latest diagnose job {extracted_job_id} from zip file", extra={"node": utils.NODE_IP})
+        return recovered_job
+
+    return None
+
+
+# SNI-based certificate hot-reload
+_cached_ssl_context = None
+_cached_cert_mtime = None
+_ssl_context_lock = threading.Lock()
+
+
+def _create_ssl_context_internal(server_cert, server_key, client_ca, sni_callback=None, tls_version="1.3"):
+    """Create SSL context with given certificates and TLS version.
+
+    Args:
+        server_cert (str): Path to server certificate file.
+        server_key (str): Path to server key file.
+        client_ca (str): Path to client CA file.
+        sni_callback (callable, optional): SNI callback function.
+        tls_version (str): TLS version to use ("1.2" or "1.3"). Defaults to "1.3".
+
+    Returns:
+        ssl.SSLContext: Configured SSL context with secure cipher suites.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    # Set minimum TLS version based on configuration
+    if tls_version == "1.3":
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        logger.info("TLS 1.3 minimum version configured for Management Server", extra={"node": utils.NODE_IP})
+    elif tls_version == "1.2":
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers(TLSV2_CIPHER_STRING)
+        logger.info("TLS 1.2 minimum version configured for Management Server", extra={"node": utils.NODE_IP})
+    else:
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        logger.warning(
+            f"Invalid TLS version '{tls_version}' specified, defaulting to TLS 1.3", extra={"node": utils.NODE_IP}
+        )
+
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.load_cert_chain(certfile=server_cert, keyfile=server_key)
+    context.load_verify_locations(cafile=client_ca)
+    context.check_hostname = False
+    if sni_callback:
+        context.sni_callback = sni_callback
+    return context
+
+
+def force_ssl_context_reload(tls_version="1.3"):
+    """Force immediate reload of SSL context with new certificates.
+
+    This must be called after generating new certificates and BEFORE
+    making any API calls to ensure the server presents the new certs.
+
+    Args:
+        tls_version (str): TLS version to use ("1.2" or "1.3"). Defaults to "1.3".
+    """
+    global _cached_ssl_context, _cached_cert_mtime
+
+    try:
+        server_cert, server_key, client_ca = get_certs_locations()
+
+        with _ssl_context_lock:
+            # Get the existing SNI callback from current context
+            # We need to preserve the SNI callback for future hot-reloads
+
+            if _cached_ssl_context is not None:
+                try:
+                    _ = _cached_ssl_context.sni_callback
+                except Exception:
+                    pass
+
+            # Create new SSL context with updated certificates
+            # Use the same SNI callback structure as get_ssl_context_with_sni()
+            def sni_callback(ssl_socket, server_name, original_context):
+                """Hot-reload certificates if file changed."""
+                global _cached_ssl_context, _cached_cert_mtime
+                try:
+                    server_cert, server_key, client_ca = get_certs_locations()
+                    current_mtime = os.path.getmtime(server_cert)
+                    with _ssl_context_lock:
+                        if _cached_cert_mtime is not None and current_mtime > _cached_cert_mtime:
+                            new_context = _create_ssl_context_internal(
+                                server_cert, server_key, client_ca, sni_callback, tls_version
+                            )
+                            _cached_ssl_context = new_context
+                            _cached_cert_mtime = current_mtime
+                            logger.info("Certificate hot-reloaded", extra={"node": utils.NODE_IP})
+                            ssl_socket.context = new_context
+                        return None
+                except Exception as e:
+                    logger.error(f"SNI callback error: {e}", extra={"node": utils.NODE_IP})
+                    return None
+
+            # Create and cache new SSL context
+            new_context = _create_ssl_context_internal(server_cert, server_key, client_ca, sni_callback, tls_version)
+            _cached_ssl_context = new_context
+            _cached_cert_mtime = os.path.getmtime(server_cert)
+
+            logger.info("SSL context reloaded with new certificates", extra={"node": utils.NODE_IP})
+        return True
+    except Exception as e:
+        logger.error(f"Failed to reload SSL context: {e}", extra={"node": utils.NODE_IP})
+        return False
+
+
+def get_ssl_context_with_sni(tls_version="1.3"):
+    """Create SSL context with SNI callback for certificate hot-reload.
+
+    Args:
+        tls_version (str): TLS version to use ("1.2" or "1.3"). Defaults to "1.3".
+
+    Returns:
+        ssl.SSLContext: Configured SSL context.
+    """
+    global _cached_ssl_context, _cached_cert_mtime
+
+    def sni_callback(ssl_socket, server_name, original_context):
+        """Hot-reload certificates if file changed."""
+        global _cached_ssl_context, _cached_cert_mtime
+
+        try:
+            server_cert, server_key, client_ca = get_certs_locations()
+            current_mtime = os.path.getmtime(server_cert)
+
+            with _ssl_context_lock:
+                if _cached_cert_mtime is not None and current_mtime > _cached_cert_mtime:
+                    new_context = _create_ssl_context_internal(
+                        server_cert,
+                        server_key,
+                        client_ca,
+                        sni_callback,
+                        tls_version,
+                    )
+                    _cached_ssl_context = new_context
+                    _cached_cert_mtime = current_mtime
+
+                    logger.info("Certificate hot-reloaded", extra={"node": utils.NODE_IP})
+                    ssl_socket.context = new_context
+                return None
+
+        except Exception as e:
+            logger.error(f"SNI callback error: {e}", extra={"node": utils.NODE_IP})
+            return None
+
+    server_cert, server_key, client_ca = get_certs_locations()
+    context = _create_ssl_context_internal(server_cert, server_key, client_ca, sni_callback, tls_version)
+
+    _cached_ssl_context = context
+    _cached_cert_mtime = os.path.getmtime(server_cert)
+
+    return context
 
 
 def get_all_existed_env_variable(location=".env", override=True):
@@ -140,6 +655,64 @@ def move_secret_file(source, destination):
         raise Exception(f"Error occurred while moving secret file. Error: {e}")
 
 
+def get_decrypted_jwt_secret():
+    """
+    Get the decrypted JWT_SECRET from .env.keys file or config file.
+
+    Returns:
+        str: The decrypted JWT secret, or None if not found or decryption fails.
+    """
+    try:
+        # 1. Try from environment variable
+        jwt_from_env = os.getenv("JWT_SECRET")
+        if jwt_from_env:
+            return jwt_from_env
+
+        # 2. Try from AVAILABLE_INPUTS (loaded from .env)
+        jwt_from_inputs = AVAILABLE_INPUTS.get("JWT_SECRET")
+        if jwt_from_inputs and not AVAILABLE_INPUTS.get("CE_SETUP_ID"):
+            return jwt_from_inputs
+
+        # 3. Try to decrypt from .env.keys
+        secret_location = AVAILABLE_INPUTS.get("LOCATION") or os.getenv("LOCATION", ".env.keys")
+        if os.path.exists(secret_location):
+            encrypted_jwt = None
+            with open(secret_location, "r") as f:
+                for line in f:
+                    if line.startswith("JWT_SECRET="):
+                        encrypted_jwt = line.strip().split("=", 1)[1]
+                        break
+
+            if encrypted_jwt:
+                ce_setup_id = (AVAILABLE_INPUTS.get("CE_SETUP_ID") or os.getenv("CE_SETUP_ID", "")).strip('"')
+                ce_hex_code = AVAILABLE_INPUTS.get("CE_HEX_CODE") or os.getenv("CE_HEX_CODE", "")
+                ce_iv = AVAILABLE_INPUTS.get("CE_IV") or os.getenv("CE_IV", "")
+
+                if all([ce_setup_id, ce_hex_code, ce_iv]):
+                    if not AVAILABLE_INPUTS.get("CE_SETUP_ID"):
+                        AVAILABLE_INPUTS["CE_SETUP_ID"] = f'"{ce_setup_id}"'
+                        AVAILABLE_INPUTS["CE_HEX_CODE"] = ce_hex_code
+                        AVAILABLE_INPUTS["CE_IV"] = ce_iv
+                    decrypted_jwt = utils.encrypt_decrypt_secret(
+                        encrypted_jwt, forward=False, available_inputs=AVAILABLE_INPUTS
+                    )
+                    if decrypted_jwt:
+                        return decrypted_jwt
+
+        # 4. Fallback to config file (secondary node scenarios)
+        config = read_config_file(CONFIG_FILE_PATH)
+        if config.get("JWT_SECRET"):
+            return config.get("JWT_SECRET")
+
+        return jwt_from_inputs
+    except Exception:
+        try:
+            config = read_config_file(CONFIG_FILE_PATH)
+            return config.get("JWT_SECRET")
+        except Exception:
+            return AVAILABLE_INPUTS.get("JWT_SECRET")
+
+
 def retirable_execute_command(
     command,
     env=None,
@@ -173,9 +746,7 @@ def retirable_execute_command(
     while attempt <= max_retries:
         attempt += 1
         return_code = 0
-        for message in execute_command(
-            command, env=env, shell=shell, input_data=input_data
-        ):
+        for message in execute_command(command, env=env, shell=shell, input_data=input_data):
             if message.get("type", "") == "returncode":
                 return_code = message.get("code", 0)
                 if return_code != 0:
@@ -221,9 +792,7 @@ def get_load_average(processors):
                 # The output is typically: '1.23 0.98 0.76 2/345 12345'
                 # We only care about the first three numbers (1, 5, 15 min averages).
             except Exception as e:
-                logger.error(
-                    f"Parsing error in loadavg: {e}", extra={"node": utils.NODE_IP}
-                )
+                logger.error(f"Parsing error in loadavg: {e}", extra={"node": utils.NODE_IP})
         elif result["type"] == "stderr":
             logger.error(
                 f"Error encountered while fetching cpu load from /proc/loadavg. {result['message']}",
@@ -290,8 +859,7 @@ def get_memory_usage():
             meminfo[key.strip()] = int(value.strip().split()[0])
         elif result["type"] == "stderr":
             logger.error(
-                f"Error encountered while fetching memory information from /proc/meminfo. "
-                f"{result['message']}",
+                f"Error encountered while fetching memory information from /proc/meminfo. {result['message']}",
                 extra={"node": utils.NODE_IP},
             )
         elif result["type"] == "returncode" and result["code"] != 0:
@@ -377,7 +945,10 @@ def handle_http_errors(res):
     elif status_code == 400:
         raise ClientExceptions("Bad Request Error.")
     elif status_code == 401:
-        raise ClientExceptions("Unauthorized Error. Please ensure configured JWT_SECRET is same as Primary Node's JWT_SECRET before executing CE Setup.")
+        raise ClientExceptions(
+            "Unauthorized Error. "
+            "Please ensure configured JWT_SECRET is same as Primary Node's JWT_SECRET before executing CE Setup."
+        )
     elif status_code == 403:
         raise ClientExceptions("Forbidden Error.")
     elif status_code == 404:
@@ -504,8 +1075,9 @@ class SimpleAPIServer(BaseHTTPRequestHandler):
         before writing the output to stderr.
 
         """
-        # overridden.
+
         def strip_control_chars(s):
+            # overridden.
             return "".join(c for c in s if c in string.printable)
 
         message = format % args
@@ -519,9 +1091,7 @@ class SimpleAPIServer(BaseHTTPRequestHandler):
         """Add CORS headers to response."""
         # Add CORS headers
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header(
-            "Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, PATCH, OPTIONS"
-        )
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, PATCH, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -582,6 +1152,11 @@ class SimpleAPIServer(BaseHTTPRequestHandler):
                             return
                     try:
                         response, status_code = handler(self)
+
+                        # If handler returns None, it has already sent the response (e.g., file streaming)
+                        if response is None:
+                            return
+
                         response = json.dumps(response).encode()
                     except Exception as e:
                         logger.error(
@@ -590,9 +1165,7 @@ class SimpleAPIServer(BaseHTTPRequestHandler):
                             extra={"node": utils.NODE_IP},
                         )
                         response = json.dumps(
-                            {
-                                "details": f"Error handling request for {self.path}. Error: {str(e)}"
-                            }
+                            {"details": f"Error handling request for {self.path}. Error: {str(e)}"}
                         ).encode()
                         status_code = 500
                     self.send_response(status_code)
@@ -613,8 +1186,7 @@ class SimpleAPIServer(BaseHTTPRequestHandler):
                 return
         except Exception as e:
             logger.error(
-                f"Error handling request for {self.path}. Error: {str(e)} "
-                f"Traceback: {traceback.format_exc()}",
+                f"Error handling request for {self.path}. Error: {str(e)} Traceback: {traceback.format_exc()}",
                 extra={"node": utils.NODE_IP},
             )
             return
@@ -628,23 +1200,15 @@ class SimpleAPIServer(BaseHTTPRequestHandler):
         """
         global SECRET_KEY
         if SECRET_KEY is None:
-            config = read_config_file(CONFIG_FILE_PATH)
-            if config.get("JWT_SECRET") is None:
-                SECRET_KEY = os.getenv("JWT_SECRET")
-            else:
-                SECRET_KEY = config.get("JWT_SECRET")
+            SECRET_KEY = get_decrypted_jwt_secret()
         if SECRET_KEY is None or SECRET_KEY == "":
             logger.error(
                 "JWT_SECRET is not set in the environment variable or config file.",
                 extra={"node": utils.NODE_IP},
             )
-            raise Exception(
-                "JWT_SECRET is not set in the environment variable or config file."
-            )
+            raise Exception("JWT_SECRET is not set in the environment variable or config file.")
         auth_header = self.headers.get("Authorization")
-        if auth_header and (
-            auth_header.startswith("Bearer ") or auth_header.startswith("bearer ")
-        ):
+        if auth_header and (auth_header.startswith("Bearer ") or auth_header.startswith("bearer ")):
             token = auth_header.split(" ")[1]
             return self.verify_token(token, scopes)
         return False
@@ -668,10 +1232,7 @@ class SimpleAPIServer(BaseHTTPRequestHandler):
                 raise ValueError("Token does not have valid structure.")
 
             # Verify signature
-            expected_sig = hmac.new(
-                SECRET_KEY.encode(), message, JWT_ALGORITH_LIB_MAP[JWT_ALGORITH]
-            ).digest()
-
+            expected_sig = hmac.new(SECRET_KEY.encode(), message, JWT_ALGORITH_LIB_MAP[JWT_ALGORITH]).digest()
             if not hmac.compare_digest(signature, expected_sig):
                 raise ValueError("Invalid Signature")
 
@@ -756,9 +1317,7 @@ def create_token(auth_header):
             return None
 
         header_dict = {"alg": "HS256", "typ": "JWT"}
-        encoded_header = base64.urlsafe_b64encode(
-            json.dumps(header_dict).encode('utf-8')
-        ).decode().rstrip('=')
+        encoded_header = base64.urlsafe_b64encode(json.dumps(header_dict).encode("utf-8")).decode().rstrip("=")
 
         payload_dict = {
             "username": payload.get("username", DEFAULT_USER),
@@ -766,16 +1325,14 @@ def create_token(auth_header):
             "type": "service-access",
             "exp": int((datetime.now(UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp()),
         }
-        encoded_payload = base64.urlsafe_b64encode(
-            json.dumps(payload_dict).encode('utf-8')
-        ).decode().rstrip('=')
+        encoded_payload = base64.urlsafe_b64encode(json.dumps(payload_dict).encode("utf-8")).decode().rstrip("=")
         signing_input = f"{encoded_header}.{encoded_payload}".encode()
         signature_binary = hmac.new(
             SECRET_KEY.encode(),
             signing_input,
             JWT_ALGORITH_LIB_MAP[JWT_ALGORITH],
         ).digest()
-        encoded_signature = base64.urlsafe_b64encode(signature_binary).decode().rstrip('=')
+        encoded_signature = base64.urlsafe_b64encode(signature_binary).decode().rstrip("=")
         return f"{encoded_header}.{encoded_payload}.{encoded_signature}"
     except Exception as e:
         logger.error(f"encountered error while creating token: {e} {traceback.format_exc()}")
@@ -784,46 +1341,82 @@ def create_token(auth_header):
 
 def get_certs_locations():
     """Get the locations of the server certificate, server private key, and client CA certificate."""
-    server_cert = CERT_DIR + 'tls_cert.crt'  # Server certificate
-    server_key = CERT_DIR + 'tls_cert_key.key'   # Server private key
-    client_ca = CERT_DIR + 'tls_cert_ca.crt'  # CA certificate that signed client certificates
+    server_cert = CERT_DIR + "tls_cert.crt"  # Server certificate
+    server_key = CERT_DIR + "tls_cert_key.key"  # Server private key
+    client_ca = CERT_DIR + "tls_cert_ca.crt"  # CA certificate that signed client certificates
     if not os.path.exists(server_cert) or not os.path.exists(server_key) or not os.path.exists(client_ca):
         raise Exception("SSL certificates not found.")
 
     return server_cert, server_key, client_ca
 
 
-def run(server_class=HTTPServer, handler_class=SimpleAPIServer):
-    """
-    Run the API server.
+def get_tls_version():
+    """Get the TLS version from configuration.
 
-    Args:
-        server_class (class): Server class to use, defaults to HTTPServer.
-        handler_class (class): Handler class to use, defaults to SimpleAPIServer.
+    Returns:
+        str: The TLS version to use ("1.2" or "1.3"). Defaults to "1.3" if not configured.
     """
+    # Load environment variables with proper priority: cloudexchange.config → .env → default
+    success, error_msg = load_environment_from_multiple_sources(handler=None)
+    if not success:
+        logger.error(f"Failed to load environment: {error_msg}", extra={"node": utils.NODE_IP})
+
+    utils.read_cloud_exchange_config_file()
+    tls_version_config = utils.CLOUD_EXCHANGE_CONFIG.get("TLS_VERSION")
+
+    if not tls_version_config:
+        tls_version_config = AVAILABLE_INPUTS.get("TLS_VERSION")
+
+    if not tls_version_config:
+        tls_version_config = "1.3"
+
+    tls_version_config = str(tls_version_config).strip().strip('"').strip("'")
+    tls_version_config = tls_version_config.upper().replace("TLSV", "")
+
+    # Parse TLS version - handle both single version ("1.3") and multiple versions ("1.2,1.3")
+    # When multiple versions are specified, use the minimum version as the baseline
+    tls_version_config = tls_version_config.replace(" ", ",")
+    if "," in tls_version_config:
+        versions = [v.strip() for v in str(tls_version_config).split(",")]
+        # Filter valid versions and sort to get minimum
+        valid_versions = [v for v in versions if v in ["1.2", "1.3"]]
+        if valid_versions:
+            tls_version = min(valid_versions)  # "1.2" < "1.3" in string comparison
+            logger.info(
+                f"Multiple TLS versions specified: {tls_version_config}. Using minimum version: {tls_version}",
+                extra={"node": utils.NODE_IP},
+            )
+        else:
+            tls_version = "1.3"
+            logger.warning(
+                f"No valid TLS versions found in config: {tls_version_config}. Defaulting to TLS 1.3",
+                extra={"node": utils.NODE_IP},
+            )
+    else:
+        tls_version = str(tls_version_config).strip()
+
+    return tls_version
+
+
+def run(server_class=HTTPServer, handler_class=SimpleAPIServer):
+    """Run the API server with certificate hot-reload and configured TLS version."""
     server_cert, server_key, client_ca = get_certs_locations()
 
     if not os.path.exists(server_cert) or not os.path.exists(server_key) or not os.path.exists(client_ca):
         raise Exception("Certificates not found.")
 
     port = int(os.getenv("CE_MANAGEMENT_PORT", 8000))
-    server_address = ('0.0.0.0', port)
+    server_address = ("0.0.0.0", port)
     httpd = server_class(server_address, handler_class)
 
-    # Improved SSL context configuration
-    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    context.verify_mode = ssl.CERT_REQUIRED  # Require client certificate
-    context.load_cert_chain(certfile=server_cert, keyfile=server_key)
-    context.load_verify_locations(cafile=client_ca)
-    context.check_hostname = False
+    # Use SSL context with SNI callback for automatic certificate hot-reload
+    # This enables loading new certificates without server restart
+    tls_version = get_tls_version()
+    context = get_ssl_context_with_sni(tls_version=tls_version)
 
-    httpd.socket = context.wrap_socket(
-        httpd.socket,
-        server_side=True,
-        do_handshake_on_connect=True
-    )
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=True)
 
-    logger.info(f"Server running at https://{server_address[0]}:{server_address[1]}")
+    logger.info(f"Server running at https://{server_address[0]}:{server_address[1]} (with certificate hot-reload)")
     httpd.serve_forever()
 
 
@@ -874,30 +1467,10 @@ def update_env(handler, update_data=None, env_file=None):
     errors = {}
     for key, value in update_data.items():
         if key in UPDATES_ALLOWED_ON_ENV:
-            if key == "MAINTENANCE_PASSWORD":
-                if (
-                    ("\\" in value)
-                    or ("/" in value)
-                    or ("'" in value)
-                    or ('"' in value)
-                    or (" " in value)
-                ):
-                    errors[key] = "Invalid value for maintenance password"
             should_proceed = True
 
     if not should_proceed or errors:
         return {"detail": "Invalid data provided", "errors": errors}, 400
-    for key, value in update_data.items():
-        if key in UPDATES_ALLOWED_ON_ENV:
-            if key == "MAINTENANCE_PASSWORD":
-                if (
-                    ("\\" in value)
-                    or ("/" in value)
-                    or ("'" in value)
-                    or ('"' in value)
-                    or (" " in value)
-                ):
-                    return {"detail": "Invalid value for environment variable"}, 400
 
     if env_file:
         env_file_path = env_file
@@ -917,9 +1490,7 @@ def update_env(handler, update_data=None, env_file=None):
                     if key == "MAINTENANCE_PASSWORD":
                         passwords = {
                             "MAINTENANCE_PASSWORD": f"'{value}'",
-                            "MAINTENANCE_PASSWORD_ESCAPED": urllib.parse.quote_plus(
-                                value
-                            ),
+                            "MAINTENANCE_PASSWORD_ESCAPED": urllib.parse.quote_plus(value),
                         }
                         secret_location = get_secret_location(AVAILABLE_INPUTS)
                         if os.path.exists(secret_location):
@@ -999,12 +1570,9 @@ def start_ce(handler, should_end_stream=True, ip=None, as_api=True):
         ip = utils.NODE_IP
 
     if (
-        AVAILABLE_INPUTS.get("HA_CURRENT_NODE") is not None
-        and ip != AVAILABLE_INPUTS.get("HA_CURRENT_NODE")
+        AVAILABLE_INPUTS.get("HA_CURRENT_NODE") is not None and ip != AVAILABLE_INPUTS.get("HA_CURRENT_NODE")
     ) or ip != utils.NODE_IP:
-        logger.info(
-            f"Starting Cloud Exchange on Node {ip}", extra={"node": utils.NODE_IP}
-        )
+        logger.info(f"Starting Cloud Exchange on Node {ip}", extra={"node": utils.NODE_IP})
         try:
             for response_chunk in check_management_server(
                 handler=handler,
@@ -1025,9 +1593,7 @@ def start_ce(handler, should_end_stream=True, ip=None, as_api=True):
                 handler.wfile,
                 f"End: Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}\n",
             )
-            return {
-                "detail": f"Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}"
-            }, 500
+            return {"detail": f"Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}"}, 500
         finally:
             end_stream(handler=handler, should_end_stream=should_end_stream)
     else:
@@ -1089,12 +1655,9 @@ def stop_ce(handler, should_end_stream=True, ip=None, as_api=True):
         ip = utils.NODE_IP
 
     if (
-        AVAILABLE_INPUTS.get("HA_CURRENT_NODE") is not None
-        and ip != AVAILABLE_INPUTS.get("HA_CURRENT_NODE")
+        AVAILABLE_INPUTS.get("HA_CURRENT_NODE") is not None and ip != AVAILABLE_INPUTS.get("HA_CURRENT_NODE")
     ) or ip != utils.NODE_IP:
-        logger.info(
-            f"Stopping Cloud Exchange on Node {ip}", extra={"node": utils.NODE_IP}
-        )
+        logger.info(f"Stopping Cloud Exchange on Node {ip}", extra={"node": utils.NODE_IP})
         try:
             for response_chunk in check_management_server(
                 handler=handler,
@@ -1115,9 +1678,7 @@ def stop_ce(handler, should_end_stream=True, ip=None, as_api=True):
                 handler.wfile,
                 f"End: Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}\n",
             )
-            return {
-                "detail": f"Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}"
-            }, 500
+            return {"detail": f"Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}"}, 500
         finally:
             end_stream(handler=handler, should_end_stream=should_end_stream)
     else:
@@ -1205,31 +1766,1056 @@ def restart_ce(handler, as_api=True):
 
     try:
         write_chunk(handler.wfile, "Info: Restarting Cloud Exchange.\n")
-        response = stop_ce(
-            handler=handler, should_end_stream=False, as_api=False, ip=ip
-        )
+        response = stop_ce(handler=handler, should_end_stream=False, as_api=False, ip=ip)
         if response[1] != 200:
             end_stream(handler=handler)
             return response
-        response = start_ce(
-            handler=handler, should_end_stream=False, as_api=False, ip=ip
-        )
+        response = start_ce(handler=handler, should_end_stream=False, as_api=False, ip=ip)
         if response[1] != 200:
             end_stream(handler=handler)
             return response
         write_chunk(handler.wfile, "Info: Cloud Exchange restarted.\n")
     except Exception as e:
-        logger.error(
-            f"Error Restarting the Cloud Exchange: {e}", extra={"node": utils.NODE_IP}
-        )
-        write_chunk(
-            handler.wfile, f"End: Error Restarting the Cloud Exchange: {str(e)}\n"
-        )
+        logger.error(f"Error Restarting the Cloud Exchange: {e}", extra={"node": utils.NODE_IP})
+        write_chunk(handler.wfile, f"End: Error Restarting the Cloud Exchange: {str(e)}\n")
         end_stream(handler=handler)
         return {"detail": f"Error Restarting the Cloud Exchange: {str(e)}"}, 500
     finally:
         end_stream(handler=handler)
     return {"detail": "Restarted Cloud Exchange successfully."}, 200
+
+
+def generate_self_signed_certificates(cert_dir=CERT_DIR, validity_days=365):
+    """
+    Generate self-signed TLS certificates for MongoDB and RabbitMQ.
+
+    Args:
+        cert_dir (str): The directory to store certificates.
+        validity_days (int): Certificate validity in days (1-365).
+
+    Raises:
+        ValueError: If validity_days is out of range.
+        RuntimeError: If certificate generation fails.
+    """
+    if not isinstance(validity_days, int) or not 1 <= validity_days <= 365:
+        raise ValueError(f"validity_days must be between 1 and 365, got {validity_days}")
+
+    try:
+        os.makedirs(cert_dir, exist_ok=True)
+
+        cert_file = os.path.join(cert_dir, "tls_cert.crt")
+        key_file = os.path.join(cert_dir, "tls_cert_key.key")
+        pem_file = os.path.join(cert_dir, "tls_cert_key.pem")
+        ca_key = os.path.join(cert_dir, "tls_cert_ca.key")
+        ca_crt = os.path.join(cert_dir, "tls_cert_ca.crt")
+        csr_file = os.path.join(cert_dir, "tls_cert.csr")
+
+        extendedkeyusage_conf = "./data/ssl_certs/mongodb_rabbitmq_certs/extendedkeyusage.txt"
+        common_ca_conf = "./data/ssl_certs/mongodb_rabbitmq_certs/common_ca.conf"
+
+        if not os.path.exists(extendedkeyusage_conf):
+            raise RuntimeError(f"Extended key usage config not found at {extendedkeyusage_conf}")
+        if not os.path.exists(common_ca_conf):
+            raise RuntimeError(f"Common CA config not found at {common_ca_conf}")
+
+        # Generate CA key if not exists
+        if not os.path.exists(ca_key):
+            result = subprocess.run(
+                ["openssl", "genrsa", "-out", ca_key, "4096"], capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to generate CA key: {result.stderr}")
+
+        # Always regenerate CA certificate during renewal to ensure full certificate chain renewal
+        logger.info("Generating new CA certificate...", extra={"node": utils.NODE_IP})
+        result = subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-new",
+                "-nodes",
+                "-key",
+                ca_key,
+                "-sha256",
+                "-days",
+                str(validity_days),
+                "-out",
+                ca_crt,
+                "-subj",
+                "/CN=CloudExchangeCA",
+                "-extensions",
+                "v3_ca",
+                "-config",
+                common_ca_conf,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to generate CA certificate: {result.stderr}")
+
+        # Generate CSR
+        result = subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-newkey",
+                "rsa:4096",
+                "-nodes",
+                "-keyout",
+                key_file,
+                "-out",
+                csr_file,
+                "-config",
+                extendedkeyusage_conf,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to generate CSR: {result.stderr}")
+
+        # Sign CSR with CA
+        result = subprocess.run(
+            [
+                "openssl",
+                "x509",
+                "-req",
+                "-in",
+                csr_file,
+                "-CA",
+                ca_crt,
+                "-CAkey",
+                ca_key,
+                "-CAcreateserial",
+                "-out",
+                cert_file,
+                "-days",
+                str(validity_days),
+                "-extfile",
+                extendedkeyusage_conf,
+                "-extensions",
+                "req_ext",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to sign certificate: {result.stderr}")
+
+        # Create combined PEM file for MongoDB
+        with open(pem_file, "wb") as pem_out:
+            with open(cert_file, "rb") as cert_in:
+                shutil.copyfileobj(cert_in, pem_out)
+            with open(key_file, "rb") as key_in:
+                shutil.copyfileobj(key_in, pem_out)
+
+        # Set secure permissions using helper function
+        set_certificate_permissions(cert_dir)
+
+        logger.info(
+            f"Certificates generated successfully with {validity_days} days validity", extra={"node": utils.NODE_IP}
+        )
+    except Exception as e:
+        logger.error(f"Error generating certificates: {e}", extra={"node": utils.NODE_IP})
+        raise RuntimeError(f"Error generating certificates: {e}")
+
+
+def renew_ui_certificate_if_https(validity_days=365):
+    """Regenerate the UI TLS certificate when UI protocol is HTTPS.
+
+    Args:
+        validity_days (int): Certificate validity in days.
+
+    Returns:
+        bool: True if successful, False otherwise.
+    """
+    try:
+        cert_dir = "./data/ssl_certs"
+        cert_file = os.path.join(cert_dir, "cte_cert.crt")
+        key_file = os.path.join(cert_dir, "cte_cert_key.key")
+        extendedkeyusage_conf = os.path.join(cert_dir, "extendedkeyusage.txt")
+
+        if not os.path.exists(extendedkeyusage_conf):
+            raise RuntimeError(f"Extended key usage config not found at {extendedkeyusage_conf}")
+
+        result = subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:4096",
+                "-keyout",
+                key_file,
+                "-out",
+                cert_file,
+                "-sha256",
+                "-days",
+                str(validity_days),
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
+                "-extensions",
+                "extendedkeyusage",
+                "-config",
+                extendedkeyusage_conf,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+
+        try:
+            os.chmod(cert_file, 0o644)
+            os.chmod(key_file, 0o644)
+        except Exception as e:
+            logger.warning(
+                f"Failed to adjust permissions on UI certificate files: {e}",
+                extra={"node": utils.NODE_IP},
+            )
+
+        logger.info(
+            f"UI certificate renewed successfully with {validity_days} days validity",
+            extra={"node": utils.NODE_IP},
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            f"Error renewing UI certificate: {e}",
+            extra={"node": utils.NODE_IP},
+        )
+        return False
+
+
+def is_ce_managed_certificate(cert_file):
+    """Return True if cert_file is generated by CE.
+
+    Args:
+        cert_file (str): Path to certificate file.
+
+    Returns:
+        bool: True if certificate is CE-generated, False if custom.
+    """
+    try:
+        if not os.path.exists(cert_file):
+            return False
+
+        result = subprocess.run(
+            ["openssl", "x509", "-in", cert_file, "-noout", "-issuer"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode == 0:
+            issuer = result.stdout.strip().replace("issuer=", "").strip().replace(" ", "")
+            return "CN=CloudExchangeCA" in issuer or "CN=localhost" in issuer
+
+        return False
+    except Exception as e:
+        logger.error(
+            f"Error while checking if certificate is CE-managed for {cert_file}: {e}",
+            extra={"node": utils.NODE_IP},
+        )
+        return False
+
+
+def get_all_node_ips():
+    """Get all node IPs from HA configuration."""
+    try:
+        ha_enabled = str(AVAILABLE_INPUTS.get("HA_ENABLED", False)).lower() in ("true", "1")
+
+        if ha_enabled and AVAILABLE_INPUTS.get("HA_IP_LIST"):
+            ip_list = [ip.strip() for ip in AVAILABLE_INPUTS["HA_IP_LIST"].split(",") if ip.strip()]
+            return ip_list if ip_list else [utils.NODE_IP]
+
+        return [utils.NODE_IP]
+    except Exception as e:
+        logger.error(f"Error getting all node IPs: {e}", extra={"node": utils.NODE_IP})
+        return [utils.NODE_IP]
+
+
+def get_nodes_requiring_renewal():
+    """Return list of node IPs whose certificates should be renewed and what to renew.
+
+    Returns:
+        tuple: (node_ips: list, renew_ca: bool, renew_ui: bool)
+    """
+    ca_cert_file = os.path.join(CERT_DIR, "tls_cert.crt")
+    ui_cert_file = "./data/ssl_certs/cte_cert.crt"
+
+    ca_is_ce_managed = is_ce_managed_certificate(ca_cert_file)
+    ui_is_ce_managed = is_ce_managed_certificate(ui_cert_file)
+
+    # Apply renewal logic based on management status
+    if not ca_is_ce_managed and ui_is_ce_managed:
+        return get_all_node_ips(), False, True
+    elif ca_is_ce_managed and not ui_is_ce_managed:
+        return get_all_node_ips(), True, False
+    elif not ca_is_ce_managed and not ui_is_ce_managed:
+        logger.info("Both CA and UI certificates are custom, skipping renewal", extra={"node": utils.NODE_IP})
+        return [], False, False
+    elif ca_is_ce_managed and ui_is_ce_managed:
+        return get_all_node_ips(), True, True
+
+    return [], False, False
+
+
+def is_management_server_reachable(handler, node_ip, protocol="https"):
+    """Check if the management server is reachable on the specified node.
+
+    Args:
+        handler: The request handler object.
+        node_ip (str): The IP address of the node to check.
+        protocol (str): The protocol to use (http/https).
+
+    Returns:
+        tuple: (is_reachable: bool, error_message: str or None)
+    """
+    try:
+        # Local node is always reachable if this code is running
+        if node_ip == utils.NODE_IP:
+            return True, None
+
+        # Use the node-details endpoint as a health check for remote nodes
+        for response in check_management_server(
+            node_ip=node_ip,
+            handler=handler,
+            endpoint="/api/management/node-details",
+            method="GET",
+            protocol=protocol,
+            should_stream=False,
+        ):
+            if isinstance(response, tuple) and len(response) >= 2:
+                if response[1] == 200:
+                    return True, None
+                else:
+                    return False, f"Management server returned status {response[1]}"
+            elif isinstance(response, dict):
+                return True, None
+        return True, None
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Management server at {node_ip} is unreachable: {error_msg}", extra={"node": utils.NODE_IP})
+        return False, error_msg
+
+
+@SimpleAPIServer.route("/ce-status", methods=["GET"], scopes=[ME_ROLE])
+def ce_status_endpoint(handler):
+    """Get the CE container running status on the local node.
+
+    Returns:
+        dict: A dictionary containing:
+            - is_running: bool indicating if CE containers are running
+            - node_ip: The IP of this node
+    """
+    try:
+        fetch_container_info()
+        # CE is considered running only if ALL core containers are running
+        is_running = utils.is_ui_running and utils.is_rabbitmq_running and utils.is_mongodb_running
+        return {
+            "is_running": is_running,
+            "node_ip": utils.NODE_IP,
+            "containers": {
+                "ui": utils.is_ui_running,
+                "rabbitmq": utils.is_rabbitmq_running,
+                "mongodb": utils.is_mongodb_running,
+            },
+        }, 200
+    except Exception as e:
+        logger.error(f"Error getting CE status: {e}", extra={"node": utils.NODE_IP})
+        return {"detail": str(e), "is_running": False, "node_ip": utils.NODE_IP}, 500
+
+
+def get_remote_ce_status(handler, node_ip, protocol="https"):
+    """Get the CE container running status on a node (local or remote).
+
+    Args:
+        handler: The request handler object.
+        node_ip (str): The IP address of the node to check.
+        protocol (str): The protocol to use for remote calls.
+
+    Returns:
+        tuple: (is_running: bool, error_message: str or None)
+    """
+    try:
+        # If checking local node, use direct container check
+        if node_ip == utils.NODE_IP:
+            fetch_container_info()
+            is_running = utils.is_ui_running and utils.is_rabbitmq_running and utils.is_mongodb_running
+            return is_running, None
+
+        # For remote nodes, use API call
+        for response in check_management_server(
+            node_ip=node_ip,
+            handler=handler,
+            endpoint="/api/management/ce-status",
+            method="GET",
+            protocol=protocol,
+            should_stream=False,
+        ):
+            if isinstance(response, tuple) and len(response) >= 2:
+                if response[1] == 200 and isinstance(response[0], dict):
+                    return response[0].get("is_running", False), None
+                else:
+                    return False, f"Failed to get CE status: {response}"
+            elif isinstance(response, dict):
+                return response.get("is_running", False), None
+        return False, "No response from remote node"
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error getting CE status from {node_ip}: {error_msg}", extra={"node": utils.NODE_IP})
+        return False, error_msg
+
+
+def set_certificate_permissions(cert_dir):
+    """Set file permissions for certificates."""
+    try:
+        # Private files - only owner can read (CA key should never be mounted)
+        private_files = ["tls_cert_ca.key"]
+        # Public/container-accessible files - need 644 for Docker containers running as non-root users
+        # tls_cert_key.key is mounted into RabbitMQ container which runs as user 1001:1001
+        # tls_cert_key.pem is mounted into MongoDB container which runs as non-root user
+        public_files = ["tls_cert.crt", "tls_cert_ca.crt", "tls_cert_key.pem", "tls_cert_key.key"]
+
+        for filename in private_files:
+            filepath = os.path.join(cert_dir, filename)
+            if os.path.exists(filepath):
+                os.chmod(filepath, 0o600)
+
+        for filename in public_files:
+            filepath = os.path.join(cert_dir, filename)
+            if os.path.exists(filepath):
+                os.chmod(filepath, 0o644)
+    except Exception as e:
+        logger.warning(f"Failed to set certificate permissions: {e}", extra={"node": utils.NODE_IP})
+
+
+def copy_and_set_permissions_ha(handler, is_primary, ha_nfs_dir, is_https_ui, renew_ca=True, renew_ui=True):
+    """Copy certificates to/from shared storage and set permissions.
+
+    Args:
+        handler: Request handler
+        is_primary: Whether this is the primary node
+        ha_nfs_dir: HA NFS directory path
+        is_https_ui: Whether UI is using HTTPS
+        renew_ca: Whether to copy CA/DB/RabbitMQ certificates
+        renew_ui: Whether to copy UI certificates
+    """
+    shared_cert_dir = f"{ha_nfs_dir}/config/ssl_certs/mongodb_rabbitmq_certs"
+    shared_ui_cert_dir = f"{ha_nfs_dir}/config/ssl_certs"
+
+    try:
+        if is_primary:
+            cmd = f"{SUDO_PREFIX} mkdir -p {shared_cert_dir} {shared_ui_cert_dir}"
+            response = execute_command_with_logging(
+                cmd, handler, should_end_stream=False, shell=True, message="creating shared directories"
+            )
+            if response[1] != 200:
+                return False, "Failed to create shared directories"
+
+            cmd = f"{SUDO_PREFIX} chmod -R 755 {ha_nfs_dir}/config"
+            execute_command(cmd, shell=True)
+
+            if renew_ca:
+                cmd = f"{SUDO_PREFIX} cp -f {os.path.abspath(CERT_DIR)}/* {shared_cert_dir}/"
+                response = execute_command_with_logging(
+                    cmd, handler, should_end_stream=False, shell=True, message="copying CA certificates"
+                )
+                if response[1] != 200:
+                    return False, "Failed to copy DB/RabbitMQ certificates"
+
+                # Set 644 on all container-accessible files (RabbitMQ runs as user 1001:1001)
+                # Only tls_cert_ca.key should be 600 (not mounted into containers)
+                cmd = (
+                    f"{SUDO_PREFIX} sh -c 'chmod 644 {shared_cert_dir}/*.crt {shared_cert_dir}/*.pem "
+                    f"{shared_cert_dir}/tls_cert_key.key 2>/dev/null; "
+                    f"chmod 600 {shared_cert_dir}/tls_cert_ca.key 2>/dev/null'"
+                )
+                execute_command(cmd, shell=True)
+
+            if renew_ui and is_https_ui:
+                cmd = f"{SUDO_PREFIX} chmod 644 ./data/ssl_certs/cte_cert.crt ./data/ssl_certs/cte_cert_key.key"
+                execute_command(cmd, shell=True)
+
+                cmd = (
+                    f"{SUDO_PREFIX} cp -f ./data/ssl_certs/cte_cert.crt "
+                    f"./data/ssl_certs/cte_cert_key.key {shared_ui_cert_dir}/"
+                )
+                response = execute_command_with_logging(
+                    cmd, handler, should_end_stream=False, shell=True, message="copying UI certificates"
+                )
+                if response[1] != 200:
+                    return False, "Failed to copy UI certificates"
+
+                cmd = f"{SUDO_PREFIX} chmod 644 {shared_ui_cert_dir}/cte_cert.crt {shared_ui_cert_dir}/cte_cert_key.key"
+                execute_command(cmd, shell=True)
+        else:
+            if renew_ca:
+                cmd = f"{SUDO_PREFIX} cp -f {shared_cert_dir}/* ./data/ssl_certs/mongodb_rabbitmq_certs/"
+                response = execute_command_with_logging(
+                    cmd, handler, should_end_stream=False, shell=True, message="syncing CA certificates"
+                )
+                if response[1] != 200:
+                    return False, "Failed to sync DB/RabbitMQ certificates"
+
+                # Set 644 on all container-accessible files (RabbitMQ runs as user 1001:1001)
+                # Only tls_cert_ca.key should be 600 (not mounted into containers)
+                cmd = (
+                    f"{SUDO_PREFIX} sh -c 'chmod 644 ./data/ssl_certs/mongodb_rabbitmq_certs/*.crt "
+                    "./data/ssl_certs/mongodb_rabbitmq_certs/*.pem "
+                    "./data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.key "
+                    "2>/dev/null; chmod 600 ./data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_ca.key 2>/dev/null'"
+                )
+                execute_command(cmd, shell=True)
+
+            if renew_ui and is_https_ui:
+                cmd = f"{SUDO_PREFIX} mkdir -p ./data/ssl_certs"
+                execute_command(cmd, shell=True)
+
+                cmd = (
+                    f"{SUDO_PREFIX} cp -f {shared_ui_cert_dir}/cte_cert.crt "
+                    f"{shared_ui_cert_dir}/cte_cert_key.key ./data/ssl_certs/"
+                )
+                response = execute_command_with_logging(
+                    cmd, handler, should_end_stream=False, shell=True, message="syncing UI certificates"
+                )
+                if response[1] != 200:
+                    return False, "Failed to sync UI certificates"
+
+                cmd = f"{SUDO_PREFIX} chmod 644 ./data/ssl_certs/cte_cert.crt ./data/ssl_certs/cte_cert_key.key"
+                execute_command(cmd, shell=True)
+
+                cmd = (
+                    f"{SUDO_PREFIX} sh -c 'chown $(stat -c %u:%g ./data/ssl_certs) "
+                    "./data/ssl_certs/cte_cert*.* 2>/dev/null || true'"
+                )
+                execute_command(cmd, shell=True)
+
+                if not os.path.exists("./data/ssl_certs/cte_cert.crt") or not os.path.exists(
+                    "./data/ssl_certs/cte_cert_key.key"
+                ):
+                    logger.error("UI certificates not found after sync", extra={"node": utils.NODE_IP})
+                    return False, "UI certificates not found after sync"
+
+        if renew_ca:
+            required_files = ["tls_cert.crt", "tls_cert_key.key", "tls_cert_key.pem", "tls_cert_ca.crt"]
+            for filename in required_files:
+                filepath = os.path.join("./data/ssl_certs/mongodb_rabbitmq_certs/", filename)
+                if not os.path.exists(filepath):
+                    logger.error(f"Required certificate file {filename} not found", extra={"node": utils.NODE_IP})
+                    return False, f"Required certificate file {filename} not found"
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+@SimpleAPIServer.route("/sync-certs", methods=["POST"], stream=True, scopes=[ADMIN_ROLE])
+def sync_certificates(handler):
+    """Sync certificates from shared storage to local storage."""
+    try:
+        success, error_msg = load_environment_from_multiple_sources(handler)
+        if not success:
+            write_chunk(handler.wfile, "End: Error loading environment variables.")
+            end_stream(handler)
+            return {"details": error_msg}, 500
+
+        # Get renewal flags from request body
+        renew_ca = True
+        renew_ui = True
+        try:
+            content_length = int(handler.headers.get("Content-Length", 0))
+            if content_length > 0:
+                body = handler.rfile.read(content_length).decode()
+                data = json.loads(body)
+                renew_ca = data.get("renew_ca", True)
+                renew_ui = data.get("renew_ui", True)
+        except (json.JSONDecodeError, AttributeError):
+            pass  # Use defaults
+
+        ha_nfs_dir = AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY", "/opt/shared/data")
+        is_https_ui = AVAILABLE_INPUTS.get("UI_PROTOCOL", "http").lower().strip() == "https"
+
+        success, error_msg = copy_and_set_permissions_ha(handler, False, ha_nfs_dir, is_https_ui, renew_ca, renew_ui)
+        if not success:
+            write_chunk(handler.wfile, f"End: {error_msg}\n")
+            end_stream(handler)
+            return {"detail": error_msg}, 500
+
+        end_stream(handler)
+        return {"detail": "Certificates synced"}, 200
+    except Exception as e:
+        write_chunk(handler.wfile, f"End: {str(e)}\n")
+        end_stream(handler)
+        return {"detail": str(e)}, 500
+
+
+@SimpleAPIServer.route("/reload-certs", methods=["POST"], scopes=[ADMIN_ROLE])
+def reload_certs_endpoint(handler, ip=None, as_api=True):
+    """Signal certificates for hot-reload."""
+    success, error_msg = load_environment_from_multiple_sources(handler)
+    if not success:
+        return {"details": error_msg}, 500
+
+    if as_api:
+        try:
+            content_length = int(handler.headers.get("Content-Length", 0))
+            if content_length > 0:
+                body = handler.rfile.read(content_length).decode()
+                data = json.loads(body)
+                ip = data.get("node_ip", "").strip()
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    if not ip:
+        ip = utils.NODE_IP
+
+    if (
+        AVAILABLE_INPUTS.get("HA_CURRENT_NODE") is not None and ip != AVAILABLE_INPUTS.get("HA_CURRENT_NODE")
+    ) or ip != utils.NODE_IP:
+        logger.info(f"Reloading certificates on Node {ip}", extra={"node": utils.NODE_IP})
+        try:
+            for response_chunk in check_management_server(
+                handler=handler,
+                endpoint="/api/management/reload-certs",
+                node_ip=ip,
+                method="POST",
+                protocol=AVAILABLE_INPUTS["UI_PROTOCOL"],
+                should_stream=False,
+            ):
+                pass
+            return {"detail": "Certificates reloaded", "node_ip": ip}, 200
+        except Exception as e:
+            return {"detail": f"Error reloading certificates on Node {ip}: {str(e)}", "node_ip": ip}, 500
+    else:
+        logger.info("Reloading certificates on local node", extra={"node": utils.NODE_IP})
+        try:
+            success, message = reload_ssl_certificates()
+            if success:
+                return {
+                    "detail": "Certificates ready for hot-reload",
+                    "message": message,
+                    "node_ip": utils.NODE_IP,
+                }, 200
+            else:
+                return {"detail": message, "node_ip": utils.NODE_IP}, 500
+        except Exception as e:
+            logger.error(f"Error in reload-certs endpoint: {e}", extra={"node": utils.NODE_IP})
+            return {"detail": str(e), "node_ip": utils.NODE_IP}, 500
+
+
+def reload_ssl_certificates():
+    """Signal certificates for hot-reload on next connection."""
+    try:
+        server_cert = CERT_DIR + "tls_cert.crt"
+        cert_expiry = "unknown"
+        cert_serial = "unknown"
+
+        try:
+            result = subprocess.run(
+                ["openssl", "x509", "-in", server_cert, "-noout", "-enddate", "-serial"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    if line.startswith("notAfter="):
+                        cert_expiry = line.replace("notAfter=", "")
+                    elif line.startswith("serial="):
+                        cert_serial = line.replace("serial=", "")
+        except Exception:
+            pass
+
+        return True, f"Certificates ready. Serial={cert_serial}, Expires={cert_expiry}"
+
+    except Exception as e:
+        logger.error(f"Certificate reload failed: {e}", extra={"node": utils.NODE_IP})
+        return False, str(e)
+
+
+@SimpleAPIServer.route("/renew-certs", methods=["POST"], stream=True, scopes=[ADMIN_ROLE])
+def renew_certificates(handler):
+    """Renew TLS certificates for MongoDB, RabbitMQ, and UI.
+
+    Handles three scenarios with state preservation:
+    1. Standalone: Generate certs locally, restart CE only if it was running
+    2. HA - Primary triggers: Generate certs, copy to NFS, sync to secondary nodes,
+       only restart nodes that were previously running
+    3. HA - Secondary triggers: Forward request to primary node which handles
+       the full cluster renewal
+
+    Key Behavior:
+    - Pre-checks management server reachability on all nodes before proceeding
+    - Preserves the stopped state: If CE was stopped before renewal, it remains stopped
+    - Primary Node (if stopped): Generate certs, copy to NFS, do not restart
+    - Secondary Node (if stopped): Sync certs from NFS, do not restart
+    """
+    stream_ended = False
+    try:
+        success, error_msg = load_environment_from_multiple_sources(handler)
+        if not success:
+            write_chunk(handler.wfile, f"End: Failed to load environment: {error_msg}\n")
+            end_stream(handler)
+            stream_ended = True
+            return {"details": error_msg}, 500
+
+        nodes_to_renew, renew_ca, renew_ui = get_nodes_requiring_renewal()
+        if not nodes_to_renew:
+            write_chunk(handler.wfile, "No CE-managed certificates found. Nothing to renew.\n")
+            end_stream(handler=handler)
+            stream_ended = True
+            return {"detail": "No CE-managed certificates found"}, 200
+
+        is_ha_enabled = str(AVAILABLE_INPUTS.get("HA_ENABLED", False)).lower() in ("true", "1")
+        primary_node_ip = AVAILABLE_INPUTS.get("HA_PRIMARY_NODE_IP", utils.NODE_IP)
+        is_primary_node = utils.NODE_IP == primary_node_ip
+        is_https_ui = AVAILABLE_INPUTS.get("UI_PROTOCOL", "http").lower().strip() == "https"
+        protocol = AVAILABLE_INPUTS.get("UI_PROTOCOL", "https")
+        validity_days = 365
+
+        # Get list of secondary nodes for HA
+        secondary_nodes = [ip for ip in nodes_to_renew if ip != primary_node_ip] if is_ha_enabled else []
+
+        # ============================================================
+        # PRE-CHECK: Verify management server reachability on all nodes
+        # ============================================================
+        if is_ha_enabled:
+            write_chunk(handler.wfile, "Verifying management server connectivity...\n")
+
+            # Check primary node if we're not on primary
+            if not is_primary_node:
+                is_reachable, error = is_management_server_reachable(handler, primary_node_ip, protocol)
+                if not is_reachable:
+                    error_msg = (
+                        f"Primary node ({primary_node_ip}) unreachable. "
+                        f"Start management service before renewal certificate."
+                    )
+                    write_chunk(handler.wfile, f"End: {error_msg}\n")
+                    end_stream(handler=handler)
+                    stream_ended = True
+                    logger.error(error_msg, extra={"node": utils.NODE_IP})
+                    return {"detail": error_msg}, 503
+
+            # Check all secondary nodes
+            for node_ip in secondary_nodes:
+                is_reachable, error = is_management_server_reachable(handler, node_ip, protocol)
+                if not is_reachable:
+                    error_msg = (
+                        f"Secondary node ({node_ip}) unreachable. Start management service before renewal certificate."
+                    )
+                    write_chunk(handler.wfile, f"End: {error_msg}\n")
+                    end_stream(handler=handler)
+                    stream_ended = True
+                    logger.error(error_msg, extra={"node": utils.NODE_IP})
+                    return {"detail": error_msg}, 503
+
+            write_chunk(handler.wfile, "All nodes are reachable\n")
+
+        # ============================================================
+        # CHECK CE STATUS: Record which nodes have CE running vs stopped
+        # ============================================================
+        node_ce_status = {}  # {node_ip: bool} - True if CE was running
+        write_chunk(handler.wfile, "Checking CE status on all nodes...\n")
+
+        # Check all nodes CE status (both HA and standalone)
+        for node_ip in nodes_to_renew:
+            remote_running, error = get_remote_ce_status(handler, node_ip, protocol)
+            node_ce_status[node_ip] = remote_running
+
+        # Log CE status summary
+        running_nodes = [ip for ip, status in node_ce_status.items() if status]
+        stopped_nodes = [ip for ip, status in node_ce_status.items() if not status]
+        if running_nodes:
+            write_chunk(handler.wfile, f"CE running on: {', '.join(running_nodes)}\n")
+        if stopped_nodes:
+            write_chunk(handler.wfile, f"CE stopped on: {', '.join(stopped_nodes)}\n")
+
+        # ============================================================
+        # Scenario 3: HA - Secondary node triggers -> Forward to primary
+        # ============================================================
+        if is_ha_enabled and not is_primary_node:
+            write_chunk(handler.wfile, f"Forwarding request to primary node ({primary_node_ip})...\n")
+            try:
+                for response_chunk in check_management_server(
+                    handler=handler,
+                    endpoint="/api/management/renew-certs",
+                    node_ip=primary_node_ip,
+                    method="POST",
+                    protocol=protocol,
+                    should_stream=True,
+                ):
+                    write_chunk(handler.wfile, response_chunk, node_ip=primary_node_ip)
+
+                end_stream(handler=handler)
+                stream_ended = True
+                return {"detail": "Certificate renewal completed"}, 200
+            except Exception as e:
+                write_chunk(handler.wfile, f"End: Failed to forward request to primary node: {str(e)}\n")
+                end_stream(handler=handler)
+                stream_ended = True
+                return {"detail": str(e)}, 500
+
+        # ============================================================
+        # PHASE 1: Stop ALL nodes that are running (BEFORE cert generation)
+        # ============================================================
+        nodes_to_restart = []  # Track which nodes need to be restarted
+
+        if any(node_ce_status.values()):
+            write_chunk(handler.wfile, "Stopping CE on all running nodes...\n")
+
+            # Stop all running nodes (primary first, then secondary)
+            all_nodes = [primary_node_ip] + secondary_nodes if is_ha_enabled else [primary_node_ip]
+            for node_ip in all_nodes:
+                if node_ce_status.get(node_ip, False):
+                    write_chunk(handler.wfile, f"Stopping CE on {node_ip}...\n")
+                    nodes_to_restart.append(node_ip)
+
+                    try:
+                        stop_failed = False
+                        for response_chunk in check_management_server(
+                            handler=handler,
+                            endpoint="/api/management/stop-ce",
+                            node_ip=node_ip,
+                            method="POST",
+                            protocol=protocol,
+                            should_stream=True,
+                            payload={"node_ip": node_ip},
+                        ):
+                            if response_chunk.strip().upper().startswith("END:"):
+                                stop_failed = True
+                            write_chunk(handler.wfile, response_chunk, node_ip=node_ip)
+
+                        if stop_failed:
+                            write_chunk(handler.wfile, f"End: Failed to stop {node_ip}\n")
+                            end_stream(handler=handler)
+                            stream_ended = True
+                            return {"detail": f"Failed to stop {node_ip}"}, 500
+                    except Exception as e:
+                        write_chunk(handler.wfile, f"End: Error stopping {node_ip}: {str(e)}\n")
+                        end_stream(handler=handler)
+                        stream_ended = True
+                        return {"detail": f"Error stopping {node_ip}: {str(e)}"}, 500
+
+        # Wait for services to fully stop
+        if nodes_to_restart:
+            write_chunk(handler.wfile, "Waiting for services to fully stop...\n")
+            # time.sleep(5)
+
+            # Verify all nodes are actually stopped
+            for node_ip in nodes_to_restart:
+                is_running, _ = get_remote_ce_status(handler, node_ip, protocol)
+                if is_running:
+                    write_chunk(handler.wfile, f"End: {node_ip} still running after stop command\n")
+                    end_stream(handler=handler)
+                    stream_ended = True
+                    return {"detail": f"{node_ip} failed to stop completely"}, 500
+
+        # ============================================================
+        # PHASE 2: Generate new certificates (After stopping CE)
+        # ============================================================
+        write_chunk(handler.wfile, f"Generating new certificates (validity: {validity_days} days)...\n")
+        try:
+            if renew_ca:
+                generate_self_signed_certificates(CERT_DIR, validity_days)
+                write_chunk(handler.wfile, "CA certificates generated successfully\n")
+            if renew_ui and is_https_ui:
+                renew_ui_certificate_if_https(validity_days)
+                write_chunk(handler.wfile, "UI certificates generated successfully\n")
+            if not renew_ca and not renew_ui:
+                write_chunk(handler.wfile, "No certificates to generate\n")
+
+            # Allow time for filesystem sync
+            time.sleep(2)
+
+            # NOTE: Do NOT reload SSL context yet - wait until after all nodes start
+            # Reloading now causes TLS errors when primary tries to connect to secondaries
+        except Exception as e:
+            write_chunk(handler.wfile, f"End: Certificate generation failed: {str(e)}\n")
+            end_stream(handler=handler)
+            stream_ended = True
+            return {"detail": f"Certificate generation failed: {str(e)}"}, 500
+
+        # ============================================================
+        # PHASE 3: Copy certificates to shared NFS storage (HA only)
+        # ============================================================
+        if is_ha_enabled:
+            write_chunk(handler.wfile, "Copying certificates to shared storage...\n")
+            ha_nfs_dir = AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY", "/opt/shared/data")
+            success, error_msg = copy_and_set_permissions_ha(handler, True, ha_nfs_dir, is_https_ui, renew_ca, renew_ui)
+            if not success:
+                write_chunk(handler.wfile, f"End: Failed to copy to shared storage: {error_msg}\n")
+                end_stream(handler=handler)
+                stream_ended = True
+                return {"detail": error_msg}, 500
+            write_chunk(handler.wfile, "Certificates copied to shared storage\n")
+
+        # ============================================================
+        # PHASE 4: Sync certificates to secondary nodes (HA only)
+        # ============================================================
+        if is_ha_enabled and secondary_nodes:
+            write_chunk(handler.wfile, f"Syncing certificates to {len(secondary_nodes)} secondary node(s)...\n")
+            sync_failed_nodes = []
+            for node_ip in secondary_nodes:
+                try:
+                    for response_chunk in check_management_server(
+                        handler=handler,
+                        endpoint="/api/management/sync-certs",
+                        node_ip=node_ip,
+                        method="POST",
+                        protocol=protocol,
+                        should_stream=True,
+                        payload={"renew_ca": renew_ca, "renew_ui": renew_ui},
+                    ):
+                        if response_chunk.strip().upper().startswith("END:"):
+                            raise RuntimeError(response_chunk)
+                        write_chunk(handler.wfile, response_chunk, node_ip=node_ip)
+                except Exception as e:
+                    sync_failed_nodes.append((node_ip, str(e)))
+                    write_chunk(handler.wfile, f"Error: Failed to sync to {node_ip}: {str(e)}\n")
+
+            if sync_failed_nodes:
+                write_chunk(handler.wfile, f"End: Failed to sync certificates to {len(sync_failed_nodes)} node(s)\n")
+                end_stream(handler=handler)
+                stream_ended = True
+                return {"detail": f"Failed to sync {len(sync_failed_nodes)} node(s)"}, 500
+
+        # ============================================================
+        # PHASE 5: Restart management server to load new certs (if needed)
+        # ============================================================
+        # Note: Management server will auto-reload certs via SNI callback
+
+        # ============================================================
+        # PHASE 6: Signal management servers to hot-reload new certificates
+        # CRITICAL: Do this BEFORE starting any nodes to avoid TLS errors
+        # ============================================================
+        write_chunk(handler.wfile, "Triggering SSL hot-reload on all management servers...\n")
+
+        # Reload all nodes (primary + secondary)
+        all_nodes = [primary_node_ip] + secondary_nodes if is_ha_enabled else [primary_node_ip]
+        for node_ip in all_nodes:
+            try:
+                # Use direct call for local node, API for remote nodes
+                if node_ip == utils.NODE_IP:
+                    tls_version = get_tls_version()
+                    force_ssl_context_reload(tls_version=tls_version)
+                    write_chunk(handler.wfile, "SSL context reloaded on local node\n")
+                else:
+                    for response_chunk in check_management_server(
+                        handler=handler,
+                        endpoint="/api/management/reload-certs",
+                        node_ip=node_ip,
+                        method="POST",
+                        protocol=protocol,
+                        should_stream=False,
+                    ):
+                        pass
+                    write_chunk(handler.wfile, f"SSL context reloaded on {node_ip}\n")
+            except Exception as e:
+                write_chunk(handler.wfile, f"Warning: SSL hot-reload failed on {node_ip}: {str(e)}\n")
+
+        # Wait for SSL context to be fully reloaded and stabilized
+        time.sleep(3)
+
+        # ============================================================
+        # PHASE 7: Start ONLY nodes that were previously running
+        # ============================================================
+        if nodes_to_restart:
+            write_chunk(handler.wfile, f"Starting {len(nodes_to_restart)} node(s) that were running...\n")
+
+            # CRITICAL: Start ALL secondary nodes FIRST (in parallel), then primary
+            # This prevents MongoDB replica set connection errors
+            if is_ha_enabled and secondary_nodes:
+                # Start all secondary nodes first
+                for node_ip in secondary_nodes:
+                    if node_ip not in nodes_to_restart:
+                        continue
+
+                    write_chunk(handler.wfile, f"Starting CE on secondary node {node_ip}...\n")
+                    try:
+                        start_failed = False
+                        for response_chunk in check_management_server(
+                            handler=handler,
+                            endpoint="/api/management/start-ce",
+                            node_ip=node_ip,
+                            method="POST",
+                            protocol=protocol,
+                            should_stream=True,
+                            payload={"node_ip": node_ip},
+                        ):
+                            if response_chunk.strip().upper().startswith("END:"):
+                                start_failed = True
+                            write_chunk(handler.wfile, response_chunk, node_ip=node_ip)
+
+                        if start_failed:
+                            write_chunk(handler.wfile, f"Warning: Failed to start secondary {node_ip}\n")
+                    except Exception as e:
+                        write_chunk(handler.wfile, f"Warning: Error starting secondary {node_ip}: {str(e)}\n")
+
+                # Wait for secondary nodes to be ready
+                write_chunk(handler.wfile, "Waiting for secondary nodes to be ready...\n")
+                time.sleep(15)
+
+            # Now start primary node (if it was running)
+            if primary_node_ip in nodes_to_restart:
+                write_chunk(handler.wfile, f"Starting CE on primary node {primary_node_ip}...\n")
+
+                try:
+                    start_failed = False
+                    for response_chunk in check_management_server(
+                        handler=handler,
+                        endpoint="/api/management/start-ce",
+                        node_ip=primary_node_ip,
+                        method="POST",
+                        protocol=protocol,
+                        should_stream=True,
+                        payload={"node_ip": primary_node_ip},
+                    ):
+                        if response_chunk.strip().upper().startswith("END:"):
+                            start_failed = True
+                        write_chunk(handler.wfile, response_chunk, node_ip=primary_node_ip)
+
+                    if start_failed:
+                        write_chunk(handler.wfile, f"End: Failed to start primary {primary_node_ip}\n")
+                        end_stream(handler=handler)
+                        stream_ended = True
+                        return {"detail": f"Failed to start {primary_node_ip}"}, 500
+                except Exception as e:
+                    write_chunk(handler.wfile, f"End: Failed to start primary {primary_node_ip}: {str(e)}\n")
+                    end_stream(handler=handler)
+                    stream_ended = True
+                    return {"detail": f"Failed to start {primary_node_ip}: {str(e)}"}, 500
+
+            # Wait for services to fully start
+            write_chunk(handler.wfile, "Waiting for services to start...\n")
+            time.sleep(20)
+        else:
+            write_chunk(handler.wfile, "All nodes were stopped, keeping them stopped\n")
+
+        write_chunk(handler.wfile, "Certificate renewal completed successfully\n")
+        end_stream(handler=handler)
+        stream_ended = True
+
+        return {"detail": "Certificate renewal completed"}, 200
+
+    except Exception as e:
+        logger.error(f"Certificate renewal error: {e}", extra={"node": utils.NODE_IP})
+        write_chunk(handler.wfile, f"End: {str(e)}\n")
+        if not stream_ended:
+            end_stream(handler=handler)
+        return {"detail": str(e)}, 500
+    finally:
+        if not stream_ended:
+            end_stream(handler=handler)
 
 
 def read_config_file(file_path):
@@ -1247,9 +2833,7 @@ def read_config_file(file_path):
     """
     config = {}
     if not os.path.exists(file_path):
-        logger.warning(
-            f"Config file '{file_path}' does not exist.", extra={"node": utils.NODE_IP}
-        )
+        logger.warning(f"Config file '{file_path}' does not exist.", extra={"node": utils.NODE_IP})
         return config
 
     try:
@@ -1297,9 +2881,7 @@ def update_config_file(handler, keys_to_update=None):
     try:
         update_cloudexchange_config(updated_config=keys_to_update)
     except Exception as e:
-        return {
-            "detail": f"Error encountered while updating config file. Error: {str(e)}."
-        }, 500
+        return {"detail": f"Error encountered while updating config file. Error: {str(e)}."}, 500
     return {"detail": "Config file updated successfully."}, 200
 
 
@@ -1322,9 +2904,7 @@ def get_config(handler):
         config = read_config_file(CONFIG_FILE_PATH)
         return config, 200
     except Exception as e:
-        return {
-            "detail": f"Error encountered while reading config file. Error: {str(e)}."
-        }, 500
+        return {"detail": f"Error encountered while reading config file. Error: {str(e)}."}, 500
 
 
 @SimpleAPIServer.route("/install-gluster", methods=["POST"], stream=True, scopes=[ADMIN_ROLE])
@@ -1352,9 +2932,7 @@ def install_gluster_route(handler):
         return {"detail": "Invalid request"}, 400
 
     if not data.get("shared_directory_path"):
-        write_chunk(
-            handler.wfile, "End: Please provide a valid shared directory path\n"
-        )
+        write_chunk(handler.wfile, "End: Please provide a valid shared directory path\n")
         end_stream(handler=handler, should_end_stream=True)
         return {"detail": "Please provide a valid shared directory path"}, 400
     else:
@@ -1403,9 +2981,7 @@ def ensure_volume_mounted_route(handler):
             "End: Please provide a valid shared directory path and current node ip.\n",
         )
         end_stream(handler=handler, should_end_stream=True)
-        return {
-            "detail": "Please provide a valid shared directory path and current node ip."
-        }, 400
+        return {"detail": "Please provide a valid shared directory path and current node ip."}, 400
 
     return ensure_volume_mounted(
         handler=handler,
@@ -1529,9 +3105,7 @@ def enable_ha(handler):
         end_stream(handler=handler)
         return response
 
-    response = verify_start_create_volume(
-        handler=handler, current_node_ip=current_node_ip
-    )
+    response = verify_start_create_volume(handler=handler, current_node_ip=current_node_ip)
     if response[1] != 200:
         end_stream(handler=handler)
         return response
@@ -1557,6 +3131,7 @@ def enable_ha(handler):
     # update the config file.
     write_chunk(handler.wfile, "Info: Updating the Cloud Exchange config file.\n")
     get_all_existed_env_variable(location=".env", override=True)
+    jwt_secret = get_decrypted_jwt_secret()
     response = update_config_file(
         handler=handler,
         keys_to_update={
@@ -1565,7 +3140,7 @@ def enable_ha(handler):
             "HA_PRIMARY_NODE_IP": current_node_ip,
             "HA_NFS_DATA_DIRECTORY": f"{shared_base_directory}/data",
             "HA_IP_LIST": f"{current_node_ip}",
-            "JWT_SECRET": AVAILABLE_INPUTS["JWT_SECRET"],
+            "JWT_SECRET": jwt_secret,
         },
     )
     if response[1] != 200:
@@ -1647,10 +3222,7 @@ def load_environment_from_multiple_sources(handler=None):
         error_msg = str(e)
         return False, error_msg
 
-    if (
-        AVAILABLE_INPUTS.get("HA_CURRENT_NODE")
-        or AVAILABLE_INPUTS.get("LOCATION", "") != ".env.keys"
-    ):
+    if AVAILABLE_INPUTS.get("HA_CURRENT_NODE") or AVAILABLE_INPUTS.get("LOCATION", "") != ".env.keys":
         try:
             location = AVAILABLE_INPUTS["LOCATION"]
             directory = os.path.dirname(location.rstrip("/"))
@@ -1658,9 +3230,7 @@ def load_environment_from_multiple_sources(handler=None):
 
             get_all_existed_env_variable(location=env_path, override=True)
         except Exception as e:
-            error_msg = (
-                f"Error encountered while fetching environment details. Error: {e}"
-            )
+            error_msg = f"Error encountered while fetching environment details. Error: {e}"
             if handler:
                 write_chunk(handler.wfile, f"End: {error_msg}\n")
                 end_stream(handler=handler)
@@ -1713,63 +3283,74 @@ def node_details(handler):
 
 def check_management_server(
     node_ip,
-    handler,
-    endpoint,
-    method,
+    handler=None,
+    endpoint=None,
+    method=None,
     protocol="https",
     should_stream=False,
+    should_stream_binary=False,
     payload=None,
     params=None,
+    auth_header=None,
 ):
     """
     Check the management server.
 
     Args:
         node_ip (str): The IP address of the host machine.
-        handler (Handler): The handler object.
+        handler (Handler, optional): The handler object. Defaults to None.
         endpoint (str): The endpoint to hit.
         method (str): The HTTP method to use.
-        protocol (str): The protocol to use. Defaults to "http".
-        should_stream (bool): A boolean indicating whether to stream the response.
+        protocol (str): The protocol to use. Defaults to "https".
+        should_stream (bool): A boolean indicating whether to stream text response.
+        should_stream_binary (bool): A boolean indicating whether to stream binary response.
         payload (str): The payload to send with the request.
+        params (dict): Query parameters to append to the endpoint.
+        auth_header (str, optional): Authorization header string for background threads. Defaults to None.
 
     Returns:
-        Response: The response object.
+        Response: The response object (yields text lines, binary chunks, or JSON).
     """
     ce_management_port = int(AVAILABLE_INPUTS.get("CE_MANAGEMENT_PORT", 8000))
     conn = None
-    
+
     if protocol == "http" or protocol == "https":  # management server is always https.
         server_cert, server_key, client_ca = get_certs_locations()
 
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_REQUIRED
         context.load_cert_chain(
             certfile=server_cert,
             keyfile=server_key,
         )
         if client_ca and os.path.exists(client_ca):
             context.load_verify_locations(cafile=client_ca)
-            context.verify_mode = ssl.CERT_REQUIRED
-            context.check_hostname = False
         else:
             logger.warning("Common CA cert not found.")
         conn = http.client.HTTPSConnection(node_ip, ce_management_port, context=context)
     else:
         raise Exception("Invalid protocol")
 
-    if handler.headers.get("Authorization"):
+    # Handle authorization from handler OR auth_header
+    headers = {}
+    if handler and handler.headers.get("Authorization"):
+        # Regular request - extract from handler
         new_token = create_token(handler.headers.get("Authorization"))
         if not new_token:
             logger.warning("Generated token is invalid, using the token from request.")
-            headers = {
-                "Authorization": handler.headers.get("Authorization"),
-            }
+            headers["Authorization"] = handler.headers.get("Authorization")
         else:
-            headers = {
-                "Authorization": f"Bearer {new_token}",
-            }
-    else:
-        headers = {}
+            headers["Authorization"] = f"Bearer {new_token}"
+    elif auth_header:
+        # Background thread - use provided auth_header
+        new_token = create_token(auth_header)
+        if not new_token:
+            logger.warning("Generated token is invalid, using the provided token.")
+            headers["Authorization"] = auth_header
+        else:
+            headers["Authorization"] = f"Bearer {new_token}"
+
     try:
         if payload:
             payload = json.dumps(payload)
@@ -1779,12 +3360,24 @@ def check_management_server(
         conn.request(method=method, url=endpoint, headers=headers, body=payload)
         res = conn.getresponse()
         handle_http_errors(res=res)
-        if should_stream:
+
+        # Binary streaming mode (for file downloads)
+        if should_stream_binary:
+            # First yield the response object so caller can check headers/status
+            yield res
+            while True:
+                chunk = res.read(8192)  # Read 8KB binary chunks
+                if not chunk:
+                    break
+                yield chunk
+        # Text streaming mode (for log messages)
+        elif should_stream:
             while True:
                 response = res.readline().decode()
                 if not response:
                     break
                 yield response
+        # JSON response mode
         else:
             response = res.read().decode()
             try:
@@ -1796,7 +3389,9 @@ def check_management_server(
                 )
             yield response, res.code
     except ssl.CertificateError as e:
-        enhanced_error = ssl.CertificateError(f"{e}. Please ensure configured CA key is same as Primary Node's CA key before executing CE Setup.")
+        enhanced_error = ssl.CertificateError(
+            f"{e}. Please ensure configured CA key is same as Primary Node's CA key before executing CE Setup."
+        )
         raise enhanced_error from e
     except Exception as e:
         raise e
@@ -1898,9 +3493,7 @@ def add_node(handler):
 
     # Node check management is up by making get call
     write_chunk(handler.wfile, "Info: Checking for Management server on new-node.\n")
-    AVAILABLE_INPUTS["UI_PROTOCOL"] = (
-        AVAILABLE_INPUTS.get("UI_PROTOCOL", "http").lower().strip()
-    )
+    AVAILABLE_INPUTS["UI_PROTOCOL"] = AVAILABLE_INPUTS.get("UI_PROTOCOL", "http").lower().strip()
     try:
         response = check_management_server(
             node_ip=node_ip,
@@ -1927,15 +3520,11 @@ def add_node(handler):
             f"Error: Issue connecting to Management Server at {node_ip}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Issue connecting to Management Server at {node_ip}. {str(e)}"
-        }, 400
+        return {"detail": f"Issue connecting to Management Server at {node_ip}. {str(e)}"}, 400
 
     AVAILABLE_INPUTS["HA_ENABLED"] = True
     AVAILABLE_INPUTS["HA_CURRENT_NODE"] = node_ip
-    AVAILABLE_INPUTS["HA_IP_LIST"] = update_ha_ip_list(
-        AVAILABLE_INPUTS["HA_IP_LIST"], ip_to_add=node_ip
-    )
+    AVAILABLE_INPUTS["HA_IP_LIST"] = update_ha_ip_list(AVAILABLE_INPUTS["HA_IP_LIST"], ip_to_add=node_ip)
 
     glusterfs_base_port = GLUSTERFS_BASE_PORT
     glusterfs_max_port = GLUSTERFS_MAX_PORT
@@ -2003,9 +3592,7 @@ def add_node(handler):
             f"End: Error encountered while updating the Cloud Exchange config file on new node. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while updating the Cloud Exchange config file on new node. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while updating the Cloud Exchange config file on new node. {str(e)}"}, 500
 
     # Validating prerequisites are met
     try:
@@ -2078,21 +3665,14 @@ def add_node(handler):
 
         write_chunk(
             handler.wfile,
-            (
-                f"End: Error encountered while validating prerequisites for new node. "
-                f"Error: {str(e)}\n"
-            ),
+            (f"End: Error encountered while validating prerequisites for new node. Error: {str(e)}\n"),
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while validating prerequisites for new node. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while validating prerequisites for new node. {str(e)}"}, 500
 
     # install GlusterFS on new node
     shared_base_directory_path = "/".join(
-        (AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY").strip().rstrip("/").split("/"))[
-            :-1
-        ]
+        (AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY").strip().rstrip("/").split("/"))[:-1]
     )  # parent dir of NFS_directory # /opt/shared/
     data = {
         "shared_directory_path": shared_base_directory_path,
@@ -2119,17 +3699,13 @@ def add_node(handler):
             f"End: Error encountered while installing GlusterFS on new node. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while installing GlusterFS on new node. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while installing GlusterFS on new node. {str(e)}"}, 500
 
     # peer probe from current
     write_chunk(handler.wfile, "Info: Peering with new node.\n")
     command = f"{SUDO_PREFIX} gluster peer probe {node_ip}"
     command = command.strip().split(" ")
-    response = execute_command_with_logging(
-        command, handler, message="peering with new node"
-    )
+    response = execute_command_with_logging(command, handler, message="peering with new node")
     if response[1] != 200:
         end_stream(handler=handler)
         return {"detail": "Error encountered while peering with new node."}, 500
@@ -2177,9 +3753,7 @@ def add_node(handler):
         )
         command = command.strip().split(" ")
         try:
-            for message in retirable_execute_command(
-                command, input_data="y\n", max_retries=3, max_delay=5
-            ):
+            for message in retirable_execute_command(command, input_data="y\n", max_retries=3, max_delay=5):
                 message_str = message.get("message", "\n")
                 type_str = message.get("type", "")
                 if type_str == "stderr":
@@ -2208,13 +3782,9 @@ def add_node(handler):
                 f"End: Error encountered while adding new brick to CloudExchange volume. Error: {str(e)}\n",
             )
             end_stream(handler=handler)
-            return {
-                "detail": "Error encountered while adding new brick to CloudExchange volume."
-            }, 500
+            return {"detail": "Error encountered while adding new brick to CloudExchange volume."}, 500
     try:
-        write_chunk(
-            handler.wfile, "Info: Triggering full heal on CloudExchange volume.\n"
-        )
+        write_chunk(handler.wfile, "Info: Triggering full heal on CloudExchange volume.\n")
         command = f"{SUDO_PREFIX} gluster volume heal CloudExchange full"
         command = command.strip().split(" ")
         for message in retirable_execute_command(command, max_retries=3, max_delay=5):
@@ -2244,9 +3814,7 @@ def add_node(handler):
             f"End: Error encountered while triggering heal operation on CloudExchange volume. Error: {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": "Error encountered while triggering heal operation on CloudExchange volume."
-        }, 500
+        return {"detail": "Error encountered while triggering heal operation on CloudExchange volume."}, 500
 
     # Mount GlusterFS volume on new node
     data = {
@@ -2273,9 +3841,7 @@ def add_node(handler):
             f"End: Error encountered while mounting GlusterFS volume on new node. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while mounting GlusterFS volume on new node. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while mounting GlusterFS volume on new node. {str(e)}"}, 500
 
     # Run setup with HA values updated on new node.
     try:
@@ -2299,9 +3865,7 @@ def add_node(handler):
             f"End: Error encountered while running setup on new node. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while running setup on new node. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while running setup on new node. {str(e)}"}, 500
 
     write_chunk(handler.wfile, "Info: Restarting other nodes in cluster now...\n")
     success, error_msg = load_environment_from_multiple_sources(handler)
@@ -2345,13 +3909,9 @@ def add_node(handler):
                 f"End: Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}\n",
             )
             end_stream(handler=handler)
-            return {
-                "detail": f"Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}"
-            }, 500
+            return {"detail": f"Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}"}, 500
 
-    write_chunk(
-        handler.wfile, f"Info: Stopping Cloud Exchange Primary Node {primary_node}.\n"
-    )
+    write_chunk(handler.wfile, f"Info: Stopping Cloud Exchange Primary Node {primary_node}.\n")
     try:
         for response_chunk in check_management_server(
             handler=handler,
@@ -2372,9 +3932,7 @@ def add_node(handler):
             f"End: Error encountered while stopping Cloud Exchange on Node {primary_node}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while stopping Cloud Exchange on Node {primary_node}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while stopping Cloud Exchange on Node {primary_node}. {str(e)}"}, 500
 
     #  Restart primary node to update certs and env
     write_chunk(
@@ -2401,9 +3959,7 @@ def add_node(handler):
             f"End: Error encountered while starting Cloud Exchange on Node {primary_node}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while starting Cloud Exchange on Node {primary_node}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while starting Cloud Exchange on Node {primary_node}. {str(e)}"}, 500
 
     # Restart other nodes to update certs and env
     write_chunk(handler.wfile, "Info: Starting other nodes in cluster now...\n")
@@ -2432,9 +3988,7 @@ def add_node(handler):
             f"End: Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}"}, 500
 
     try:
         # run start on new node.
@@ -2458,9 +4012,7 @@ def add_node(handler):
             f"End: Error encountered while running start on new node. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while running start on new node. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while running start on new node. {str(e)}"}, 500
 
     write_chunk(
         handler.wfile,
@@ -2522,9 +4074,7 @@ def restart_nodes(handler, ip):
             f"End: Error encountered while running restarting Cloud Exchange on node: {ip}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while running restarting Cloud Exchange on node: {ip}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while running restarting Cloud Exchange on node: {ip}. {str(e)}"}, 500
 
     return {"detail": "Cloud Exchange restarted"}, 200
 
@@ -2604,9 +4154,7 @@ def remove_node(handler):
 
     # node check management is up by making get call
     write_chunk(handler.wfile, "Info: Checking for Management server on node.\n")
-    AVAILABLE_INPUTS["UI_PROTOCOL"] = (
-        AVAILABLE_INPUTS.get("UI_PROTOCOL", "http").lower().strip()
-    )
+    AVAILABLE_INPUTS["UI_PROTOCOL"] = AVAILABLE_INPUTS.get("UI_PROTOCOL", "http").lower().strip()
     try:
         response = check_management_server(
             node_ip=node_ip,
@@ -2628,13 +4176,9 @@ def remove_node(handler):
             node_ip=node_ip,
         )
     except Exception as e:
-        write_chunk(
-            handler.wfile, f"Error: Issue connecting to Management Server. {str(e)}\n"
-        )
+        write_chunk(handler.wfile, f"Error: Issue connecting to Management Server. {str(e)}\n")
         end_stream(handler=handler)
-        return {
-            "detail": f"Issue connecting to Management Server on node {node_ip}. {str(e)}"
-        }, 400
+        return {"detail": f"Issue connecting to Management Server on node {node_ip}. {str(e)}"}, 400
 
     # stop
     try:
@@ -2657,14 +4201,10 @@ def remove_node(handler):
             f"End: Error encountered while stopping Cloud Exchange on node: {node_ip}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while stopping Cloud Exchange on node: {node_ip}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while stopping Cloud Exchange on node: {node_ip}. {str(e)}"}, 500
 
     # update_config
-    AVAILABLE_INPUTS["HA_IP_LIST"] = update_ha_ip_list(
-        AVAILABLE_INPUTS.get("HA_IP_LIST", ""), ip_to_remove=node_ip
-    )
+    AVAILABLE_INPUTS["HA_IP_LIST"] = update_ha_ip_list(AVAILABLE_INPUTS.get("HA_IP_LIST", ""), ip_to_remove=node_ip)
     try:
         data = {"HA_IP_LIST": AVAILABLE_INPUTS["HA_IP_LIST"]}
         response = check_management_server(
@@ -2688,18 +4228,12 @@ def remove_node(handler):
             f"End: Error encountered while updating env file on node {node_ip}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while updating env file on node {node_ip}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while updating env file on node {node_ip}. {str(e)}"}, 500
 
     # remove brick from GlusterFS volume
     write_chunk(handler.wfile, "Info: Removing brick from GlusterFS volume.\n")
     replica_nodes = len(AVAILABLE_INPUTS.get("HA_IP_LIST", "").rstrip(",").split(","))
-    shared_dir_base_path = "/".join(
-        (AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY").strip().rstrip("/").split("/"))[
-            :-1
-        ]
-    )
+    shared_dir_base_path = "/".join((AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY").strip().rstrip("/").split("/"))[:-1])
     command = (
         f"{SUDO_PREFIX} gluster volume remove-brick CloudExchange replica "
         f"{replica_nodes} {node_ip}:{shared_dir_base_path}/gluster/bricks/1/brick force"
@@ -2713,12 +4247,8 @@ def remove_node(handler):
     )
     if response[1] != 200:
         end_stream(handler=handler)
-        return {
-            "detail": "Error encountered while removing brick from GlusterFS volume."
-        }, 500
-    write_chunk(
-        handler.wfile, "Info: Successfully removed brick from GlusterFS volume.\n"
-    )
+        return {"detail": "Error encountered while removing brick from GlusterFS volume."}, 500
+    write_chunk(handler.wfile, "Info: Successfully removed brick from GlusterFS volume.\n")
 
     # Unmount.
     try:
@@ -2745,17 +4275,13 @@ def remove_node(handler):
             f"End: Error encountered while un-mounting CloudExchange volume on node: {node_ip}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while un-mounting CloudExchange volume on node: {node_ip}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while un-mounting CloudExchange volume on node: {node_ip}. {str(e)}"}, 500
 
     # detach-node
     write_chunk(handler.wfile, f"Info: Detaching node {node_ip} from GlusterFS.\n")
     command = f"{SUDO_PREFIX} gluster peer detach {node_ip}"
     command = command.strip().split(" ")
-    response = execute_command_with_logging(
-        command, handler, input_data="y\n", message="detaching node from GlusterFS"
-    )
+    response = execute_command_with_logging(command, handler, input_data="y\n", message="detaching node from GlusterFS")
     if response[1] != 200:
         end_stream(handler=handler)
         return {"detail": "Error encountered while detaching node from GlusterFS."}, 500
@@ -2809,13 +4335,9 @@ def remove_node(handler):
                 f"End: Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}\n",
             )
             end_stream(handler=handler)
-            return {
-                "detail": f"Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}"
-            }, 500
+            return {"detail": f"Error encountered while stopping Cloud Exchange on Node {ip}. {str(e)}"}, 500
 
-    write_chunk(
-        handler.wfile, f"Info: Stopping Cloud Exchange Primary Node {primary_node}.\n"
-    )
+    write_chunk(handler.wfile, f"Info: Stopping Cloud Exchange Primary Node {primary_node}.\n")
     try:
         for response_chunk in check_management_server(
             handler=handler,
@@ -2836,9 +4358,7 @@ def remove_node(handler):
             f"End: Error encountered while stopping Cloud Exchange on Node {primary_node}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while stopping Cloud Exchange on Node {primary_node}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while stopping Cloud Exchange on Node {primary_node}. {str(e)}"}, 500
 
     # Restart other nodes to update certs and env
     write_chunk(
@@ -2865,9 +4385,7 @@ def remove_node(handler):
             f"End: Error encountered while starting Cloud Exchange on Node {primary_node}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while starting Cloud Exchange on Node {primary_node}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while starting Cloud Exchange on Node {primary_node}. {str(e)}"}, 500
 
     write_chunk(handler.wfile, "Info: Starting other nodes in cluster now...\n")
     try:
@@ -2895,9 +4413,7 @@ def remove_node(handler):
             f"End: Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}\n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": f"Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}"
-        }, 500
+        return {"detail": f"Error encountered while starting Cloud Exchange on Node {ip}. {str(e)}"}, 500
 
     write_chunk(handler.wfile, f"End: Removed node: {node_ip} from HA Cluster.\n")
     end_stream(handler=handler)
@@ -2946,9 +4462,7 @@ def disable_ha(handler):
         }, 400
 
     shared_base_directory = "/".join(
-        (AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY").strip().rstrip("/").split("/"))[
-            :-1
-        ]
+        (AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY").strip().rstrip("/").split("/"))[:-1]
     )
     # Copy custom plugins from shared directory to "data" folder as in HA
     # if anyone using custom plugins they will be on shared directory
@@ -2968,13 +4482,14 @@ def disable_ha(handler):
     )
     if response[1] != 200:
         end_stream(handler=handler)
-        return {
-            "detail": "Error encountered while copying plugins, repos and custom plugins to data directory."
-        }, 500
+        return {"detail": "Error encountered while copying plugins, repos and custom plugins to data directory."}, 500
 
     # Move the custom certs to data directory.
     write_chunk(handler.wfile, "Info: Moving custom certs and ssl certs to data directory.\n")
-    command = f"{SUDO_PREFIX} cp -r {shared_base_directory}/data/config/ca_certs {shared_base_directory}/data/config/ssl_certs ./data/"
+    command = (
+        f"{SUDO_PREFIX} cp -r {shared_base_directory}/data/config/ca_certs "
+        f"{shared_base_directory}/data/config/ssl_certs ./data/"
+    )
     command = command.strip().split(" ")
     response = execute_command_with_logging(
         command, handler, message="moving custom certs and ssl certs to data directory"
@@ -3000,20 +4515,19 @@ def disable_ha(handler):
     )
     if response[1] != 200:
         end_stream(handler=handler)
-        return {
-            "detail": "Error encountered while copying env files from shared directory."
-        }, 500
+        return {"detail": "Error encountered while copying env files from shared directory."}, 500
     write_chunk(handler.wfile, "Info: Copied env files from shared directory.\n")
 
     # Update Cloud Exchange config.
     try:
         write_chunk(handler.wfile, "Info: Updating Cloud Exchange env file.\n")
+        jwt_secret = get_decrypted_jwt_secret()
         data = {
             "HA_ENABLED": False,
             "HA_IP_LIST": "",
             "HA_CURRENT_NODE": "",
             "HA_NFS_DATA_DIRECTORY": "",
-            "JWT_SECRET": AVAILABLE_INPUTS["JWT_SECRET"],
+            "JWT_SECRET": jwt_secret,
             "HA_PRIMARY_NODE_IP": "",
         }
         response = update_env(handler=handler, update_data=data, env_file=".env")
@@ -3035,13 +4549,9 @@ def disable_ha(handler):
             f"End: Error encountered while updating Cloud Exchange config. Error: {str(e)} \n",
         )
         end_stream(handler=handler)
-        return {
-            "detail": "Error encountered while updating Cloud Exchange config."
-        }, 500
+        return {"detail": "Error encountered while updating Cloud Exchange config."}, 500
 
-    write_chunk(
-        handler.wfile, "Info: Setting up Cloud Exchange as Standalone deployment."
-    )
+    write_chunk(handler.wfile, "Info: Setting up Cloud Exchange as Standalone deployment.")
     response = setup(
         handler=handler,
         should_end_stream=False,
@@ -3075,6 +4585,1032 @@ def disable_ha(handler):
     write_chunk(handler.wfile, "Info: Cloud Exchange started successfully.\n")
     end_stream(handler=handler)
     return {"detail": "Cloud Exchange started."}, 200
+
+
+def _run_local_diagnose():
+    """
+    Run the ./diagnose script locally and return the path to the generated zip file.
+
+    This function executes the diagnose bash script which collects system information,
+    container logs, and CE platform details, then packages them into a zip file.
+
+    Uses the common execute_command utility for consistent command execution.
+    The diagnose script outputs the path to the generated zip file as its last line.
+    The zip file is typically created in /opt/cloudexchange/ directory.
+
+    Returns:
+        tuple: (success: bool, result: str)
+            - On success: (True, path_to_zip_file)
+            - On failure: (False, error_message)
+    """
+    command = f"{SUDO_PREFIX} ./diagnose".strip()
+    diagnose_file = None
+    return_code = 0
+    stderr_output = []
+
+    logger.info(f"Running diagnose command: {command}", extra={"node": utils.NODE_IP})
+
+    try:
+        # Use the common execute_command utility for consistent command execution
+        for message in execute_command(command, shell=True):
+            msg_type = message.get("type", "")
+            msg_content = message.get("message", "").strip()
+
+            if msg_type == "stdout":
+                # Check if this line contains the zip file path
+                if msg_content.endswith(".zip"):
+                    diagnose_file = msg_content
+                    logger.info("Found diagnose zip path: {}".format(diagnose_file), extra={"node": utils.NODE_IP})
+            elif msg_type == "stderr":
+                if msg_content:
+                    stderr_output.append(msg_content)
+            elif msg_type == "returncode":
+                return_code = message.get("code", 0)
+
+        logger.info(
+            f"Diagnose script completed with return code: {return_code}",
+            extra={"node": utils.NODE_IP},
+        )
+
+        if return_code != 0:
+            error_detail = "; ".join(stderr_output) if stderr_output else "Unknown error"
+            return (
+                False,
+                f"Diagnose script failed with return code {return_code}: {error_detail}",
+            )
+
+        if not diagnose_file or not os.path.exists(diagnose_file):
+            return (
+                False,
+                "Diagnose completed but zip file path not captured from script output",
+            )
+
+        return True, diagnose_file
+
+    except Exception as e:
+        logger.error(f"Error running diagnose: {str(e)}", extra={"node": utils.NODE_IP})
+        return False, f"Error running diagnose: {str(e)}"
+
+
+def _collect_remote_diagnose(node_ip, auth_header):
+    """
+    Collect diagnose zip from a remote node in the HA cluster.
+
+    This function makes an HTTPS request to the remote node's /run-diagnose-node endpoint,
+    which triggers the diagnose script on that node and returns the zip file directly.
+    The received zip file is saved to the shared NFS directory.
+
+    Args:
+        node_ip: IP address of the remote node to collect diagnose from
+        auth_header: Authorization header value from the original request
+
+    Returns:
+        tuple: (success: bool, result: str, node_ip: str)
+            - On success: (True, path_to_saved_zip, node_ip)
+            - On failure: (False, error_message, node_ip)
+    """
+    try:
+        # Prepare the directory to store the downloaded zip file
+        shared_dir = AVAILABLE_INPUTS.get("HA_NFS_DATA_DIRECTORY", "/opt/shared/data")
+        diagnose_dir = os.path.join(shared_dir, "diagnose_files")
+        os.makedirs(diagnose_dir, exist_ok=True)
+
+        # Generate unique filename for this node's diagnose zip
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        node_filename = f"node_{node_ip.replace('.', '_')}_{timestamp}.zip"
+        file_path = os.path.join(diagnose_dir, node_filename)
+
+        # Use check_management_server with binary streaming mode
+        stream = check_management_server(
+            node_ip=node_ip,
+            handler=None,
+            auth_header=auth_header,
+            endpoint="/api/management/run-diagnose-node",
+            method="POST",
+            protocol="https",
+            should_stream_binary=True,
+        )
+
+        # First item yielded is the response object
+        res = next(stream)
+
+        # Check if response is a JSON error (status 500) or binary zip (status 200)
+        status_code = res.code
+        content_type = res.getheader("Content-Type", "")
+
+        if status_code != 200:
+            # Read error response as JSON
+            error_data = res.read().decode()
+            try:
+                error_json = json.loads(error_data)
+                error_msg = error_json.get("detail", error_data)
+            except (JSONDecodeError, TypeError):
+                error_msg = error_data
+            logger.error(f"Remote diagnose failed on {node_ip}: {error_msg}", extra={"node": utils.NODE_IP})
+            return False, f"Remote node returned error: {error_msg}", node_ip
+
+        if "application/zip" not in content_type:
+            # Unexpected content type
+            logger.error(f"Unexpected Content-Type from {node_ip}: {content_type}", extra={"node": utils.NODE_IP})
+            return False, f"Unexpected response type: {content_type}", node_ip
+
+        # Stream the binary zip file
+        with open(file_path, "wb") as f:
+            for chunk in stream:
+                f.write(chunk)
+
+        # Verify the downloaded file is valid
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            logger.info(f"Successfully collected diagnose from {node_ip}: {file_path}", extra={"node": utils.NODE_IP})
+            return True, file_path, node_ip
+        else:
+            return False, "Downloaded file is empty or missing", node_ip
+
+    except Exception as e:
+        logger.error(f"Error collecting diagnose from {node_ip}: {str(e)}", extra={"node": utils.NODE_IP})
+        return False, str(e), node_ip
+
+
+def _merge_diagnose_zips(zip_files, output_path):
+    """
+    Merge multiple diagnose zip files into a single cluster zip.
+
+    Args:
+        zip_files: List of tuples (node_ip, zip_file_path)
+        output_path: Path for the merged zip file
+
+    Returns:
+        tuple: (success: bool, error_message: str or None)
+    """
+    try:
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as merged_zip:
+            for node_ip, zip_path in zip_files:
+                if not os.path.exists(zip_path):
+                    continue
+
+                # Create a folder for each node in the merged zip
+                node_folder = f"node_{node_ip.replace('.', '_')}"
+
+                with zipfile.ZipFile(zip_path, "r") as node_zip:
+                    for item in node_zip.namelist():
+                        # Read file content from source zip
+                        content = node_zip.read(item)
+                        # Write to merged zip under node-specific folder
+                        merged_zip.writestr(f"{node_folder}/{item}", content)
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _cleanup_diagnose_files(file_paths):
+    """
+    Clean up temporary diagnose files.
+
+    Args:
+        file_paths: List of file paths to remove
+    """
+    for path in file_paths:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup file {path}: {str(e)}", extra={"node": utils.NODE_IP})
+
+
+def _pre_check_ha_nodes_for_diagnose(auth_header, ha_ip_list, current_node_ip):
+    """
+    Pre-check all HA nodes before starting diagnose collection.
+
+    This function checks the health of all nodes in the HA cluster and logs
+    warnings for any nodes that have issues. Warnings are logged to backend only.
+
+    Uses direct HTTPS connections for remote node communication since this
+    runs in a background thread.
+
+    Args:
+        auth_header: Authorization header for remote calls
+        ha_ip_list: Comma-separated list of HA node IPs
+        current_node_ip: IP of the current node
+
+    Returns:
+        dict: node_status mapping node_ip to status dict
+    """
+    node_status = {}
+    all_node_ips = [ip.strip() for ip in ha_ip_list.split(",") if ip.strip()]
+
+    for node_ip in all_node_ips:
+        if node_ip == current_node_ip:
+            # Local node - check CE status directly
+            fetch_container_info()
+            local_ce_running = utils.is_ui_running and utils.is_rabbitmq_running and utils.is_mongodb_running
+            node_status[node_ip] = {
+                "management_server": "running",
+                "ce_status": "running" if local_ce_running else "stopped",
+                "is_local": True,
+            }
+            if not local_ce_running:
+                logger.warning(
+                    f"Diagnose: Local node ({node_ip}) CE containers are stopped. "
+                    f"Some container logs may be missing in diagnose output.",
+                    extra={"node": utils.NODE_IP},
+                )
+            continue
+
+        # Check remote node management server health
+        try:
+            for response in check_management_server(
+                node_ip=node_ip,
+                handler=None,
+                auth_header=auth_header,
+                endpoint="/api/management/node-details",
+                method="GET",
+                protocol="https",
+                should_stream=False,
+            ):
+                if isinstance(response, tuple) and len(response) >= 2:
+                    is_reachable = response[1] == 200
+                    error_msg = None if is_reachable else f"Status {response[1]}"
+                elif isinstance(response, dict):
+                    is_reachable = True
+                    error_msg = None
+                break
+        except Exception as e:
+            is_reachable = False
+            error_msg = str(e)
+
+        if not is_reachable:
+            node_status[node_ip] = {
+                "management_server": "unreachable",
+                "ce_status": "unknown",
+                "is_local": False,
+                "error": error_msg,
+            }
+            # Log warning to backend only
+            logger.warning(
+                f"Diagnose: Node {node_ip} management server is not reachable. "
+                f"Error: {error_msg}. Diagnose logs for this node will be missing. "
+                f"Please start the management server on this node for complete HA diagnostics.",
+                extra={"node": utils.NODE_IP},
+            )
+            continue
+
+        # Management server is reachable; initialize node status once
+        node_status[node_ip] = {"management_server": "running", "ce_status": "unknown", "is_local": False}
+
+        # Now check CE status only and update ce_status / error
+        try:
+            for response in check_management_server(
+                node_ip=node_ip,
+                handler=None,
+                auth_header=auth_header,
+                endpoint="/api/management/ce-status",
+                method="GET",
+                protocol="https",
+                should_stream=False,
+            ):
+                if isinstance(response, tuple) and len(response) >= 2:
+                    if response[1] == 200 and isinstance(response[0], dict):
+                        ce_running = response[0].get("is_running", False)
+                        ce_error = None
+                    else:
+                        ce_running = False
+                        ce_error = f"HTTP {response[1]}"
+                elif isinstance(response, dict):
+                    ce_running = response.get("is_running", False)
+                    ce_error = None
+                break
+        except Exception as e:
+            ce_running = False
+            ce_error = str(e)
+
+        if ce_running:
+            node_status[node_ip]["ce_status"] = "running"
+            logger.info(
+                f"Diagnose: Node {node_ip} management server and CE containers are running.",
+                extra={"node": utils.NODE_IP},
+            )
+        else:
+            node_status[node_ip]["ce_status"] = "stopped"
+            node_status[node_ip]["error"] = ce_error
+            # Log warning to backend only
+            logger.warning(
+                f"Diagnose: Node {node_ip} CE containers are stopped. "
+                f"Some CE logs may be missing or incomplete for this node. "
+                f"Consider starting CE containers on this node before collecting diagnostics.",
+                extra={"node": utils.NODE_IP},
+            )
+
+    # Log summary
+    reachable_nodes = [ip for ip, st in node_status.items() if st.get("management_server") == "running"]
+    unreachable_nodes = [ip for ip, st in node_status.items() if st.get("management_server") == "unreachable"]
+
+    if unreachable_nodes:
+        logger.warning(
+            f"Diagnose: {len(unreachable_nodes)} node(s) have unreachable management servers: "
+            f"{', '.join(unreachable_nodes)}. Diagnose will proceed with {len(reachable_nodes)} reachable node(s).",
+            extra={"node": utils.NODE_IP},
+        )
+    else:
+        logger.info(
+            f"Diagnose: All {len(reachable_nodes)} node(s) have reachable management servers.",
+            extra={"node": utils.NODE_IP},
+        )
+
+    return node_status
+
+
+def _send_json_error_response(handler, error_message, status_code):
+    """
+    Send a JSON error response to the client.
+
+    This helper function formats and sends an error response with the appropriate
+    HTTP status code and JSON content type.
+
+    Args:
+        handler: HTTP request handler object
+        error_message: Error message to include in the response
+        status_code: HTTP status code (e.g., 400, 500)
+
+    Returns:
+        tuple: (response_dict, status_code) for consistency with other handlers
+    """
+    response = json.dumps({"detail": error_message}).encode()
+    handler.send_response(status_code)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(response)))
+    handler.end_headers()
+    handler.wfile.write(response)
+    handler.wfile.flush()
+    return {"detail": error_message}, status_code
+
+
+def _send_zip_file_download(handler, zip_file_path, filename, files_to_cleanup):
+    """
+    Send a zip file as direct binary HTTP response for download.
+
+    This function sends the zip file with appropriate headers for browser download.
+    The file is streamed in chunks to handle large files efficiently.
+
+    Args:
+        handler: HTTP request handler object
+        zip_file_path: Absolute path to the zip file to send
+        filename: Filename to use in Content-Disposition header (download name)
+        files_to_cleanup: List of file paths to delete after successful send
+
+    Returns:
+        None - Response is sent directly, caller should return this None value
+    """
+    try:
+        # Verify the zip file exists before attempting to send
+        if not os.path.exists(zip_file_path):
+            logger.error(f"Zip file not found: {zip_file_path}", extra={"node": utils.NODE_IP})
+            return _send_json_error_response(handler, "Zip file not found", 500)
+
+        # Get file size for Content-Length header
+        file_size = os.path.getsize(zip_file_path)
+
+        # Send HTTP response headers for binary file download
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/zip")
+        handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        handler.send_header("Content-Length", str(file_size))
+        handler.send_header("Connection", "close")  # Prevent keep-alive issues
+        handler.end_headers()
+
+        # Stream the file content in 8KB chunks
+        with open(zip_file_path, "rb") as f:
+            while True:
+                chunk = f.read(8192)  # 8KB chunks for efficient streaming
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+
+        # Cleanup temporary files after successful send
+        _cleanup_diagnose_files(files_to_cleanup)
+
+        logger.info(f"Diagnose file sent successfully: {filename} ({file_size} bytes)", extra={"node": utils.NODE_IP})
+
+        write_chunk(handler.wfile, "End: Diagnose file sent successfully.\n")
+
+        # Return None to signal that response was already sent
+        # This prevents SimpleAPIServer from trying to send headers again
+        return None, 200
+
+    except Exception as e:
+        logger.error(f"Error sending zip file: {str(e)}", extra={"node": utils.NODE_IP})
+        _cleanup_diagnose_files(files_to_cleanup)
+        return _send_json_error_response(handler, f"Error sending file: {str(e)}", 500)
+
+
+def _update_diagnose_job(updates):
+    """Thread-safe helper to update CURRENT_DIAGNOSE_JOB and persist to disk."""
+    global CURRENT_DIAGNOSE_JOB
+    with _diagnose_job_lock:
+        if CURRENT_DIAGNOSE_JOB:
+            CURRENT_DIAGNOSE_JOB.update(updates)
+            # Persist updates to disk so other HA nodes can see status changes
+            output_dir = _get_diagnose_output_dir()
+            if os.path.exists(output_dir):
+                _save_diagnose_job_metadata(CURRENT_DIAGNOSE_JOB, output_dir)
+
+
+def _run_diagnose_worker(job_id, auth_header, is_ha_mode, ha_ip_list):
+    """
+    Background worker for diagnose. Updates CURRENT_DIAGNOSE_JOB.
+
+    This worker performs health checks on HA nodes before collecting diagnostics
+    and logs warnings to backend for unreachable management servers or stopped
+    CE containers.
+
+    Args:
+        job_id: Unique job identifier
+        auth_header: Authorization header for remote calls
+        is_ha_mode: Whether running in HA mode
+        ha_ip_list: Comma-separated list of HA node IPs
+    """
+    global CURRENT_DIAGNOSE_JOB
+    files_to_cleanup = []
+    timestamp = datetime.now().strftime("%a_%d_%b_%Y_%H_%M_%S")
+    output_dir = _get_diagnose_output_dir()
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+
+        if not is_ha_mode:
+            # Single node mode - check CE status and run local diagnose
+            _update_diagnose_job({"message": "Checking CE container status..."})
+
+            # Check local CE status first and log warning if stopped
+            fetch_container_info()
+            ce_running = utils.is_ui_running and utils.is_rabbitmq_running and utils.is_mongodb_running
+            if not ce_running:
+                logger.warning(
+                    f"Diagnose: CE containers are stopped on this node ({utils.NODE_IP}). "
+                    f"Some CE container logs may be missing or incomplete in diagnose output. "
+                    f"Consider starting CE containers before collecting diagnostics for complete logs.",
+                    extra={"node": utils.NODE_IP},
+                )
+            else:
+                logger.info(
+                    f"Diagnose: CE containers are running on this node ({utils.NODE_IP}).",
+                    extra={"node": utils.NODE_IP},
+                )
+
+            _update_diagnose_job({"message": "Running diagnose script..."})
+            success, result = _run_local_diagnose()
+            completion_msg = ""
+            errors = []
+            output_path = None
+            output_filename = None
+
+            if not success:
+                completion_msg += f"Diagnose failed: {result}"
+                errors.append(result)
+            else:
+                # Filename format: diagnose_{job_id}_{timestamp}.zip
+                output_filename = f"diagnose_{job_id}_{timestamp}.zip"
+                output_path = os.path.join(output_dir, output_filename)
+                shutil.copy2(result, output_path)
+                files_to_cleanup.append(result)
+                completion_msg = "Diagnose completed"
+            if not ce_running:
+                completion_msg += " (CE containers were stopped - some logs may be missing)"
+
+            job_update = {
+                "status": "completed" if success else "failed",
+                "message": completion_msg,
+                "file_path": output_path,
+                "file_name": output_filename,
+                "ce_status": "running" if ce_running else "stopped",
+                "errors": errors,
+            }
+            _update_diagnose_job(job_update)
+            # Persist job metadata to file for recovery after restart
+            with _diagnose_job_lock:
+                if CURRENT_DIAGNOSE_JOB:
+                    _save_diagnose_job_metadata(CURRENT_DIAGNOSE_JOB, output_dir)
+        else:
+            # HA mode - check node health before collecting
+            current_node_ip = AVAILABLE_INPUTS.get("HA_CURRENT_NODE", "").strip() or (
+                utils.NODE_IP.strip() if utils.NODE_IP else ""
+            )
+            all_node_ips = [ip.strip() for ip in ha_ip_list.split(",") if ip.strip()]
+            remote_node_ips = [ip for ip in all_node_ips if ip != current_node_ip]
+            total_nodes = len(all_node_ips)
+
+            # Pre-check all nodes for health status (logs warnings to backend)
+            _update_diagnose_job({"message": f"HA mode: Checking health of {total_nodes} nodes..."})
+            node_status = _pre_check_ha_nodes_for_diagnose(auth_header, ha_ip_list, current_node_ip)
+
+            # Identify which nodes to skip based on pre-check
+            unreachable_nodes = [
+                ip for ip, status in node_status.items() if status.get("management_server") == "unreachable"
+            ]
+
+            # Identify nodes with stopped CE containers
+            stopped_ce_nodes = [ip for ip, status in node_status.items() if status.get("ce_status") == "stopped"]
+
+            _update_diagnose_job({"message": f"HA mode: collecting from {total_nodes} nodes"})
+            collected_zips = []
+            errors = []
+
+            # Collect from local node first
+            _update_diagnose_job({"message": f"Running on local node ({current_node_ip})..."})
+            success, result = _run_local_diagnose()
+            if success:
+                collected_zips.append((current_node_ip, result))
+                files_to_cleanup.append(result)
+            else:
+                errors.append(f"Local ({current_node_ip}): {result}")
+                logger.error(
+                    f"Diagnose: Local node ({current_node_ip}) diagnose script failed: {result}",
+                    extra={"node": utils.NODE_IP},
+                )
+
+            # Collect from remote nodes
+            for node_ip in remote_node_ips:
+                # Skip nodes that were identified as unreachable in pre-check
+                if node_ip in unreachable_nodes:
+                    errors.append(f"{node_ip}: Management server unreachable (skipped)")
+                    continue
+
+                _update_diagnose_job({"message": f"Collecting from {node_ip}..."})
+                success, result, _ = _collect_remote_diagnose(node_ip, auth_header)
+
+                if success:
+                    collected_zips.append((node_ip, result))
+                    files_to_cleanup.append(result)
+                    # Log success message, note if CE was stopped
+                    if node_ip in stopped_ce_nodes:
+                        logger.info(
+                            f"Diagnose: Successfully collected from {node_ip}. "
+                            f"Note: CE containers were stopped, some CE logs may be missing.",
+                            extra={"node": utils.NODE_IP},
+                        )
+                else:
+                    errors.append(f"{node_ip}: {result}")
+                    # Log specific error based on error type to backend
+                    if "Connection refused" in result or "not running" in result.lower():
+                        logger.warning(
+                            f"Diagnose: Node {node_ip} management server stopped during collection. "
+                            f"Diagnose logs missing for this node. Start management server and retry.",
+                            extra={"node": utils.NODE_IP},
+                        )
+                    elif "timeout" in result.lower():
+                        logger.warning(
+                            f"Diagnose: Node {node_ip} connection timed out during collection. "
+                            f"The node may be overloaded or network issues exist.",
+                            extra={"node": utils.NODE_IP},
+                        )
+                    else:
+                        logger.warning(
+                            f"Diagnose: Node {node_ip} failed to collect diagnose: {result}",
+                            extra={"node": utils.NODE_IP},
+                        )
+
+            # Check if we collected anything
+            if not collected_zips:
+                raise Exception("No diagnose collected from any node. Errors: " + "; ".join(errors))
+
+            _update_diagnose_job({"message": f"Merging {len(collected_zips)} node files..."})
+
+            # Filename format: cluster_{job_id}_{timestamp}.zip
+            merged_zip_name = f"cluster_{job_id}_{timestamp}.zip"
+            merged_zip_path = os.path.join(output_dir, merged_zip_name)
+
+            success, merge_error = _merge_diagnose_zips(collected_zips, merged_zip_path)
+            if not success:
+                raise Exception(f"Merge failed: {merge_error}")
+
+            # Build completion message with summary
+            collected_count = len(collected_zips)
+            skipped_count = len(unreachable_nodes)
+            error_count = len(errors)
+
+            completion_msg = f"Completed ({collected_count}/{total_nodes} nodes)"
+            if skipped_count > 0:
+                completion_msg += f", {skipped_count} unreachable"
+            if error_count > skipped_count:
+                completion_msg += f", {error_count - skipped_count} failed"
+
+            job_update = {
+                "status": "completed",
+                "message": completion_msg,
+                "file_path": merged_zip_path,
+                "file_name": merged_zip_name,
+                "node_summary": {
+                    "total": total_nodes,
+                    "collected": collected_count,
+                    "unreachable": skipped_count,
+                    "errors": errors,
+                },
+            }
+            _update_diagnose_job(job_update)
+            # Persist job metadata to file for recovery after restart
+            with _diagnose_job_lock:
+                if CURRENT_DIAGNOSE_JOB:
+                    _save_diagnose_job_metadata(CURRENT_DIAGNOSE_JOB, output_dir)
+
+            # Log summary to backend
+            if unreachable_nodes:
+                logger.warning(
+                    f"Diagnose completed: {len(unreachable_nodes)} node(s) had "
+                    f"unreachable management servers: {', '.join(unreachable_nodes)}. "
+                    f"Start management servers on these nodes for complete diagnostics.",
+                    extra={"node": utils.NODE_IP},
+                )
+            if stopped_ce_nodes:
+                logger.warning(
+                    f"Diagnose completed: {len(stopped_ce_nodes)} node(s) had stopped CE containers: "
+                    f"{', '.join(stopped_ce_nodes)}. Some CE logs may be missing for these nodes.",
+                    extra={"node": utils.NODE_IP},
+                )
+            if collected_count == total_nodes:
+                logger.info(
+                    f"Diagnose completed successfully: All {total_nodes} nodes collected.",
+                    extra={"node": utils.NODE_IP},
+                )
+
+        _cleanup_diagnose_files(files_to_cleanup)
+        logger.info(f"Diagnose job {job_id} completed", extra={"node": utils.NODE_IP})
+
+    except Exception as e:
+        _update_diagnose_job({"status": "failed", "message": str(e), "error": str(e)})
+        _cleanup_diagnose_files(files_to_cleanup)
+        logger.error(f"Diagnose job {job_id} failed: {e}", extra={"node": utils.NODE_IP})
+
+
+@SimpleAPIServer.route("/run-diagnose", methods=["POST"], scopes=[ADMIN_ROLE])
+def run_diagnose(handler):
+    """
+    Start diagnose collection. Returns job_id immediately for async processing.
+
+    Use /diagnose-download to get file or check status.
+
+    Throttling behavior:
+    - If a job is already running, returns the existing job_id with status "running"
+    - If a completed job exists, returns info about it (use cleanup=true to clear)
+    - Only starts a new job if no job exists or previous job was cleared
+
+    In HA mode, this will:
+    - Pre-check all nodes for management server and CE container health
+    - Generate warnings for unreachable nodes or stopped containers
+    - Collect diagnose from all reachable nodes
+    - Merge results into a single cluster zip file
+
+    Recovery after restart:
+        If management server restarted with a completed diagnose job, this endpoint
+        will recover the job state and inform the user to download it first.
+
+    Returns:
+        JSON response with job_id, status, and message
+    """
+    global CURRENT_DIAGNOSE_JOB
+    logger.info("Diagnose API called", extra={"node": utils.NODE_IP})
+
+    # Load environment variables
+    success, error_msg = load_environment_from_multiple_sources(handler)
+    if not success:
+        return _send_json_error_response(handler, f"Error loading environment: {error_msg}", 500)
+
+    with _diagnose_job_lock:
+        # If no in-memory job, attempt recovery from file system
+        if not CURRENT_DIAGNOSE_JOB:
+            recovered_job = _recover_diagnose_job_state()
+            if recovered_job and recovered_job.get("status") == "completed":
+                # Verify the file still exists
+                if recovered_job.get("file_path") and os.path.exists(recovered_job["file_path"]):
+                    CURRENT_DIAGNOSE_JOB = recovered_job
+                    logger.info(
+                        f"Recovered completed diagnose job {recovered_job.get('job_id')} from file system",
+                        extra={"node": utils.NODE_IP},
+                    )
+
+        # Check if a job is already running - throttle redundant requests
+        if CURRENT_DIAGNOSE_JOB and CURRENT_DIAGNOSE_JOB.get("status") == "running":
+            return {
+                "job_id": CURRENT_DIAGNOSE_JOB["job_id"],
+                "status": "running",
+                "message": "Diagnose already in progress",
+            }, 200
+
+        # Check if a completed job exists - inform user to download or clear it
+        if CURRENT_DIAGNOSE_JOB and CURRENT_DIAGNOSE_JOB.get("status") == "completed":
+            return {
+                "job_id": CURRENT_DIAGNOSE_JOB["job_id"],
+                "status": "completed",
+                "message": "Remove existing diagnose file after download to allow a new diagnosis run",
+                "file_name": CURRENT_DIAGNOSE_JOB.get("file_name"),
+            }, 200
+
+        job_id = str(uuid.uuid4())
+        auth_header = handler.headers.get("Authorization")
+        ha_ip_list = AVAILABLE_INPUTS.get("HA_IP_LIST", "")
+        is_ha_mode = bool(ha_ip_list and len(ha_ip_list.strip().split(",")) > 1)
+
+        # Clean up all old diagnose files (metadata + zips) - only one job at a time
+        _cleanup_all_diagnose_files()
+
+        CURRENT_DIAGNOSE_JOB = {
+            "job_id": job_id,
+            "status": "running",
+            "message": "Starting diagnose...",
+            "file_path": None,
+            "file_name": None,
+            "error": None,
+            "node_summary": None,
+        }
+
+        # Persist job metadata immediately so other HA nodes can see status
+        output_dir = _get_diagnose_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        _save_diagnose_job_metadata(CURRENT_DIAGNOSE_JOB, output_dir)
+        logger.info(f"Persisted job metadata for {job_id} to {output_dir}", extra={"node": utils.NODE_IP})
+
+    worker = threading.Thread(
+        target=_run_diagnose_worker,
+        args=(job_id, auth_header, is_ha_mode, ha_ip_list),
+        daemon=True,
+    )
+    worker.start()
+
+    logger.info(
+        f"Diagnose job {job_id} started (HA mode: {is_ha_mode})",
+        extra={"node": utils.NODE_IP},
+    )
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "message": "Diagnose started",
+        "is_ha_mode": is_ha_mode,
+    }, 202
+
+
+@SimpleAPIServer.route("/diagnose-status", methods=["GET"], scopes=[ADMIN_ROLE])
+def diagnose_status(handler):
+    """
+    Get the status of the current or last diagnose job.
+
+    Returns:
+        JSON response with:
+        - job_id: The diagnose job ID (use this for download if status is "completed")
+        - status: "running", "completed", "failed", or None
+        - message: Human-readable status message
+        - file_name: Name of the zip file (only if status is "completed")
+
+    Recovery after restart:
+        If management server restarts, this endpoint will attempt to recover
+        the job state from metadata files or zip files on disk.
+    """
+    global CURRENT_DIAGNOSE_JOB
+
+    # Load environment variables
+    success, error_msg = load_environment_from_multiple_sources(handler)
+    if not success:
+        return _send_json_error_response(handler, f"Error loading environment: {error_msg}", 500)
+
+    with _diagnose_job_lock:
+        # If no in-memory job, attempt recovery from file system
+        if not CURRENT_DIAGNOSE_JOB:
+            logger.info(
+                "No in-memory job found, attempting recovery from file system",
+                extra={"node": utils.NODE_IP},
+            )
+            recovered_job = _recover_diagnose_job_state()
+            if recovered_job:
+                CURRENT_DIAGNOSE_JOB = recovered_job
+                logger.info(
+                    f"Recovered diagnose job {recovered_job.get('job_id')} from file system",
+                    extra={"node": utils.NODE_IP},
+                )
+        else:
+            # Refresh from metadata file to get latest updates from other HA nodes
+            job_id = CURRENT_DIAGNOSE_JOB.get("job_id")
+            if job_id:
+                logger.info(f"Refreshing job {job_id} from metadata file", extra={"node": utils.NODE_IP})
+                output_dir = _get_diagnose_output_dir()
+                refreshed_job = _load_diagnose_job_metadata(job_id, output_dir)
+                if refreshed_job:
+                    logger.info(
+                        f"Refreshed job {job_id}: old_status={CURRENT_DIAGNOSE_JOB.get('status')}, "
+                        f"new_status={refreshed_job.get('status')}",
+                        extra={"node": utils.NODE_IP},
+                    )
+                    CURRENT_DIAGNOSE_JOB = refreshed_job
+                else:
+                    # Metadata file missing or corrupted - clear in-memory job
+                    logger.warning(
+                        f"Failed to refresh job {job_id} from metadata file - metadata missing or corrupted. "
+                        f"Clearing in-memory job state.",
+                        extra={"node": utils.NODE_IP},
+                    )
+                    _cleanup_all_diagnose_files()
+                    CURRENT_DIAGNOSE_JOB = None
+
+        # No job found
+        if not CURRENT_DIAGNOSE_JOB:
+            logger.info(
+                "No diagnose job found after recovery attempt",
+                extra={"node": utils.NODE_IP},
+            )
+            return {
+                "job_id": None,
+                "status": None,
+                "message": "No diagnose job found. Run diagnose first.",
+            }, 404
+
+        job_id = CURRENT_DIAGNOSE_JOB["job_id"]
+        status = CURRENT_DIAGNOSE_JOB["status"]
+
+        if status == "running":
+            return {
+                "job_id": job_id,
+                "status": "running",
+                "message": CURRENT_DIAGNOSE_JOB["message"],
+            }, 200
+
+        if status == "failed":
+            error_msg = CURRENT_DIAGNOSE_JOB.get("error") or CURRENT_DIAGNOSE_JOB.get("message", "Unknown error")
+            # Keep metadata file so user can see error details
+            # User can start a new diagnose which will clean up old files
+            CURRENT_DIAGNOSE_JOB = None
+            return {
+                "job_id": job_id,
+                "status": "failed",
+                "message": error_msg,
+            }, 200
+
+        if status == "completed":
+            file_path = CURRENT_DIAGNOSE_JOB.get("file_path")
+            file_name = CURRENT_DIAGNOSE_JOB.get("file_name")
+
+            # Verify file still exists
+            if not file_path or not os.path.exists(file_path):
+                _delete_diagnose_job_metadata(job_id)
+                CURRENT_DIAGNOSE_JOB = None
+                return {
+                    "job_id": job_id,
+                    "status": "error",
+                    "message": "File not found. Run new diagnose.",
+                }, 410
+
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "message": "Diagnose ready for download.",
+                "file_name": file_name,
+            }, 200
+
+        # Unknown status
+        return {
+            "job_id": job_id,
+            "status": status,
+            "message": "Unknown status",
+        }, 200
+
+
+@SimpleAPIServer.route("/diagnose-download", methods=["GET"], scopes=[ADMIN_ROLE])
+def diagnose_download(handler):
+    """
+    Download the diagnose zip file by job_id.
+
+    Query Parameters:
+        job_id (required): The job ID to download (obtained from /diagnose-status)
+        remove_file (optional): Controls file cleanup after download
+            - remove_file=true  → Download ZIP + Delete server files + Reset job state
+            - remove_file=false or not passed → Just download ZIP (keep files for re-download)
+
+    Returns:
+        - Binary zip file download if job_id is valid and file exists
+        - JSON error response otherwise
+    """
+    global CURRENT_DIAGNOSE_JOB
+
+    parsed_url = urlparse(handler.path)
+    query_params = parse_qs(parsed_url.query)
+    job_id = query_params.get("job_id", [None])[0]
+    cleanup = query_params.get("remove_file", ["false"])[0].lower() == "true"
+
+    if not job_id:
+        return {
+            "job_id": None,
+            "status": "error",
+            "message": "job_id is required. Use /diagnose-status to get the job_id.",
+        }, 400
+
+    # Load environment variables
+    success, error_msg = load_environment_from_multiple_sources(handler)
+    if not success:
+        return _send_json_error_response(handler, f"Error loading environment: {error_msg}", 500)
+
+    with _diagnose_job_lock:
+        file_path = None
+        file_name = None
+
+        # Check if job_id matches current in-memory job
+        if CURRENT_DIAGNOSE_JOB and CURRENT_DIAGNOSE_JOB.get("job_id") == job_id:
+            if CURRENT_DIAGNOSE_JOB["status"] == "running":
+                return {
+                    "job_id": job_id,
+                    "status": "running",
+                    "message": "Diagnose is still running. Please wait.",
+                }, 202
+
+            if CURRENT_DIAGNOSE_JOB["status"] == "failed":
+                return {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "message": CURRENT_DIAGNOSE_JOB.get("error", "Diagnose failed."),
+                }, 200
+
+            if CURRENT_DIAGNOSE_JOB["status"] == "completed":
+                file_path = CURRENT_DIAGNOSE_JOB.get("file_path")
+                file_name = CURRENT_DIAGNOSE_JOB.get("file_name")
+
+        # If not in memory, try to recover from file system
+        if not file_path:
+            recovered_job = _recover_diagnose_job_state(job_id)
+            if recovered_job:
+                file_path = recovered_job.get("file_path")
+                file_name = recovered_job.get("file_name")
+
+        # Validate file exists
+        if not file_path or not os.path.exists(file_path):
+            return {
+                "job_id": job_id,
+                "status": "not_found",
+                "message": f"No file found for job {job_id}. It may have been deleted or expired.",
+            }, 404
+
+        # Determine cleanup behavior
+        if cleanup:
+            _delete_diagnose_job_metadata(job_id)
+            if CURRENT_DIAGNOSE_JOB and CURRENT_DIAGNOSE_JOB.get("job_id") == job_id:
+                CURRENT_DIAGNOSE_JOB = None
+            files_to_cleanup = [file_path]
+            logger.info(
+                f"Diagnose download (job {job_id}): file will be deleted after download",
+                extra={"node": utils.NODE_IP},
+            )
+        else:
+            files_to_cleanup = []
+            logger.info(
+                f"Diagnose download (job {job_id}): file kept for future downloads",
+                extra={"node": utils.NODE_IP},
+            )
+    return _send_zip_file_download(handler, file_path, file_name, files_to_cleanup=files_to_cleanup)
+
+
+@SimpleAPIServer.route("/run-diagnose-node", methods=["POST"], scopes=[ADMIN_ROLE])
+def run_diagnose_node(handler):
+    """
+    Run diagnose on a single node and return the zip file.
+
+    This endpoint is used for node-to-node communication in HA mode.
+    When the main /run-diagnose endpoint is called on any node in an HA cluster,
+    it calls this endpoint on all other nodes to collect their diagnose data.
+
+    This endpoint:
+        - Executes ./diagnose script locally on this node
+        - Returns the generated zip file as a direct binary download
+        - Is NOT intended to be called directly by the UI
+
+    Returns:
+        Binary zip file download with Content-Type: application/zip
+
+    Error Response:
+        JSON with "detail" field and appropriate HTTP status code
+    """
+    logger.info("Starting node-only diagnose operation (internal API)", extra={"node": utils.NODE_IP})
+
+    # Load environment variables
+    success, error_msg = load_environment_from_multiple_sources(handler)
+    if not success:
+        return _send_json_error_response(handler, f"Error loading environment: {error_msg}", 500)
+
+    files_to_cleanup = []
+
+    try:
+        # Execute the ./diagnose script on this node
+        logger.info("Running diagnose locally for remote collection", extra={"node": utils.NODE_IP})
+        success, result = _run_local_diagnose()
+
+        if not success:
+            logger.error(f"Node diagnose failed: {result}", extra={"node": utils.NODE_IP})
+            return _send_json_error_response(handler, f"Diagnose failed: {result}", 500)
+
+        zip_file_path = result
+        files_to_cleanup.append(zip_file_path)
+
+        # Send the zip file directly as binary download
+        logger.info(f"Node diagnose completed, sending file: {zip_file_path}", extra={"node": utils.NODE_IP})
+        return _send_zip_file_download(handler, zip_file_path, os.path.basename(zip_file_path), files_to_cleanup)
+
+    except Exception as e:
+        logger.error(f"Node diagnose operation failed: {str(e)}", extra={"node": utils.NODE_IP})
+        _cleanup_diagnose_files(files_to_cleanup)
+        return _send_json_error_response(handler, f"Diagnose operation failed: {str(e)}", 500)
 
 
 @SimpleAPIServer.route("/system-stats", methods=["GET"], require_auth=False, scopes=[])
@@ -3125,11 +5661,7 @@ def system_stats(handler):
     try:
         parsed_url = urlparse(handler.path)
         query_params = parse_qs(parsed_url.query)
-        skip_cluster = (
-            True
-            if query_params.get("skip_cluster", [""])[0].lower() == "true"
-            else False
-        )
+        skip_cluster = True if query_params.get("skip_cluster", [""])[0].lower() == "true" else False
     except Exception:
         skip_cluster = False
 

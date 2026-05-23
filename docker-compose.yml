@@ -51,6 +51,7 @@ services:
     volumes:
       - ./data/mongo-data/data/db:/data/db:z
       - ./data/database-init/mongo-init.sh:/docker-entrypoint-initdb.d/mongo-init.sh:z
+      - ./data/database-init/mongo-autocompact.sh:/opt/mongo-autocompact.sh:z
       - ./data/database-init/load_env.sh:/opt/load_env.sh:z
       - ./data/ssl_certs/mongodb_rabbitmq_certs/tls_cert.crt:/opt/tls_cert.pem:z
       - ./data/ssl_certs/mongodb_rabbitmq_certs/tls_cert_key.pem:/opt/tls_cert_key.pem:z
@@ -62,6 +63,9 @@ services:
       - MONGODB_USERNAME=cteadmin
       - HTTP_PROXY=${CORE_HTTP_PROXY}
       - HTTPS_PROXY=${CORE_HTTPS_PROXY}
+      - MONGODB_AUTOCOMPACT_ENABLED=true
+      - MONGODB_AUTOCOMPACT_FREE_SPACE_TARGET_MB=1024
+      - MONGODB_AUTOCOMPACT_RUN_ONCE=false
     restart: always
     logging:
       options:
@@ -75,7 +79,9 @@ services:
       [
         "/bin/bash",
         "-c",
-        "source /opt/load_env.sh && docker-entrypoint.sh mongod --tlsMode preferTLS --tlsCertificateKeyFile /opt/tls_cert_key.pem --tlsCAFile /opt/tls_cert_ca.crt --tlsDisabledProtocols TLS1_0,TLS1_1",
+        "source /opt/load_env.sh && docker-entrypoint.sh mongod --tlsMode preferTLS --tlsCertificateKeyFile /opt/tls_cert_key.pem --tlsCAFile /opt/tls_cert_ca.crt --tlsDisabledProtocols TLS1_0,TLS1_1 
+        --setParameter opensslCipherSuiteConfig='TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256' 
+        --setParameter opensslCipherConfig='ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305' & MONGO_PID=$$! && sleep 30 && /opt/mongo-autocompact.sh; wait $$MONGO_PID",
       ]
   core:
     image: index.docker.io/${CORE_TAG}
@@ -95,20 +101,12 @@ services:
       - ./data/healthcheck.sh:/opt/healthcheck.sh:z
       - ./data/database-init/load_env.sh:/opt/load_env.sh:z
     environment:
-      - JWT_SECRET=${JWT_SECRET}
-      - CHAINLIT_AUTH_SECRET=${JWT_SECRET}
       - JWT_ALGORITHM=HS256
       - ENABLE_CELERY_BEAT=true
       - DOCKER_USERNAME=${DOCKER_USERNAME:-}
       - DOCKER_PASSWORD=${DOCKER_PASSWORD:-}
       - CORE_TAG=${CORE_TAG}
       - UI_TAG=${UI_TAG}
-      - CORE_LATEST_VERSION_TAG=${CORE_LATEST_VERSION_TAG}
-      - UI_LATEST_VERSION_TAG=${UI_LATEST_VERSION_TAG}
-      - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_TOKEN}
-      - ANALYTICS_BASE_URL=https://reporting.netskope.tech
-      - ANALYTICS_TOKEN=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpbnN0YWxsYXRpb25faWQiOiJjMDAyIn0.w8SVrTcDjk8PkR4IcbWGwOyf6-OWfCUyOoCTgZvqHqc
-      - ANALYTICS_SERVER_CONNECTIVITY=${ANALYTICS_SERVER_CONNECTIVITY:-True}
       - MAX_MAINTENANCE_WINDOW_MINUTES=${MAX_MAINTENANCE_WINDOW_MINUTES}
       - PULL_THREADS=${PULL_THREADS}
       - MAX_WAIT_ON_LOCK_IN_MINUTES=${MAX_WAIT_ON_LOCK_IN_MINUTES}

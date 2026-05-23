@@ -16,6 +16,7 @@ from base64 import b64encode
 import urllib
 import urllib.request
 import traceback
+import json
 
 NODE_IP = ""
 GLUSTERFS_BASE_PORT = 24009
@@ -23,10 +24,10 @@ GLUSTERFS_MAX_PORT = 24029
 TOKEN_VALIDITY = 3600
 API_PREFIX = "/api/management"
 SECRET_FILE_NAME = ".env.keys"
-RECOMMENDED_HOST_OS = ["Ubuntu 22", "Ubuntu 24", "RHEL 8", "RHEL 9"]
-RECOMMENDED_HOST_OS_VERSION = ["Ubuntu 22.04", "Ubuntu 24.04", "RHEL 8.8", "RHEL 9.5"]
+RECOMMENDED_HOST_OS = ["Ubuntu 22", "Ubuntu 24", "RHEL 9"]
+RECOMMENDED_HOST_OS_VERSION = ["Ubuntu 22.04", "Ubuntu 24.04", "RHEL 9.5"]
 RECOMMENDED_UBUNTU_VERSION = ["22.04", "24.04"]
-RECOMMENDED_RHEL_VERSION = ["8.8", "9.5"]
+RECOMMENDED_RHEL_VERSION = ["9.5"]
 AVAILABLE_INPUTS = {}
 SUDO_PREFIX = ""
 UPDATES_ALLOWED_ON_ENV = [
@@ -74,6 +75,10 @@ CLOUD_EXCHANGE_CONFIG_KEYS = {
     "GLUSTERFS_MAX_PORT": {"type": int, "default": GLUSTERFS_MAX_PORT},
 }
 CA_CERTS_DIR = "./data/ca_certs/"
+
+is_ui_running = False
+is_rabbitmq_running = False
+is_mongodb_running = False
 
 logger = logging.getLogger(__name__)
 
@@ -254,11 +259,7 @@ def get_os_name_and_major_version(handler):
                     f"Warning: The recommended Ubuntu OS versions are {RECOMMENDED_UBUNTU_VERSION[0]} and {RECOMMENDED_UBUNTU_VERSION[1]}"
                 )
         elif "red hat" in pretty_name.lower():
-            recommended_version = (
-                RECOMMENDED_RHEL_VERSION[0]
-                if version_id.split(".")[0] == "8"
-                else RECOMMENDED_RHEL_VERSION[1]
-            )
+            recommended_version = RECOMMENDED_RHEL_VERSION[0]
             if compare_versions(version_id, recommended_version):
                 write_chunk(handler.wfile, f"Info: RHEL OS Version {version_id}")
             else:
@@ -270,7 +271,7 @@ def get_os_name_and_major_version(handler):
             if version_id not in RECOMMENDED_RHEL_VERSION:
                 write_chunk(
                     handler.wfile,
-                    f"Warning: The recommended RHEL OS versions are {RECOMMENDED_RHEL_VERSION[0]} and {RECOMMENDED_RHEL_VERSION[1]}"
+                    f"Warning: The recommended RHEL OS version is {RECOMMENDED_RHEL_VERSION[0]}"
                 )
         return os_name, os_version
     except Exception as e:
@@ -1061,6 +1062,109 @@ def ce_as_vm_check():
         "./ce_as_vm_tags.py"
     )
 
+def _openssl_aes_operation(raw_text: str, processed_stream: str, ce_hex_code: str, ce_iv: str, encrypt: bool = True, iter_count: str = "10000"):
+    """
+    Helper function to perform OpenSSL AES encryption/decryption operations.
+    
+    Args:
+        raw_text: The text to encrypt or decrypt
+        processed_stream: The processed key stream
+        ce_hex_code: The hex code for OpenSSL
+        ce_iv: The initialization vector
+        encrypt: True for encryption, False for decryption
+        iter_count: The iteration count for PBKDF2
+        
+    Returns:
+        str: The encrypted or decrypted text
+        
+    Raises:
+        Exception: If OpenSSL operation fails
+    """
+    if encrypt:
+        # Encryption operation
+        process = subprocess.Popen(
+            [
+                "openssl", "enc", "-aes-256-cbc", "-A", "-a",
+                "-S", ce_hex_code,
+                "-K", processed_stream,
+                "-iv", ce_iv,
+                "-pbkdf2", "-iter", iter_count
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, err = process.communicate(input=raw_text.encode())
+        if process.returncode == 0:
+            return out.decode().strip()
+        else:
+            raise Exception(f"{err.decode('utf-8')}\n")
+    else:
+        # Decryption operation
+        process = subprocess.Popen(
+            [
+                "openssl", "enc", "-aes-256-cbc", "-A", "-d", "-a",
+                "-S", ce_hex_code,
+                "-K", processed_stream,
+                "-iv", ce_iv,
+                "-pbkdf2", "-iter", iter_count
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, err = process.communicate(input=(raw_text + "\n").encode())
+        if process.returncode == 0:
+            return out.decode().rstrip('\n')
+        else:
+            raise Exception(f"{err.decode('utf-8')}\n")
+
+
+def encrypt_decrypt_secret(raw_text: str, forward=True, available_inputs={}):
+    """
+    Encrypt or decrypt the given text using the given available inputs.
+
+    Args:
+        raw_text: The raw text of the new password.
+        forward: Whether to forward the request to the HA server. Defaults to
+            True.
+    """
+    try:
+        CE_SETUP_ID = None
+        CE_HEX_CODE = None
+        CE_IV = None
+        if not available_inputs.get("CE_SETUP_ID", ""):
+            CE_SETUP_ID = generate_ce_setup_id()
+            available_inputs["CE_SETUP_ID"] = f'"{CE_SETUP_ID}"'
+            available_inputs["CE_HEX_CODE"] = os.urandom(8).hex().upper()
+            available_inputs["CE_IV"] = os.urandom(16).hex()
+        CE_HEX_CODE = available_inputs["CE_HEX_CODE"]
+        CE_IV = available_inputs["CE_IV"]
+        CE_SETUP_ID = available_inputs["CE_SETUP_ID"].strip('"')
+        process = subprocess.Popen(
+            ["openssl", "dgst", "-sha256", "-hex"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, err = process.communicate(input=CE_SETUP_ID.encode())
+        if process.returncode == 0:
+            raw_output = out.decode().strip()
+            if '= ' in raw_output:
+                processed_stream = raw_output.split('= ')[-1]
+            else:
+                processed_stream = raw_output.split()[-1]
+            # generate mpass
+            if forward:
+                return _openssl_aes_operation(raw_text, processed_stream, CE_HEX_CODE, CE_IV, encrypt=True)
+            else:
+                return _openssl_aes_operation(raw_text, processed_stream, CE_HEX_CODE, CE_IV, encrypt=False)
+        else:
+            raise Exception(f"{err.decode('utf-8')}\n")
+    except Exception as e:
+        raise Exception(
+            f"Error occurred while processing environment variables. Error: {e}"
+        )
 
 def change_maintenance_password(raw_text: str, forward=True):
     """
@@ -1087,49 +1191,24 @@ def change_maintenance_password(raw_text: str, forward=True):
         CE_HEX_CODE = AVAILABLE_INPUTS["CE_HEX_CODE"]
         CE_IV = AVAILABLE_INPUTS["CE_IV"]
         CE_SETUP_ID = AVAILABLE_INPUTS["CE_SETUP_ID"].strip('"')
-        command = f"""echo -n '{CE_SETUP_ID}' | openssl dgst -sha256 -hex | awk '{{print $2}}'"""
         process = subprocess.Popen(
-            command,
-            shell=True,
-            stderr=subprocess.PIPE,
+            ["openssl", "dgst", "-sha256", "-hex"],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        out, err = process.communicate()
+        out, err = process.communicate(input=CE_SETUP_ID.encode())
         if process.returncode == 0:
-            processed_stream = out.decode().strip()
+            raw_output = out.decode().strip()
+            if '= ' in raw_output:
+                processed_stream = raw_output.split('= ')[-1]
+            else:
+                processed_stream = raw_output.split()[-1]
             # generate mpass
             if forward:
-                second_command = (
-                    f"echo '{raw_text}' | openssl enc -aes-256-cbc -a -S {CE_HEX_CODE} "
-                    f"-K '{processed_stream}' -iv {CE_IV} -pbkdf2 -iter 10000"
-                )
-                second_process = subprocess.Popen(
-                    second_command,
-                    shell=True,
-                    stderr=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                )
-                sec_out, sec_err = second_process.communicate()
-                if second_process.returncode == 0:
-                    return sec_out.decode().strip()
-                else:
-                    raise Exception(f"{sec_err.decode('utf-8')}\n")
+                return _openssl_aes_operation(raw_text, processed_stream, CE_HEX_CODE, CE_IV, encrypt=True)
             else:
-                third_command = (
-                    f"echo '{raw_text}' | openssl enc -aes-256-cbc -d -a -S {CE_HEX_CODE} "
-                    f"-K '{processed_stream}' -iv {CE_IV} -pbkdf2 -iter 10000"
-                )
-                third_process = subprocess.Popen(
-                    third_command,
-                    shell=True,
-                    stderr=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                )
-                third_out, third_err = third_process.communicate()
-                if third_process.returncode == 0:
-                    return third_out.decode().strip()
-                else:
-                    raise Exception(f"{third_err.decode('utf-8')}\n")
+                return _openssl_aes_operation(raw_text, processed_stream, CE_HEX_CODE, CE_IV, encrypt=False)
         else:
             raise Exception(f"{err.decode('utf-8')}\n")
     except Exception as e:
@@ -1625,6 +1704,65 @@ def update_cloudexchange_config(updated_config):
             fcntl.flock(f, fcntl.LOCK_UN)
     except Exception as e:
         raise e from e
+
+
+def fetch_container_info():
+    """Fetch container information to check if containers are running."""
+    global is_ui_running, is_rabbitmq_running, is_mongodb_running
+    is_ui_running = False
+    is_rabbitmq_running = False
+    is_mongodb_running = False
+    try:
+        if isRedHat():
+            p = subprocess.Popen(
+                ["podman", "ps", "--format", "json"],
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+            )
+            out, err = p.communicate()
+            containers = json.loads(out.decode("utf-8"))
+            if err:
+                raise Exception("Unable to fetch container information.")
+        else:
+            p = subprocess.Popen(
+                ["docker", "ps", "--format", "json"],
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+            )
+            out, err = p.communicate()
+            if err:
+                raise Exception("Unable to fetch container information.")
+            containers = [
+                json.loads(line) for line in out.decode("utf-8").splitlines()
+            ]
+
+        for container_info in containers:
+            container_name = container_info.get("Names", "")
+            if isinstance(container_name, list):
+                container_name = container_name[0]
+            if "_mongodb-primary" in container_name:
+                is_mongodb_running = True
+            elif "_rabbitmq-stats" in container_name:
+                is_rabbitmq_running = True
+            elif "_ui" in container_name:
+                is_ui_running = True
+    except Exception:
+        print_warning("Unable to fetch container information.")
+
+
+def isRedHat():
+    """Check if the OS is Red Hat."""
+    try:
+        with open("/etc/redhat-release") as f:
+            content = f.readline()
+            if content.startswith("Red Hat"):
+                return True
+            else:
+                return False
+    except Exception:
+        return False
 
 
 def print_warning(message):
