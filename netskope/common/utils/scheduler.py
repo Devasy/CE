@@ -34,7 +34,7 @@ LOCKING_ARGS = {
     "itsm.pull_data_items": {
         "lock_collection": Collections.ITSM_CONFIGURATIONS,
         "lock_unique_key": "name",
-        "lock_field": "lockedAt",
+        "lock_field": "lockedAt.pull",
     },
     "edm.execute_plugin": {
         "lock_collection": Collections.EDM_CONFIGURATIONS,
@@ -59,12 +59,12 @@ LOCKING_ARGS = {
     "itsm.sync_states": {
         "lock_collection": Collections.ITSM_CONFIGURATIONS,
         "lock_unique_key": "name",
-        "lock_field": "lockedAt",
+        "lock_field": "lockedAt.sync",
     },
     "itsm.update_incidents": {
         "lock_collection": Collections.ITSM_CONFIGURATIONS,
         "lock_unique_key": "name",
-        "lock_field": "lockedAt",
+        "lock_field": "lockedAt.update",
     },
 }
 

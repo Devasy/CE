@@ -198,7 +198,7 @@ class PluginProviderHelper(metaclass=Singleton):
 
             provider = ProviderClass(
                 tenant["name"],
-                tenant["parameters"],
+                SecretDict(tenant["parameters"]),
                 tenant["storage"],
                 None,
                 self.logger,

@@ -7,14 +7,17 @@ from pytz import UTC
 from copy import deepcopy
 
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Security
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure
 
+from netskope.common.api.routers.auth import get_current_user
+from netskope.common.models import User
 from netskope.common.utils import Collections, DBConnector, Logger
 from netskope.common.utils.db_connector import check_mongo_service, mongo_connection
 from netskope.common.utils.rabbitmq_helper import make_rabbitmq_api_call
+
 
 logger = Logger()
 connector = DBConnector()
@@ -27,7 +30,9 @@ router = APIRouter()
     description="Cloud Exchange monitoring stats.",
     status_code=200,
 )
-def get_status():
+def get_status(
+    user: User = Security(get_current_user, scopes=[]),
+):
     """Cloud Exchange monitoring stats."""
     status_list = {
         "mongodb": dict(),
@@ -118,7 +123,10 @@ def get_status():
     description="Machine monitoring stats",
     status_code=200,
 )
-def get_system_stats(node: str = None):
+def get_system_stats(
+    node: str = None,
+    user: User = Security(get_current_user, scopes=[]),
+):
     """Machine monitoring stats.
 
     Args:
@@ -166,13 +174,13 @@ def get_system_stats(node: str = None):
                 "timestamps": [],
             },
             "memory": {
-                "total_GB": "",
+                "total_GB": [],
                 "used_GB": [],
                 "percent": [],
                 "timestamps": [],
             },
             "disk": {
-                "total_GB": "",
+                "total_GB": [],
                 "used_GB": [],
                 "available_GB": [],
                 "percent_used": [],
@@ -225,11 +233,9 @@ def get_system_stats(node: str = None):
                     node_response[node]["memory"]["percent"].append(
                         memory.get("percent")
                     )
-                    if (
-                        not node_response[node]["memory"]["total_GB"]
-                        and memory.get("total_GB") is not None
-                    ):
-                        node_response[node]["memory"]["total_GB"] = memory["total_GB"]
+                    node_response[node]["memory"]["total_GB"].append(
+                        memory.get("total_GB")
+                    )
                     node_response[node]["memory"]["timestamps"].append(timestamp)
 
                 disk = node_data.get("disk")
@@ -241,11 +247,9 @@ def get_system_stats(node: str = None):
                     node_response[node]["disk"]["percent_used"].append(
                         disk.get("percent_used")
                     )
-                    if (
-                        not node_response[node]["disk"]["total_GB"]
-                        and disk.get("total_GB") is not None
-                    ):
-                        node_response[node]["disk"]["total_GB"] = disk["total_GB"]
+                    node_response[node]["disk"]["total_GB"].append(
+                        disk.get("total_GB")
+                    )
                     node_response[node]["disk"]["timestamps"].append(timestamp)
 
         return node_response
@@ -266,7 +270,9 @@ def get_system_stats(node: str = None):
     description="Cloud Exchange deployment details",
     status_code=200,
 )
-def get_ce_details():
+def get_ce_details(
+    user: User = Security(get_current_user, scopes=[]),
+):
     """Cloud Exchange deployment details.
 
     Returns:

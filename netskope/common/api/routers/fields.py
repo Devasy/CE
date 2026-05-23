@@ -5,7 +5,7 @@ from netskope.common.models.other import NetskopeField
 from netskope.common.models import User
 from netskope.common.utils import DBConnector, Collections, Logger
 from netskope.common.utils import RepoManager, PluginBase
-from .auth import get_current_user
+from netskope.common.api.routers.auth import get_current_user
 
 router = APIRouter()
 logger = Logger()
@@ -19,7 +19,9 @@ required_optional_scopes = ["cte_read", "cto_read", "cls_read", "cre_read"]
     tags=["Netskope Alerts/Events fields"],
     description="Get the supported netskope alerts/events fields",
 )
-def get_fields():
+def get_fields(
+    user: User = Security(get_current_user, scopes=[]),
+):
     """Get the alerts/events fields."""
     return [
         NetskopeField(**field)
