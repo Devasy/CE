@@ -8,6 +8,7 @@ from netskope.common.utils import (
     Logger,
     RepoManager,
     PluginHelper,
+    integration,
     track,
     SecretDict
 )
@@ -25,6 +26,7 @@ logger = Logger()
 
 
 @APP.task(name="common.pull_logs")
+@integration("cls")
 @track()
 def pull_logs(plugin_name: str):
     """Pull logs and execute all the Netskope configurations."""
