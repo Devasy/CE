@@ -28,6 +28,7 @@ from netskope.common.api.routers.repos import (
 
 # Newer versions should be prepended to this list
 ALL_VERSIONS = [
+    "6.1.0",
     "6.0.1",
     "6.0.0",
     "6.0.0-beta.1",
