@@ -60,6 +60,8 @@ modules = {  # create constant
     Collections.ITSM_CONFIGURATIONS: {
         "lifecycle": pull_itsm_data_items,
         "task": "itsm.pull_data_items",
+        "lastrunAt": "lastRunAt.pull",
+        "lastRunSuccess": "lastRunSuccess.pull",
         "batch_id_supported": False,
     },
     Collections.CREV2_CONFIGURATIONS: {
