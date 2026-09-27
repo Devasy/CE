@@ -29,12 +29,14 @@ class EntityField(BaseModel):
     name: str
     type: EntityFieldType
     required: bool = False
+    label: Optional[str] = None
 
 
 class Entity(BaseModel):
     """Plugin entity model."""
 
     name: str
+    label: Optional[str] = None
     fields: list[EntityField]
 
 
@@ -75,12 +77,23 @@ class PluginBase(CommonPluginBase):
         """Validate action parameters."""
         raise NotImplementedError
 
-    def execute_action(self, action: Action):
-        """Execute an action with the given paramters."""
+    def execute_action(self, action: Action, revert: bool = False):
+        """Execute an action with the given parameters.
+
+        Args:
+            action (Action): The action to execute.
+            revert (bool): If True, this is a revert operation. Plugin should undo the action.
+                         If False (default), this is a normal action execution.
+        """
         raise NotImplementedError
 
-    def execute_actions(self, actions: list[Action]) -> Optional[ActionResult]:
+    def execute_actions(self, actions: list[Action], revert: bool = False) -> Optional[ActionResult]:
         """Execute the actions with the given parameters.
+
+        Args:
+            actions (list[Action]): List of actions to execute.
+            revert (bool): If True, these are revert operations. Plugin should undo the actions.
+                         If False (default), these are normal action executions.
 
         Returns:
             Optional[ActionResult]: Result with partial success information.

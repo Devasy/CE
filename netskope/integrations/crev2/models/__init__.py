@@ -40,6 +40,7 @@ from .entities import (
     ValueMapMappingString,
     ValueMapTypeParams,
     get_entity_by_name,
+    NormalizedType,
 )
 from .records import (
     RecordDB,
