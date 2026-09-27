@@ -40,7 +40,7 @@ from ..models.indicator import (
     RetractionUpdate,
 )
 from ..models.tags import TagIn
-from .tags import list_tags, create_tag
+from .tags import create_tag
 
 router = APIRouter()
 logger = Logger()
@@ -153,8 +153,8 @@ async def create_tag_helper(indicator):
     list_of_available_tags = []
     indicator.tags = list(set(indicator.tags))  # unique tags
     created_tags = []
-    for tag_info in await list_tags():
-        list_of_available_tags.append(tag_info.name)
+    for tag_info in db_connector.collection(Collections.TAGS).find({}, {"name": 1}):
+        list_of_available_tags.append(tag_info["name"])
     for tag_name in indicator.tags:
         tag_name = tag_name.strip()
         if len(tag_name) == 0:

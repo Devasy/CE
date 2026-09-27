@@ -1,5 +1,7 @@
 """JSON query schemas."""
 
+from netskope.common.utils import DATE_VALUE_SCHEMA
+
 # for case-insensitive search
 INDICATOR_STRING_FIELDS = ["value", "source", "comments"]
 
@@ -10,22 +12,26 @@ DATE_STRING_FILTERS = {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "$gt": {"type": "string"},
-                    "$lt": {"type": "string"},
-                    "$gte": {"type": "string"},
-                    "$lte": {"type": "string"},
-                    "$ne": {"type": "string"},
+                    "$gt": DATE_VALUE_SCHEMA,
+                    "$lt": DATE_VALUE_SCHEMA,
+                    "$gte": DATE_VALUE_SCHEMA,
+                    "$lte": DATE_VALUE_SCHEMA,
+                    "$ne": DATE_VALUE_SCHEMA,
                     "$not": {
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "$gt": {"type": "string"},
-                            "$lt": {"type": "string"},
-                            "$gte": {"type": "string"},
-                            "$lte": {"type": "string"},
-                            "$ne": {"type": "string"},
+                            "$gt": DATE_VALUE_SCHEMA,
+                            "$lt": DATE_VALUE_SCHEMA,
+                            "$gte": DATE_VALUE_SCHEMA,
+                            "$lte": DATE_VALUE_SCHEMA,
+                            "$ne": DATE_VALUE_SCHEMA,
                         }
                     },
+                    "$expr": {
+                        "type": "object",
+                        "$ref": "#/definitions/expressionFilters"
+                    }
                 },
             },
             {"type": "string"},
@@ -43,6 +49,10 @@ DATE_STRING_FILTERS = {
                     "$nin": {"type": "array", "items": {"type": ["string", "null"]}},
                     "$not": {"type": "string"},
                     "$ne": {"type": "string"},
+                    "$expr": {
+                        "type": "object",
+                        "$ref": "#/definitions/expressionFilters"
+                    },
                 },
             },
             {"type": "string"},
@@ -70,6 +80,22 @@ INDICATOR_QUERY_SCHEMA = {
                     },
                 },
                 {"type": ["integer", "null"]},
+            ]
+        },
+        "expressionFilters": {
+            "anyOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "$gt": {"type": "array"},
+                        "$lt": {"type": "array"},
+                        "$gte": {"type": "array"},
+                        "$lte": {"type": "array"},
+                        "$ne": {"type": "array"},
+                        "$eq": {"type": "array"}
+                    },
+                }
             ]
         },
         "booleanFilters": {
@@ -149,6 +175,10 @@ INDICATOR_QUERY_SCHEMA = {
                     "type": "array",
                     "items": {"$ref": "#/definitions/sourceFilters"},
                 },
+                "$expr": {
+                    "type": "object",
+                    "$ref": "#/definitions/expressionFilters"
+                }
             },
         },
         "sourcesFilters": {
@@ -184,6 +214,10 @@ INDICATOR_QUERY_SCHEMA = {
                     "type": "array",
                     "items": {"$ref": "#/definitions/searchRoot"},
                 },
+                "$expr": {
+                    "type": "object",
+                    "$ref": "#/definitions/expressionFilters"
+                }
             },
         },
     },
