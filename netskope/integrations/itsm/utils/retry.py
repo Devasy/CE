@@ -12,7 +12,8 @@ from netskope.common.utils import (
     DBConnector,
     Collections,
     PluginHelper,
-    Logger
+    Logger,
+    SecretDict,
 )
 from netskope.integrations.itsm.utils.tickets import create_tickets_or_requests
 import traceback
@@ -73,7 +74,7 @@ def _create_tickets_for_failed_task(
             PluginClass = helper.find_by_id(configuration.plugin)  # NOSONAR S117
             plugin = PluginClass(
                 configuration.name,
-                configuration.parameters,
+                SecretDict(configuration.parameters),
                 configuration.storage,
                 configuration.checkpoint,
                 logger,

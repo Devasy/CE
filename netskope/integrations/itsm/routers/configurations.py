@@ -155,7 +155,7 @@ async def get_configuration_queues(
         {"name": name}
     )
     if configuration is None:
-        logger.info(
+        logger.error(
             f"Could not find a configuration with name {name}. Skipping get_queues task.",
             error_code="CTO_1001",
         )
@@ -179,7 +179,7 @@ async def get_configuration_queues(
         )
         return []
     except Exception:
-        logger.info(
+        logger.error(
             f"Error occurred while fetching queues for configuration {configuration.name}.",
             details=traceback.format_exc(),
             error_code="CTO_1003",
@@ -208,7 +208,7 @@ def _get_available_mapping_fields(name: str):
     except NotImplementedError:
         return []
     except Exception:
-        logger.info(
+        logger.error(
             "Error occurred while getting available fields.",
             details=traceback.format_exc(),
             error_code="CTO_1004",
@@ -262,7 +262,7 @@ async def get_default_mappings(
     except NotImplementedError:
         return []
     except Exception:
-        logger.info(
+        logger.error(
             "Error occurred while getting default mapping.",
             details=traceback.format_exc(),
             error_code="CTO_1005",
@@ -308,7 +308,7 @@ def _validate_configuration_step(step, configuration):
             SecretDict(configuration_dict),
         )
     except Exception as e:
-        logger.info(
+        logger.error(
             f"Exception occurred while executing validate for step {step}",
             details=traceback.format_exc(),
             error_code="CTO_1006",
@@ -359,7 +359,7 @@ def _validate_entire_configuration(plugin, configuration):
                 SecretDict(configuration_dict),
             )
         except Exception as e:
-            logger.info(
+            logger.error(
                 f"Exception occurred while executing validate for step {step}",
                 details=traceback.format_exc(),
                 error_code="CTO_1022",
@@ -428,28 +428,20 @@ async def create_configuration(
         if configuration.tenant is not None:
             schedule_or_delete_common_pull_tasks(configuration.tenant)
 
-        task = None
-        if plugin.metadata.get("pulling_supported"):
-            task = "itsm.pull_data_items"
-        elif plugin.metadata.get("receiving_supported"):
-            task = "itsm.sync_states"
-        if task is not None and not PluginClass.metadata.get("netskope", False):
+        tasks = []
+        if plugin.metadata.get("pulling_supported") and not PluginClass.metadata.get("netskope", False):
+            tasks.append("itsm.pull_data_items")
+        if plugin.metadata.get("receiving_supported"):
+            tasks.append("itsm.sync_states")
+        for task in tasks:
             scheduler.schedule(
                 name=_get_task_name(configuration.name),
                 task_name=task,
-                poll_interval=(
-                    tenant_poll_interval["interval"]
-                    if tenant_poll_interval
-                    else configuration.pollInterval
-                ),
-                poll_interval_unit=(
-                    tenant_poll_interval["unit"]
-                    if tenant_poll_interval
-                    else configuration.pollIntervalUnit
-                ),
+                poll_interval=configuration.pollInterval,
+                poll_interval_unit=configuration.pollIntervalUnit,
                 args=[configuration.name],
             )
-        elif PluginClass.metadata.get("netskope", False):
+        if PluginClass.metadata.get("netskope", False):
             name_tenant = tenant.name
             name_tenant = name_tenant.replace(" ", "_")
             if not plugin.get_types_to_pull("alerts"):
@@ -539,7 +531,7 @@ def _get_dynamic_step_fields(step_name: str, configuration: dict) -> List:
     except NotImplementedError:
         raise HTTPException(400, "Plugin does not implement dynamic steps.")
     except Exception:
-        logger.info(
+        logger.error(
             "Error occurred while getting fields.",
             details=traceback.format_exc(),
             error_code="CTO_1007",
@@ -627,27 +619,23 @@ async def update_configuration(
         if configuration.tenant is not None:
             schedule_or_delete_common_pull_tasks(configuration.tenant)
 
-        task = None
-        if plugin.metadata.get("pulling_supported"):
-            task = "itsm.pull_data_items"
-        elif plugin.metadata.get("receiving_supported"):
-            task = "itsm.sync_states"
-        if task is not None:
+        tasks = []
+        if plugin.metadata.get("pulling_supported") and not PluginClass.metadata.get("netskope", False):
+            tasks.append("itsm.pull_data_items")
+        if plugin.metadata.get("receiving_supported"):
+            tasks.append("itsm.sync_states")
+        for task in tasks:
             if configuration.active is False:
                 scheduler.delete(_get_task_name(configuration.name))
-            elif not PluginClass.metadata.get("netskope", False):
+            else:
                 scheduler.upsert(
                     name=_get_task_name(configuration.name),
                     task_name=task,
                     poll_interval=(
-                        tenant_poll_interval["interval"]
-                        if tenant_poll_interval
-                        else configuration.pollInterval
+                        configuration.pollInterval
                     ),
                     poll_interval_unit=(
-                        tenant_poll_interval["unit"]
-                        if tenant_poll_interval
-                        else configuration.pollIntervalUnit
+                        configuration.pollIntervalUnit
                     ),
                     args=[configuration.name],
                 )
