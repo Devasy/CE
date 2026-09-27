@@ -16,7 +16,6 @@ from netskope.integrations.edm.utils import increment_count
 from netskope.integrations.edm.utils.task_listing import (
     complete_task,
     set_task_status,
-    set_task_status_by_config_name,
 )
 
 from .poll_edm_apply_status import sent_hashes_for_polling
@@ -68,11 +67,6 @@ def share_data(
             Collections.EDM_CONFIGURATIONS
         ).find_one(({"name": source_config_name}))
         configuration_db = ConfigurationDB(**configuration_db_dict)
-        set_task_status_by_config_name(
-            configuration_db.name,
-            StatusType.UPLOADING_HASH,
-            destination_config_name=destination_config_name,
-        )
         PluginClass = helper.find_by_id(configuration_db.plugin)  # NOSONAR S117
         if not PluginClass:
             logger.error(
@@ -137,12 +131,29 @@ def share_file_hashes(
         hash_dict = _get_storage(source_config_name)
         hash_dict = hash_dict["storage"] if hash_dict else {}
     try:
+        # Eligible statuses:
+        # - GENERATING_HASH: marked earlier in execute_plugin
+        # - ready statuses (COMPLETED, FAILED, SCHEDULED): became ready during hash generation
+        eligible_statuses = {
+            StatusType.COMPLETED,
+            StatusType.FAILED,
+            StatusType.SCHEDULED,
+            StatusType.GENERATING_HASH
+        }
         for rule in rules:
             rule_dict = rule
             rule = BusinessRuleDB(**rule)
             sharedWith = rule.sharedWith
             if source_config_name not in sharedWith.keys():
                 # Skip if source configuration not found in business rule
+                continue
+
+            if rule.status not in eligible_statuses:
+                dest_config_name = next(iter(sharedWith.get(source_config_name, {})), None)
+                logger.info(
+                    f"Skipping sharing for source '{source_config_name}'. "
+                    f"As sync is already in progress for this destination '{dest_config_name}'.",
+                )
                 continue
             if destination_config_name is None:
                 destination_dict = sharedWith.get(source_config_name, {})
