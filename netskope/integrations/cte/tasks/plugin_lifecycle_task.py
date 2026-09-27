@@ -539,7 +539,7 @@ def execute_plugin(configuration_name, data: List = None, data_type: str = None,
             configuration_db.plugin
         )
         if PluginClass is None:
-            logger.info(
+            logger.error(
                 f"Could not find the plugin with id='{configuration_db.plugin}'. Skipping the CTE lifecycle execution.",
                 error_code="CTE_1001",
             )

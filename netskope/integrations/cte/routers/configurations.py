@@ -266,7 +266,7 @@ def log_changes(configuration, updated_configuration):
     """Log changes based on the incoming request."""
     if configuration.active is not None:
         logger.debug(
-            f"Configuration '{configuration.name}' is {'enabled' if configuration.active else 'disabled'}."
+            f"Configuration '{configuration.name}' is {'enabled' if updated_configuration.active else 'disabled'}."
         )
     if configuration.pollInterval or configuration.pollIntervalUnit:
         logger.debug(
@@ -424,8 +424,7 @@ async def update_configuration(
             )
     if updated_configuration.tenant is not None:
         schedule_or_delete_common_pull_tasks(updated_configuration.tenant)
-    existing_configuration = ConfigurationDB(**configuration_db_dict)
-    log_changes(existing_configuration, updated_configuration)
+    log_changes(configuration, updated_configuration)
 
     return {
         **updated_configuration.model_dump(),
@@ -535,7 +534,7 @@ async def list_actions(
     try:
         return plugin.get_actions()
     except Exception:
-        logger.info(
+        logger.error(
             "Error occurred while getting list of actions.",
             details=traceback.format_exc(),
             error_code="CTE_1014",
@@ -572,7 +571,7 @@ async def get_action_fields(
     try:
         return plugin.get_action_fields(action)
     except Exception:
-        logger.info(
+        logger.error(
             "Error occurred while getting list of actions.",
             details=traceback.format_exc(),
             error_code="CTE_1025",
