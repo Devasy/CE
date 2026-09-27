@@ -1,9 +1,11 @@
 """Provides tagging related endpoints."""
 
-from typing import List
 import json
+import re
+from typing import List
 from jsonschema import validate, ValidationError
-from fastapi import APIRouter, HTTPException, Security
+from fastapi import APIRouter, HTTPException, Security, Query
+from starlette.responses import JSONResponse
 
 from netskope.common.utils import DBConnector, Collections, Logger, parse_dates
 from netskope.common.api.routers.auth import get_current_user
@@ -44,13 +46,21 @@ def get_applied_on(tag: str, filters: dict) -> TagAppliedOn:
     "/tags",
     response_model=List[TagOut],
     tags=["Tags"],
-    description="List tags.",
+    description="List tags with pagination and optional search.",
 )
 async def list_tags(
     filters: str = "{}",
+    skip: int = Query(default=0, ge=0, description="Number of tags to skip."),
+    limit: int = Query(default=200, ge=1, le=1000, description="Maximum number of tags to return."),
+    search: str = Query(default="", description="Filter tags by name (case-insensitive substring match)."),
+    aggregate: bool = Query(default=False, description="If true, return only the total count of matching tags."),
     user: User = Security(get_current_user, scopes=["cte_read"]),
 ):
-    """Get list of all the tags."""
+    """Get a paginated list of tags with optional name search.
+
+    When aggregate=True, returns a JSON object with the total count of matching tags
+    instead of the list, consistent with the /indicators API pattern.
+    """
     try:
         validate(json.loads(filters), schema=INDICATOR_QUERY_SCHEMA)
         filters = json.loads(
@@ -61,8 +71,24 @@ async def list_tags(
         raise HTTPException(400, "Invalid JSON query provided.")
     except ValidationError as ex:
         raise HTTPException(400, f"Invalid query provided. {ex.message}.")
+
+    tag_query = {}
+    if search:
+        tag_query["name"] = {"$regex": re.escape(search), "$options": "i"}
+
+    if aggregate:
+        total = connector.collection(Collections.TAGS).count_documents(tag_query)
+        return JSONResponse(status_code=200, content={"count": total})
+
+    tag_cursor = (
+        connector.collection(Collections.TAGS)
+        .find(tag_query)
+        .sort("name", 1)
+        .skip(skip)
+        .limit(limit)
+    )
     tags = []
-    for tag in connector.collection(Collections.TAGS).find({}):
+    for tag in tag_cursor:
         tags.append(TagOut(**tag, appliedOn=get_applied_on(tag["name"], filters)))
     return tags
 

@@ -30,6 +30,7 @@ from ..models import (
     ActionLogDB,
     ActionLogStatus,
     BusinessRuleDB,
+    EntityFieldType,
     get_entity_by_name,
     get_plugin_from_configuration_name,
 )
@@ -40,6 +41,25 @@ connector = DBConnector()
 helper = PluginHelper()
 logger = Logger()
 RECORD_BATCH_SIZE = 1000
+
+
+def _get_normalized_field_value(normalized_value: dict, configuration: str):
+    """Get normalized fields."""
+    if isinstance(normalized_value, dict):
+        for plugin_value_dict in normalized_value.get("plugins", []):
+            if plugin_value_dict.get("config") == configuration:
+                return plugin_value_dict.get("value")
+        return normalized_value.get("value")
+    return normalized_value
+
+
+def _get_normalized_fields(entity):
+    """Get normalized fields list."""
+    return [
+        field.name
+        for field in entity.fields
+        if field.type == EntityFieldType.STRING and field.params and field.params.normalization
+    ]
 
 
 def _evaluate_records(
@@ -76,6 +96,8 @@ def _evaluate_records(
                 all_eval_actions.add(
                     f"{rule.name}-{configuration}-{action.value}"
                 )
+        # Get normalized field list
+        normalized_entity_fields = _get_normalized_fields(entity)
         alerts = []
         for record in connector.collection(
             f"{Collections.CREV2_ENTITY_PREFIX.value}{entity.name}"
@@ -104,7 +126,7 @@ def _evaluate_records(
                         )
                         continue
                     try:
-                        params = _map_params(action, record)
+                        params = _map_params(action, record, configuration, normalized_entity_fields)
                         if action.requireApproval:
                             logger.info(
                                 f"Scheduling the {action.value} action for record with id {record['_id']} for approval."
@@ -293,12 +315,13 @@ def _execute_undos(records: list[str], entity, rule: BusinessRuleDB):
     ) + build_pipeline_from_entity(
         entity
     )  # perform the joins
+    normalized_fields = _get_normalized_fields(entity)
     for record in connector.collection(
         f"{Collections.CREV2_ENTITY_PREFIX.value}{entity.name}"
     ).aggregate(unmatched_pipeline):
         for configuration, actions in rule.actions.items():
             for action in actions:
-                params = _map_params(action, record)
+                params = _map_params(action, record, configuration, normalized_fields)
                 plugin = get_plugin_from_configuration_name(configuration)
                 try:
                     plugin.revert_action(params)
@@ -323,11 +346,16 @@ def _dot_walk(obj: dict, key: str) -> Any:
     return obj
 
 
-def _map_params(action: Action, record: dict) -> Action:
+def _map_params(action: Action, record: dict, configuration: str, normalize_fields: list = []) -> Action:
     action = action.model_copy(deep=True)
     for key, value in action.parameters.items():
         if isinstance(value, str) and value.startswith("$"):
             action.parameters[key] = _dot_walk(record, value[1:])
+            if value[1:] in normalize_fields:
+                action.parameters[key] = _get_normalized_field_value(
+                    action.parameters[key],
+                    configuration
+                )
     return action
 
 

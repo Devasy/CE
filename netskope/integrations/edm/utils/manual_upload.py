@@ -30,23 +30,15 @@ class ManualUploadManager:
         """Init method."""
         self.name = name
         self.configuration = configuration or {}
+        if "delimiter" not in self.configuration:
+            raise ValueError(
+                "Delimiter is not provided in the configuration parameters."
+            )
+        self.delimiter = self.configuration["delimiter"]
         self.storage = storage or {}
         self.file_name = file_name
         self.file_path = f"{MANUAL_UPLOAD_PATH}/{self.name}/{self.file_name}"
         self.logger = logger
-
-    @staticmethod
-    def strip_args(data):
-        """Strip arguments from left and right directions.
-
-        Args:
-            data (dict): Dict object having all the
-            configuration parameters.
-        """
-        keys = data.keys()
-        for key in keys:
-            if isinstance(data[key], str):
-                data[key] = data[key].strip()
 
     def create_directory(self, dir_path):
         """Create a directory at the specified path, including all necessary parent directories.
@@ -164,10 +156,10 @@ class ManualUploadManager:
             exclude_stopwords = self.configuration.get("sanity_inputs", {}).get(
                 "exclude_stopwords", False
             )
-            for field in fields:  # strips spaces from front and end for all values.
-                self.strip_args(field)
 
             # Construct edm_data_config based on fields configuration
+            remove_quotes = self.configuration.get("remove_quotes", False)
+
             edm_data_config = deepcopy(CONFIG_TEMPLATE)
             edm_data_config.update(
                 {
@@ -175,7 +167,9 @@ class ManualUploadManager:
                         field.get("field", "")
                         for field in fields
                         if field.get("nameColumn", False)
-                    ]
+                    ],
+                    "delimiter": self.delimiter,
+                    "remove-quotes": remove_quotes,
                 }
             )
 
@@ -263,9 +257,13 @@ class ManualUploadManager:
                 sanity_inputs
             )
 
+            # Get remove_quotes flag from configuration (default to False)
+            remove_quotes = self.configuration.get("remove_quotes", False)
+
             edm_hash_config = deepcopy(EDM_HASH_CONFIG)
             edm_hash_config.update(
                 {
+                    "delimiter": self.delimiter,
                     "dict_cs": dict_cs,
                     "dict_cins": dict_cins,
                     "norm_num": norm_num,
@@ -273,6 +271,7 @@ class ManualUploadManager:
                     "output_dir": output_dir_path,
                     "norm_str": norm_str,
                     "skip_hash": False,
+                    "remove_quotes": remove_quotes,
                 }
             )
 
