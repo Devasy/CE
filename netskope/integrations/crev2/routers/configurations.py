@@ -49,16 +49,20 @@ def _add_task_prefix(name: str) -> str:
 
 @router.get("/configurations", tags=["CREv2 Configurations"])
 async def list_configurations(
-    _: User = Security(get_current_user, scopes=["cre_read"])
+    user: User = Security(get_current_user, scopes=["cre_read"]),
 ) -> list[ConfigurationOut]:
     """List configurations."""
-    return [
-        ConfigurationOut(
-            **config,
-            pluginName=helper.find_by_id(config["plugin"]).metadata.get("name"),
+    out = []
+    for config in connector.collection(Collections.CREV2_CONFIGURATIONS).find({}):
+        if "cre_write" not in user.scopes:
+            config["parameters"] = {}
+        out.append(
+            ConfigurationOut(
+                **config,
+                pluginName=helper.find_by_id(config["plugin"]).metadata.get("name"),
+            )
         )
-        for config in connector.collection(Collections.CREV2_CONFIGURATIONS).find({})
-    ]
+    return out
 
 
 @router.post("/plugins/{name}/entities", tags=["CREv2 Configurations"])
@@ -72,7 +76,14 @@ async def list_entities(
     if not PluginClass:
         raise HTTPException(status_code=404, detail="Plugin not found.")
     plugin = PluginClass(None, parameters, {}, None, logger)
-    return plugin.get_entities()
+    entities = plugin.get_entities()
+    for entity in entities:
+        for field in entity.fields:
+            if not field.label:
+                field.label = field.name
+        if not entity.label:
+            entity.label = entity.name
+    return entities
 
 
 @router.get("/configurations/{name}/actions", tags=["CREv2 Configurations"])
@@ -140,7 +151,7 @@ async def get_action_fields(
     try:
         return plugin.get_action_params(action)
     except Exception as ex:
-        logger.info(
+        logger.error(
             "Error occurred while getting list of actions.",
             details=traceback.format_exc(),
         )
