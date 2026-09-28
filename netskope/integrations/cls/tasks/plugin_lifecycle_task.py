@@ -28,6 +28,8 @@ from netskope.common.models import (
 )
 from netskope.common.models.settings import CLSRetryStrategy
 from netskope.common.utils import (
+    DATA_FORMAT_JSON,
+    compress_batch,
     Collections,
     DBConnector,
     DataBatchManager,
@@ -715,9 +717,9 @@ def pull_third_party_historical_data(
         filtered_data = list(filter(lambda d: query.match(deep_stringify(d)), data))
 
         if filtered_data:
-            filtered_data = gzip.compress(
+            filtered_data = compress_batch(
                 json.dumps({"result": filtered_data}).encode("utf-8"),
-                compresslevel=3,
+                DATA_FORMAT_JSON,
             )
             execute_celery_task(
                 transform_and_ingest.apply_async,
@@ -861,9 +863,9 @@ def pull_historical_data(
                     len(filtered_data),
                 )
                 ingestion_count += 1
-                filtered_data = gzip.compress(
+                filtered_data = compress_batch(
                     json.dumps({"result": filtered_data}).encode("utf-8"),
-                    compresslevel=3,
+                    DATA_FORMAT_JSON,
                 )
                 execute_celery_task(
                     transform_and_ingest.apply_async,

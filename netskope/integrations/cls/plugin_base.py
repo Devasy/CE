@@ -69,6 +69,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             List: List of raw_data to be ingested on the target platform.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         pass
 
@@ -85,6 +88,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             PushResult: Result indicating ingesting outcome and message
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -101,6 +107,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             List: list of transformed data.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -115,13 +124,20 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             ValidationResult: Result indicating validation outcome and message.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
     def extract_and_store_fields(
         self, data: list[dict], data_type: str, subtype: str
     ) -> None:
-        """Extract and store fields from data."""
+        """Extract and store fields from data.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         raise NotImplementedError()
 
     @staticmethod

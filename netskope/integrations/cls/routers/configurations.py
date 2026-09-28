@@ -243,7 +243,7 @@ async def update_configuration(
             plugin = PluginClass(
                 configuration.name,
                 SecretDict(configuration.parameters),
-                configuration.storage,
+                configuration.storage or {},
                 None,
                 logger
             )
@@ -297,15 +297,13 @@ async def delete_configuration(
     except Exception:
         logger.debug("Error occurred while terminating the WebTx task.",
                      details=traceback.format_exc())
-    PluginClass = plugin_helper.find_by_id(configuration.plugin)
     if "netskope_webtx.main" in configuration.plugin:
         is_webtx = True
         scheduler.delete(f"tenant.{configuration.tenant}.{configuration.name}.webtx")
-        add_or_acknowledge_webtx_disabled_banner()
     PluginClass = plugin_helper.find_by_id(configuration.plugin)
     if PluginClass is not None:
         plugin = PluginClass(configuration.name, SecretDict(
-            configuration.parameters), configuration.storage, None, logger)
+            configuration.parameters), configuration.storage or {}, None, logger)
         try:
             has_action_type = has_source_info_args(plugin, "cleanup", ["action_type"])
             if "cleanup" in dir(plugin) and has_action_type:
@@ -320,6 +318,13 @@ async def delete_configuration(
     db_connector.collection(Collections.CLS_CONFIGURATIONS).delete_one(
         {"name": configuration.name}
     )
+
+    if is_webtx:
+        # Re-evaluate only once the row is gone. This helper rebuilds the banner
+        # from the WebTx configurations still present, so running it before the
+        # delete re-raises BANNER_ERROR_1004 naming the very configuration being
+        # removed, leaving it stranded with nothing left to acknowledge it.
+        add_or_acknowledge_webtx_disabled_banner()
 
     if configuration.tenant is not None and not is_webtx:
         schedule_or_delete_common_pull_tasks(configuration.tenant)
