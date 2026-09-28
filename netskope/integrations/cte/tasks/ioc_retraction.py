@@ -16,7 +16,7 @@ from netskope.common.utils.plugin_helper import PluginHelper
 
 from netskope.integrations.cte.utils import RETRACTION_IOC_BATCH_SIZE
 from netskope.integrations.cte.utils.tag_utils import TagUtils
-from netskope.integrations.cte.tasks.plugin_lifecycle_task import get_possible_destinations
+from netskope.integrations.cte.tasks.plugin_lifecycle_task import get_possible_destinations, _update_storage
 
 from netskope.integrations.cte.models import (
     ConfigurationDB,
@@ -44,6 +44,13 @@ def ioc_retraction():
         try:
             logger.update_level()
             cte_plugin = connector.collection(Collections.CONFIGURATIONS).find_one({"name": cte_plugin_name})
+            if cte_plugin is None:
+                logger.warn(
+                    f"Could not find the configuration with name='{cte_plugin_name}'. "
+                    "Skipping the IoCs retraction execution.",
+                    error_code="CTE_1049",
+                )
+                continue
             configuration_db = ConfigurationDB(**cte_plugin)
             if not configuration_db.active:
                 logger.info(
@@ -139,6 +146,11 @@ def ioc_retraction():
                     success = True
                     break
                 total_indicators += len(batch)
+                # Build retraction destinations with initial status "N/A" for all.
+                retraction_destinations_na = [
+                    {"name": dest["name"], "status": "N/A"}
+                    for dest in destinations
+                ]
                 connector.collection(
                     Collections.INDICATORS
                 ).update_many(
@@ -146,13 +158,44 @@ def ioc_retraction():
                     {
                         "$set": {
                             "sources.$[elem].retracted": True,
-                            "sources.$[elem].retractionDestinations": destinations
+                            "sources.$[elem].retractionDestinations": retraction_destinations_na
                         }
                     },
                     array_filters=[
                         {"elem.source": configuration_db.name}
                     ]
                 )
+                # Promote to "pending" only for destinations the indicator is actually shared with.
+                for dest in destinations:
+                    connector.collection(
+                        Collections.INDICATORS
+                    ).update_many(
+                        {
+                            "value": {"$in": batch},
+                            "sharedWith": {"$in": [dest["name"]]},
+                            "sources": {
+                                "$elemMatch": {
+                                    "source": configuration_db.name,
+                                    "destinations": {
+                                        "$elemMatch": {
+                                            "name": dest["name"],
+                                            "status": "shared"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "$set": {
+                                "sources.$[elem].retractionDestinations.$[dest].status": "pending"
+                            }
+                        },
+                        array_filters=[
+                            {"elem.source": configuration_db.name},
+                            {"dest.name": dest["name"]}
+                        ]
+                    )
+            _update_storage(configuration_db.name, plugin.storage)
             if success:
                 logger.info(
                     f"Completed executing cycle to get modified indicator(s) for CTE configuration "

@@ -25,7 +25,13 @@ def unmute_business_rule():
     update_result = connector.collection(
         Collections.CTE_BUSINESS_RULES
     ).update_many(
-        {"unmuteAt": {"$ne": None, "$lte": current_time}, "muted": True},
+        {
+            "unmuteAt": {"$ne": None, "$lte": current_time},
+            "muted": True,
+            # Never auto-unmute rules locked because the CRE module is off; they
+            # are restored only when CRE is re-enabled.
+            "disabledByCre": {"$ne": True},
+        },
         {"$set": {"muted": False, "unmuteAt": None}},
     )
     if update_result.modified_count > 0:

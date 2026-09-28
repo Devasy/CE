@@ -27,6 +27,18 @@ class TaskStatusFields(BaseModel):
     share: Union[bool, None] = Field(None)
 
 
+def coerce_task_fields(cls, v):
+    """Treat a flattened scalar lock/run-state field as the empty sub-document.
+
+    A stale queued task naming the lock field ``lockedAt`` without the per-op
+    suffix can ``$set`` over the whole sub-document. A malformed bookkeeping
+    field must not make the configuration unmanageable.
+    """
+    # A flattened field can hold either the acquire-side datetime or the
+    # release-side null, so coerce any non-dict scalar -- not just null.
+    return v if isinstance(v, (dict, BaseModel)) else {}
+
+
 class AggregateStrategy(str, Enum):
     """Tags Aggregate Strategies."""
 
@@ -94,10 +106,21 @@ def validate_reputation(cls, v):
 class ManualSyncConfig(BaseModel):
     """Storing manual sync configs."""
 
-    source: str = Field(..., description="Name of the source config.")
+    source: Union[str, None] = Field(
+        None,
+        description="Name of the source config; None for CRE-entity rules.",
+    )
     rule: str = Field(..., description="Name of the rule.")
     lastseen: int = Field(..., description="Number of lastseen days IoCs to sync.")
     action: dict = Field(..., description="Name of the action.")
+    ruleType: str = Field(
+        "cte",
+        description=(
+            "Which rule store the entry's rule name resolves against: 'cte' "
+            "(CTE business rules, the default for pre-existing entries) or "
+            "'unified_mapping' (unified mapping business rules)."
+        ),
+    )
 
 
 class ConfigurationOut(BaseModel):
@@ -154,6 +177,10 @@ class ConfigurationOut(BaseModel):
         ...,
         description="Storing criteria for tags using selected strategy."
     )
+
+    _coerce_task_fields = field_validator(
+        "lastRunAt", "lastRunSuccess", "lockedAt", mode="before"
+    )(coerce_task_fields)
 
 
 class ConfigurationIn(BaseModel):
@@ -318,6 +345,9 @@ class ConfigurationDB(BaseModel):
     lastRunAt: TaskFields = Field(TaskFields())
     lastRunSuccess: TaskStatusFields = Field(TaskStatusFields())
     lockedAt: TaskFields = Field(TaskFields())
+    _coerce_task_fields = field_validator(
+        "lastRunAt", "lastRunSuccess", "lockedAt", mode="before"
+    )(coerce_task_fields)
     disabledAt: Union[datetime, None] = Field(None)
     cycleStartedAt: Union[datetime, None] = Field(None)
     subCheckpoint: Union[dict, None] = Field(None)

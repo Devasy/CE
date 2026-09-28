@@ -2,10 +2,12 @@
 
 from __future__ import absolute_import, unicode_literals
 import json
-from ipaddress import IPv4Address, IPv6Address, ip_address
+from ipaddress import IPv4Address, IPv6Address, IPv4Network, IPv6Network, ip_address, ip_network
 import traceback
 import re
-from typing import List
+from typing import List, Optional
+
+from bson import ObjectId
 from netskope.common.models.settings import CTECriterias, SettingsDB
 from netskope.integrations.cte.models.indicator import (
     IndicatorDBWithSources,
@@ -126,7 +128,7 @@ def compare_severity(existing, newer):
         return (
             newer == SeverityType.CRITICAL
             or newer == SeverityType.HIGH
-            or SeverityType.MEDIUM
+            or newer == SeverityType.MEDIUM
         )
     else:
         return newer != SeverityType.UNKNOWN
@@ -306,7 +308,7 @@ def insert_or_update_indicator(
     indicator: Indicator,
     is_internal: bool,
     from_api: bool = False,
-) -> bool:
+) -> Optional[ObjectId]:
     """Insert or update the indicator in the database.
 
     Args:
@@ -316,7 +318,7 @@ def insert_or_update_indicator(
         from_api (bool): Whether this method is called directly from API or from plugin.
 
     Returns:
-        bool: Whether the indicator was successfully inserted or not.
+        ObjectId of the stored indicator document, or None on hard failure.
     """
     indicator = _set_defaults(indicator, configuration)
     existing_indicator = get_existing_indicator(indicator.value)
@@ -348,6 +350,7 @@ def insert_or_update_indicator(
                     "internalHits": 1 if is_internal else 0,
                     "externalHits": 1 if not is_internal else 0,
                     "source": configuration.name,
+                    "lastUpdated": datetime.now(),
                 },
             },
             sources=[indicator_source],
@@ -357,6 +360,8 @@ def insert_or_update_indicator(
             {"$set": indicator_model.model_dump()},
             upsert=True,
         )
+        stored = get_existing_indicator(indicator.value)
+        return stored["_id"] if stored else None
     else:  # alrady in the database
         _update_existing_indicator(
             indicator, existing_indicator, configuration, is_internal, from_api, destinations
@@ -366,6 +371,7 @@ def insert_or_update_indicator(
         indicator_dict = indicator_model.model_dump()
         indicator_dict.pop("internalHits", None)
         indicator_dict.pop("externalHits", None)
+        indicator_dict["lastUpdated"] = datetime.now()
 
         upsert_dict = {"$set": indicator_dict}
         if is_internal:
@@ -382,10 +388,11 @@ def insert_or_update_indicator(
                 f"value='{indicator.value}'",
                 error_code="CTE_1000",
             )
+        return existing_indicator["_id"]
 
 
 def end_life(name: str, success: bool) -> bool:
-    """Update the lastRunSuccess and lastRunAt and exit.
+    """Update the lastRunSuccess and lastRunAt, release the pull lock, and exit.
 
     Args:
         name (str): Name of the configuration.
@@ -400,7 +407,7 @@ def end_life(name: str, success: bool) -> bool:
             "$set": {
                 "lastRunAt.pull": datetime.now(),
                 "lastRunSuccess.pull": success,
-                # "lockedAt": None,
+                "lockedAt.pull": None,
             }
         },
     )
@@ -460,6 +467,22 @@ def validate_iocs(type: IndicatorType, value: str):
             return isinstance(addr, IPv6Address)
         except ValueError:
             return False
+    elif type == IndicatorType.IPV4_CIDR:
+        try:
+            if "/" not in value:
+                return False
+            network = ip_network(value, strict=False)
+            return isinstance(network, IPv4Network)
+        except ValueError:
+            return False
+    elif type == IndicatorType.IPV6_CIDR:
+        try:
+            if "/" not in value:
+                return False
+            network = ip_network(value, strict=False)
+            return isinstance(network, IPv6Network)
+        except ValueError:
+            return False
     else:
         return False
 
@@ -480,18 +503,25 @@ def _process_indicators_batch(
     Returns:
         int: The number of indicators processed.
     """
+    from netskope.integrations.crev2.utils.ti_evaluation import (
+        queue_threat_indicator_evaluation,
+    )
+
     skipped_url_count = 0
     count = 0
+    indicator_ids: List[ObjectId] = []
     for indicator in indicators:
         if not isinstance(indicator, Indicator):
             continue
         if validate_iocs(indicator.type, indicator.value):
             count += 1
-            insert_or_update_indicator(
+            indicator_id = insert_or_update_indicator(
                 source,
                 indicator,
-                is_internal=metadata.get("netskope", False)
+                is_internal=metadata.get("netskope", False),
             )
+            if indicator_id is not None:
+                indicator_ids.append(indicator_id)
         else:
             if indicator.type == IndicatorType.URL:
                 skipped_url_count += 1
@@ -509,6 +539,12 @@ def _process_indicators_batch(
         f"Completed storing the batch of {count} indicator(s) for configuration "
         f"'{source.name}'."
     )
+    if indicator_ids:
+        queue_threat_indicator_evaluation(indicator_ids)
+        logger.debug(
+            f"Queued CRE Threat Indicators evaluation for {len(indicator_ids)} "
+            f"indicator(s) from source '{source.name}'."
+        )
     return count
 
 

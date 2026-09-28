@@ -39,6 +39,7 @@ class PushResult(BaseModel):
     success: bool = False
     should_run_cleanup: bool = False
     failed_iocs: list = []
+    skipped_iocs: list = []
 
 
 class PluginBase(CommonPluginBase):
@@ -86,6 +87,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             List[Indicator]: List of indicators to be stored on the platform.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -108,6 +112,9 @@ class PluginBase(CommonPluginBase):
 
         Raises:
             NotImplementedError: If the method is not implemented.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -122,6 +129,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             ValidationResult: Result indicating validation outcome and message.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -133,6 +143,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             List[Action]: List of actions.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -144,6 +157,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             List: List of fields to be rendered.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -170,6 +186,9 @@ class PluginBase(CommonPluginBase):
         Returns:
             List[str]: List of retracted indicators values.
             to be marked on the platform.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -181,6 +200,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             ValidationResult: Validation result object.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -192,5 +214,8 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             ValidationResult: Validation result object.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
