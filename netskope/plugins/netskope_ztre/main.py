@@ -31,12 +31,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Netskope CRE plugin."""
 
+import copy
 import json
 import re
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from netskope.common.utils import (
     AlertsHelper,
@@ -63,6 +64,7 @@ from .utils.constants import (
     REGEX_HOST,
     REGEX_EMAIL,
     REGEX_TAG,
+    REGEX_FOR_DOMAIN,
     MODULE_NAME,
     PLUGIN,
     PLUGIN_VERSION,
@@ -78,15 +80,98 @@ from .utils.constants import (
     APPLICATIONS_BATCH_SIZE,
     TAG_APP_TAG_LENGTH,
     TAG_DEVICE_TAG_LENGTH,
+    PRIVATE_APP_TAG_MAX_LENGTH,
     TAG_DEVICE_BATCH_SIZE,
     TAG_EXISTS,
     DEVICE_FIELD_MAPPING,
     MAX_TAGS_PER_DEVICE,
     TAG_CACHE_PAGE_SIZE,
+    DEVICE_BULK_TAG_INTER_BATCH_SLEEP,
+    TAG_ACTION_LABEL_MAP,
+    PENDING_CHANGES_DETECTED,
+    V2_SERVICE_PROFILE,
+    V2_SERVICE_PROFILE_BY_ID,
+    SERVICE_PROFILE_TYPE_CUSTOM,
+    SERVICE_PROFILE_PAGE_SIZE,
+    MAX_DESTINATION_PROFILE_NAME_LENGTH,
+    MAX_DESTINATION_PROFILE_DESC_LENGTH,
+    DESTINATION_PROFILE_NAME_FORBIDDEN_CHARS,
+    DESTINATION_PROFILE_PAYLOAD_LIMIT,
+    DESTINATION_PROFILE_PAYLOAD_SAFETY_BUFFER,
+    DESTINATION_PROFILE_VALUES_PER_APPEND,
+    DESTINATION_PROFILE_REGEX_TOTAL_LIMIT,
+    MATCH_TYPE_OPTIONS,
+    MAX_DNS_PROFILE_NAME_LENGTH,
+    MAX_DNS_PROFILE_DESC_LENGTH,
+    DNS_PROFILE_FORBIDDEN_CHARS,
+    MAX_SERVICE_PROFILE_NAME_LENGTH,
+    MAX_SERVICE_PROFILE_DESC_LENGTH,
+    DNS_PROFILE_ACTION_TYPE_OPTIONS,
+    BLOCK_ALL_EXCEPT_ALLOW_LIST_OPTIONS,
+    CUSTOM_SEPARATOR,
+    CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION,
+    OPERATION_OPTIONS,
+    SERVICE_PROFILE_OPERATION_OPTIONS,
+    DNS_PROFILE_PAYLOAD_LIMIT,
+    DNS_PROFILE_PAYLOAD_SAFETY_BUFFER,
+    DEVICE_CLASSIFICATION_PAGE_SIZE,
+    MAX_DEVICE_CLASSIFICATION_NAME_LENGTH,
+    DEVICE_CLASSIFICATION_DEFAULT_DESCRIPTION,
+    DEVICE_CLASSIFICATION_OS_OPTIONS,
+    DEVICE_CLASSIFICATION_OPERATOR_OPTIONS,
+    DESTINATION_PROFILE_ACTION_PARAMS,
+    DNS_PROFILE_ACTION_PARAMS,
+    SERVICE_PROFILE_ACTION_PARAMS,
+    DEVICE_CLASSIFICATION_ACTION_PARAMS,
+    MAX_NETWORK_PROFILE_NAME_LENGTH,
+    MAX_NETWORK_PROFILE_DESC_LENGTH,
+    MAX_NETWORK_PROFILE_VALUE_LENGTH,
+    MAX_NETWORK_PROFILES,
+    NETWORK_PROFILE_SIBLING_SUFFIX,
+    NETWORK_PROFILE_ACTION_PARAMS,
+    NETWORK_PROFILE_COMMENT_PREFIXES,
+    NETWORK_PROFILE_EMPTY_PLACEHOLDER,
+    NETWORK_PROFILE_LIMIT_ERROR_MARKERS,
+    NETWORK_PROFILE_COUNT_ERROR_PATTERNS,
+    NETWORK_PROFILE_NAME_FORBIDDEN_CHARS,
+    NETWORK_PROFILE_PAYLOAD_LIMIT,
+    NETWORK_PROFILE_PAYLOAD_SAFETY_BUFFER,
+    NETWORK_PROFILE_PER_PROFILE_LIMIT,
+    NETWORK_PROFILE_STATUS_PENDING_DELETE,
+    NETWORK_PROFILE_TENANT_TOTAL_LIMIT,
+    NETWORK_PROFILE_VALUES_PER_APPEND,
 )
-from .utils.helper import NetskopePluginHelper, NetskopeException
+from .utils.helper import (
+    NetskopePluginHelper,
+    NetskopeException,
+    _capitalize_first,
+)
 
 plugin_provider_helper = PluginProviderHelper()
+
+
+class PrivateAppLimitReachedError(Exception):
+    """Raised when the tenant's maximum private app count is reached.
+
+    Netskope returns this as an HTTP 200 with a body of
+    ``{"status": "error", "message": "The maximum number ... has been
+    reached."}`` when a private app create would exceed the tenant limit.
+    It is treated as a non-fatal stop signal during roll-over (the
+    remaining hosts are skipped) rather than a hard action failure.
+    """
+
+
+class NetworkProfileLimitReachedError(Exception):
+    """Raised when the tenant's maximum network profile count is reached.
+
+    Mirrors ``PrivateAppLimitReachedError``. The plugin stops before the
+    create when the tenant is already at ``MAX_NETWORK_PROFILES``, and
+    also raises this when the API rejects a create with a body carrying
+    one of ``NETWORK_PROFILE_LIMIT_ERROR_MARKERS`` (403 is reused for
+    "licensed feature not enabled", so the status alone is not enough).
+    It is a non-fatal stop signal during roll-over - the remaining values
+    are skipped and reported - not a hard action failure.
+    """
 
 
 class NetskopePlugin(PluginBase):
@@ -152,41 +237,71 @@ class NetskopePlugin(PluginBase):
                     EntityField(
                         name="email",
                         type=EntityFieldType.STRING,
+                        description=(
+                            "User email address. This field can be used to"
+                            " merge User records with other CRE plugins."
+                        ),
                         required=True,
                     ),
-                    EntityField(name="ubaScore", type=EntityFieldType.NUMBER),
                     EntityField(
-                        name="policyName", type=EntityFieldType.STRING
+                        name="ubaScore",
+                        type=EntityFieldType.NUMBER,
+                        description="User Behavior Analytics risk score.",
                     ),
                     EntityField(
-                        name="cci", type=EntityFieldType.NUMBER
+                        name="policyName",
+                        type=EntityFieldType.STRING,
+                        description="Security policy name applied to user.",
                     ),
                     EntityField(
-                        name="ccl", type=EntityFieldType.STRING
+                        name="cci",
+                        type=EntityFieldType.NUMBER,
+                        description="Netskope Confidence Correlation Index.",
                     ),
                     EntityField(
-                        name="deviceClassification", type=EntityFieldType.STRING
+                        name="ccl",
+                        type=EntityFieldType.STRING,
+                        description="Netskope Confidence Correlation Level.",
                     ),
                     EntityField(
-                        name="policyAction", type=EntityFieldType.LIST
+                        name="deviceClassification",
+                        type=EntityFieldType.STRING,
+                        description="Device classification category.",
                     ),
                     EntityField(
-                        name="severity", type=EntityFieldType.STRING
+                        name="policyAction",
+                        type=EntityFieldType.LIST,
+                        description="Policy actions applied to traffic.",
                     ),
                     EntityField(
-                        name="destinationIP", type=EntityFieldType.STRING
+                        name="severity",
+                        type=EntityFieldType.STRING,
+                        description="Security event severity level.",
                     ),
                     EntityField(
-                        name="sourceRegion", type=EntityFieldType.STRING
+                        name="destinationIP",
+                        type=EntityFieldType.STRING,
+                        description="Destination server IP address.",
                     ),
                     EntityField(
-                        name="sourceIP", type=EntityFieldType.STRING
+                        name="sourceRegion",
+                        type=EntityFieldType.STRING,
+                        description="Geographic region of source.",
                     ),
                     EntityField(
-                        name="userIP", type=EntityFieldType.STRING
+                        name="sourceIP",
+                        type=EntityFieldType.STRING,
+                        description="Source IP address.",
                     ),
                     EntityField(
-                        name="policyID", type=EntityFieldType.STRING
+                        name="userIP",
+                        type=EntityFieldType.STRING,
+                        description="User's public IP address.",
+                    ),
+                    EntityField(
+                        name="policyID",
+                        type=EntityFieldType.STRING,
+                        description="Policy identifier.",
                     ),
                 ],
             ),
@@ -194,28 +309,65 @@ class NetskopePlugin(PluginBase):
                 name="Applications",
                 fields=[
                     EntityField(
-                        name="applicationId", type=EntityFieldType.STRING
+                        name="applicationId",
+                        type=EntityFieldType.STRING,
+                        description="Unique application identifier.",
                     ),
                     EntityField(
                         name="applicationName",
                         type=EntityFieldType.STRING,
                         required=True,
-                    ),
-                    EntityField(name="vendor", type=EntityFieldType.STRING),
-                    EntityField(name="source", type=EntityFieldType.STRING),
-                    EntityField(name="cci", type=EntityFieldType.NUMBER),
-                    EntityField(name="ccl", type=EntityFieldType.STRING),
-                    EntityField(
-                        name="categoryName", type=EntityFieldType.STRING
-                    ),
-                    EntityField(name="users", type=EntityFieldType.LIST),
-                    EntityField(name="deepLink", type=EntityFieldType.STRING),
-                    EntityField(name="customTags", type=EntityFieldType.LIST),
-                    EntityField(
-                        name="discoveryDomains", type=EntityFieldType.LIST
+                        description="Application name.",
                     ),
                     EntityField(
-                        name="steeringDomains", type=EntityFieldType.LIST
+                        name="vendor",
+                        type=EntityFieldType.STRING,
+                        description="Software vendor or publisher.",
+                    ),
+                    EntityField(
+                        name="source",
+                        type=EntityFieldType.STRING,
+                        description="Application discovery source.",
+                    ),
+                    EntityField(
+                        name="cci",
+                        type=EntityFieldType.NUMBER,
+                        description="Netskope Confidence Correlation Index.",
+                    ),
+                    EntityField(
+                        name="ccl",
+                        type=EntityFieldType.STRING,
+                        description="Netskope Confidence Correlation Level.",
+                    ),
+                    EntityField(
+                        name="categoryName",
+                        type=EntityFieldType.STRING,
+                        description="Application category classification.",
+                    ),
+                    EntityField(
+                        name="users",
+                        type=EntityFieldType.LIST,
+                        description="Users accessing application.",
+                    ),
+                    EntityField(
+                        name="deepLink",
+                        type=EntityFieldType.STRING,
+                        description="Direct dashboard link to application.",
+                    ),
+                    EntityField(
+                        name="customTags",
+                        type=EntityFieldType.LIST,
+                        description="Custom tags assigned to application.",
+                    ),
+                    EntityField(
+                        name="discoveryDomains",
+                        type=EntityFieldType.LIST,
+                        description="Domains for application discovery.",
+                    ),
+                    EntityField(
+                        name="steeringDomains",
+                        type=EntityFieldType.LIST,
+                        description="Domains for steering policies.",
                     ),
                 ],
             ),
@@ -226,84 +378,118 @@ class NetskopePlugin(PluginBase):
                         name="Device ID",
                         type=EntityFieldType.STRING,
                         required=True,
+                        description="Unique device identifier.",
                     ),
                     EntityField(
                         name="Hostname",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        required=True,
+                        description=(
+                            "Device hostname or computer name. This field"
+                            " can be used to merge device records with other"
+                            " CRE plugins."
+                        ),
                     ),
                     EntityField(
                         name="Netskope Device UID",
                         type=EntityFieldType.STRING,
                         required=True,
+                        description="Unique identifier assigned by Netskope.",
                     ),
                     EntityField(
                         name="Mac Addresses",
-                        type=EntityFieldType.LIST
+                        type=EntityFieldType.LIST,
+                        description="Device MAC addresses.",
                     ),
                     EntityField(
                         name="Last Connected from Private IP",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Last private IP connection.",
                     ),
                     EntityField(
                         name="Last Connected from Public IP",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Last public IP connection.",
                     ),
                     EntityField(
                         name="Device Serial Number",
                         type=EntityFieldType.STRING,
                         required=True,
+                        description=(
+                            "Manufacturer device serial number. "
+                            "This field can be used to merge device"
+                            " records with other CRE Plugins."
+                        ),
                     ),
                     EntityField(
                         name="Operating System",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Device operating system name.",
                     ),
                     EntityField(
                         name="Operating System Version",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Operating system version number.",
                     ),
                     EntityField(
                         name="Device Make",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Device manufacturer brand.",
                     ),
                     EntityField(
                         name="Device Model",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Device model name or number.",
                     ),
                     EntityField(
                         name="Last Updated Timestamp",
-                        type=EntityFieldType.DATETIME
+                        type=EntityFieldType.DATETIME,
+                        description="Last device information update time.",
                     ),
                     EntityField(
                         name="Management ID",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Device management system identifier.",
                     ),
                     EntityField(
                         name="Steering Config",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Applied steering policy configuration.",
                     ),
                     EntityField(
                         name="Region",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Device geographic region",
                     ),
                     EntityField(
                         name="User Name",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description=(
+                            "Primary device user name. This field can be used"
+                            " to merge User records from other CRE plugins or"
+                            " make this field as unique and use it as a"
+                            " reference in other plugin that supports user"
+                            " name reference field."
+                        ),
                     ),
                     EntityField(
                         name="User Key",
                         type=EntityFieldType.LIST,
                         required=True,
+                        description="Device user identifiers or keys",
                     ),
                     EntityField(
                         name="Device Classification Status",
-                        type=EntityFieldType.STRING
+                        type=EntityFieldType.STRING,
+                        description="Current device classification status",
                     ),
                     EntityField(
                         name="Tags",
-                        type=EntityFieldType.LIST
+                        type=EntityFieldType.LIST,
+                        description="Tags assigned to the device",
                     ),
                 ],
-            )
+            ),
         ]
 
     def _convert_string_to_list(self, data_object: Dict, key: str) -> Dict:
@@ -430,7 +616,7 @@ class NetskopePlugin(PluginBase):
                 return records
             else:
                 return [extracted_fields] if extracted_fields else []
-        
+
         # If the CSV response has multiple values for mac address field they
         # are separated by '|' and the tenant plugin parses it into a list
         # of strings but for single value in mac address field it is parsed
@@ -440,8 +626,8 @@ class NetskopePlugin(PluginBase):
                 data_object=extracted_fields,
                 key="Mac Addresses",
             )
-            # The userkey earlier was going as str, but 
-            # in the netity mapping we have made it as list now 
+            # The userkey earlier was going as str, but
+            # in the netity mapping we have made it as list now
             # so it should also be returned as list
             extracted_fields = self._convert_string_to_list(
                 data_object=extracted_fields,
@@ -1019,18 +1205,21 @@ class NetskopePlugin(PluginBase):
         }
         total_updated_record_counter = 0
         updated_records = []
+        update_skip_count = 0
         for record in records:
             # Make a copy to avoid modifying the original record in case of failure
             updated_record = {}
 
             device_uid = record.get("Netskope Device UID")
             user_key = record.get("User Key")
+            hostname = record.get("Hostname")
             updated_record["Device Serial Number"] = record.get(
                 "Device Serial Number"
             )
             updated_record["Device ID"] = record.get("Device ID")
             updated_record["Netskope Device UID"] = device_uid
             updated_record["User Key"] = user_key
+            updated_record["Hostname"] = hostname
 
             # Handle User Key as list (multi-user scenario)
             user_keys = user_key
@@ -1041,14 +1230,13 @@ class NetskopePlugin(PluginBase):
 
             unique_user_keys = set()
             for uk in user_keys:
-                unique_user_keys.add(uk)
+                if uk:
+                    unique_user_keys.add(uk)
+                else:
+                    update_skip_count += 1
 
-            if not device_uid or not unique_user_keys:
-                self.logger.info(
-                    f"{self.log_prefix}: Missing Netskope Device UID or "
-                    f"User Key for device '{record.get('Device ID')}'. "
-                    "Skipping update."
-                )
+            if not device_uid or not unique_user_keys or not hostname:
+                update_skip_count += 1
                 continue
 
             user_keys_list = list(unique_user_keys)
@@ -1077,7 +1265,11 @@ class NetskopePlugin(PluginBase):
                 user_keys_batch = user_keys_list[start_idx:end_idx]
 
                 devices_payload = [
-                    {"nsdeviceuid": device_uid, "userkey": user_key}
+                    {
+                        "nsdeviceuid": device_uid,
+                        "userkey": user_key,
+                        "hostname": hostname
+                    }
                     for user_key in user_keys_batch
                 ]
                 payload = {"devices": devices_payload}
@@ -1146,7 +1338,7 @@ class NetskopePlugin(PluginBase):
                     f"out of {total_batches} batch(es) for device "
                     f"with UID '{device_uid}'."
                 )
-            
+
             self.logger.debug(
                 f"{self.log_prefix}: Successfully fetched tags for "
                 f"{successful_batches} batch(es).{log_msg}"
@@ -1157,11 +1349,16 @@ class NetskopePlugin(PluginBase):
 
             if list(all_tags):
                 total_updated_record_counter += 1
-
+        skip_msg = "."
+        if update_skip_count > 0:
+            skip_msg += (
+                f" Skipped {update_skip_count} records due to missing "
+                f"Netskope Device UID, User Key, or Hostname."
+            )
         self.logger.info(
             f"{self.log_prefix}: Successfully updated {len(updated_records)}"
             f" record(s). Fetched tag(s) for {total_updated_record_counter} out "
-            f"of {len(records)} record(s)."
+            f"of {len(records)} record(s){skip_msg}"
         )
         return updated_records
 
@@ -1255,6 +1452,5097 @@ class NetskopePlugin(PluginBase):
         else:
             raise ValueError(f"Unsupported entity '{entity}'")
 
+    def _get_tenant_and_headers(self) -> Tuple[str, Dict]:
+        """Return the tenant base URL and the v2-token auth headers.
+
+        The Add to Destination/DNS/Service Profile and Create Device
+        Classification actions all authenticate the same way against the
+        shared Netskope provider tenant. This resolves the tenant base
+        URL and builds the ``Netskope-API-Token`` header once so the
+        per-action helpers do not each repeat the same setup.
+
+        Returns:
+            Tuple[str, Dict]: ``(tenant_name, headers)`` where
+                ``tenant_name`` is the stripped tenant base URL and
+                ``headers`` carries the resolved v2 API token.
+        """
+        tenant_name = (
+            self.tenant.parameters.get("tenantName", "").strip()
+        )
+        headers = {
+            "Netskope-API-Token": resolve_secret(
+                self.tenant.parameters.get("v2token", "")
+            )
+        }
+        return tenant_name, headers
+
+    def _get_destination_profiles(
+        self,
+        is_values_required: bool = False,
+    ) -> Dict:
+        """Fetch destination profiles from the Netskope Tenant.
+
+        Iterates over the destinations list endpoint using
+        offset/limit pagination and returns a mapping keyed by
+        profile name. Each value carries the metadata fields
+        required for de-duplication and capacity checks.
+
+        Args:
+            is_values_required (bool): When True request the
+                full profile, including ``values`` (needed to skip
+                values that are already present). ``values`` is
+                not a supported ``fields`` filter value, so the
+                ``fields`` param is omitted entirely in this case
+                and the API returns the full profile. Defaults to
+                False.
+
+        Returns:
+            Dict: Mapping of profile name to profile metadata
+                (id, name, type, values_count, description[, values]).
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{URLS.get('V2_DESTINATION_PROFILE')}"
+        profiles = {}
+        offset = 0
+        limit = 100
+        logger_msg = "fetching destination profiles from the Netskope Tenant"
+        self.logger.debug(
+            f"{self.log_prefix}: {logger_msg.capitalize()}."
+        )
+        try:
+            # Drive the loop off the page size rather than a returned
+            # total: stop once a page returns fewer than ``limit``
+            # items and advance the offset by the number actually
+            # returned, so a missing/incorrect total cannot cause an
+            # early stop or an infinite loop.
+            while True:
+                params = {
+                    "offset": offset,
+                    "limit": limit,
+                }
+                if not is_values_required:
+                    params["fields"] = (
+                        "id,name,type,values_count,description"
+                    )
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="get",
+                    error_codes=["CRE_1063", "CRE_1064"],
+                    headers=headers,
+                    params=params,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {logger_msg}",
+                    logger_msg=logger_msg,
+                )
+                elements = response.get("elements", [])
+                for profile in elements:
+                    profiles[profile.get("name", "")] = profile
+                if len(elements) < limit:
+                    break
+                offset += len(elements)
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+        self.logger.info(
+            f"{self.log_prefix}: Successfully fetched "
+            f"{len(profiles)} destination profile(s)."
+        )
+        return profiles
+
+    def _deploy_destination_profile(self, ids: list) -> bool:
+        """Apply pending changes for the given destination profiles.
+
+        Calls the destinations deploy endpoint so that profiles
+        carrying undeployed (pending) changes become editable
+        again before values are appended.
+
+        Args:
+            ids (list): Destination profile ids to deploy.
+
+        Returns:
+            bool: True when every requested id was applied,
+                False otherwise.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{URLS.get('V2_DESTINATION_PROFILE_DEPLOY')}"
+        payload = {"ids": ids}
+        logger_msg = (
+            "applying pending changes for destination "
+            f"profile(s) {ids}"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {logger_msg.capitalize()}."
+        )
+        try:
+            response = self.netskope_helper._api_call_helper(
+                url=url,
+                method="post",
+                error_codes=["CRE_1067", "CRE_1068"],
+                headers=headers,
+                json=payload,
+                proxies=self.proxy,
+                message=f"Error occurred while {logger_msg}",
+                logger_msg=logger_msg,
+                is_handle_error_required=False,
+            )
+            if response.status_code not in [200, 201]:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        f"{logger_msg}. Received exit code "
+                        f"{response.status_code}."
+                    ),
+                    details=str(response.text),
+                )
+                return False
+            deploy_json = handle_status_code(
+                response,
+                error_code="CRE_1068",
+                custom_message=f"Error occurred while {logger_msg}",
+                plugin=self.log_prefix,
+                notify=False,
+                log=True,
+            )
+            applied = []
+            if isinstance(deploy_json, dict):
+                applied = deploy_json.get("applied", [])
+            success = all(str(i) in [str(a) for a in applied] for i in ids)
+            if not success:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Pending changes were not "
+                        f"applied for all destination profile(s) {ids}."
+                    ),
+                    details=repr(deploy_json),
+                )
+            return success
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+
+    def _push_destination_profile(
+        self,
+        destination_values: list,
+        existing_profile_name: str,
+        new_profile_name: str,
+        new_profile_description: str,
+        match_type: str,
+        apply_pending_changes: str = "No",
+        operation: str = "append",
+        exact_total_limit: Optional[int] = None,
+    ) -> int:
+        """Create or update values on a Netskope destination profile.
+
+        When ``existing_profile_name`` is ``"create"`` a new profile
+        is created with the resolved values. Otherwise, for an
+        ``append`` operation the values are added (PATCH on the values
+        endpoint) to the matching profile, skipping any value already
+        present; for a ``replace`` operation the whole value list is
+        overwritten in a single PATCH on the profile id endpoint.
+        Capacity limits are respected best-effort by trimming overflow
+        before the request, while still relying on the API to reject
+        anything it cannot accept. A 409 pending-changes response
+        triggers a deploy + retry only when ``apply_pending_changes``
+        is ``"Yes"``; otherwise it is logged and skipped.
+
+        Args:
+            destination_values (list): Resolved, de-duplicated values
+                to add to the profile.
+            existing_profile_name (str): Selected profile name, or the
+                literal ``"create"`` to create a new profile.
+            new_profile_name (str): Name to use when creating a profile.
+            new_profile_description (str): Description for a new profile.
+            match_type (str): Match type for a new profile
+                (insensitive/sensitive/regex).
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy
+                pending changes on a 409, else ``"No"``.
+            operation (str): ``append`` to keep the existing values and
+                add to them, ``replace`` to overwrite the profile with
+                the provided values.
+            exact_total_limit (Optional[int]): Tenant-wide exact-match
+                value limit from the action parameter; ``None`` falls
+                back to the default constant.
+
+        Returns:
+            tuple: ``(shared_count, not_applied)`` where ``shared_count``
+                is the count of values successfully shared to the profile
+                and ``not_applied`` is the list of values that failed or
+                were skipped (capacity overflow or a failed batch). Used
+                by the bulk caller to attribute unshared values back to
+                their originating action ids.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        values = [v for v in destination_values if v]
+        if not values:
+            self.logger.info(
+                f"{self.log_prefix}: No network targets to share "
+                "after removing empty entries. Skipping action execution."
+            )
+            return 0, []
+        try:
+            existing_profiles = self._get_destination_profiles(
+                is_values_required=True
+            )
+            if existing_profile_name == "create":
+                # Re-running the action with the same parameters would
+                # otherwise attempt to create a duplicate profile, which
+                # the API rejects with an "already exists" error. If a
+                # profile with the requested name already exists, share
+                # the values to it instead of creating a new one.
+                if new_profile_name not in existing_profiles:
+                    return self._create_destination_profile(
+                        tenant_name=tenant_name,
+                        headers=headers,
+                        profile_name=new_profile_name,
+                        description=new_profile_description,
+                        match_type=match_type,
+                        values=values,
+                        existing_profiles=existing_profiles,
+                        exact_total_limit=exact_total_limit,
+                    )
+                self.logger.info(
+                    f"{self.log_prefix}: Destination profile "
+                    f"'{new_profile_name}' already exists on the "
+                    "Netskope Tenant; adding values to the existing "
+                    "profile instead of creating a new one."
+                )
+                target_profile = existing_profiles.get(new_profile_name)
+            else:
+                target_profile = existing_profiles.get(
+                    existing_profile_name
+                )
+                if not target_profile:
+                    error_message = (
+                        f"Destination profile '{existing_profile_name}' "
+                        "could not be found on the Netskope Tenant."
+                    )
+                    self.logger.error(
+                        message=f"{self.log_prefix}: {error_message}",
+                        resolution=(
+                            "Verify the destination profile still exists "
+                            "on the Netskope Tenant and re-run the "
+                            "action."
+                        ),
+                    )
+                    raise NetskopeException(error_message)
+                self.logger.info(
+                    f"{self.log_prefix}: Found destination "
+                    f"profile '{existing_profile_name}' on "
+                    "the Netskope Tenant."
+                )
+            if operation == "replace":
+                return self._replace_destination_profile_values(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    profile=target_profile,
+                    values=values,
+                    new_profile_description=new_profile_description,
+                    match_type=match_type,
+                    existing_profiles=existing_profiles,
+                    apply_pending_changes=apply_pending_changes,
+                    exact_total_limit=exact_total_limit,
+                )
+            return self._append_destination_profile_values(
+                tenant_name=tenant_name,
+                headers=headers,
+                profile=target_profile,
+                values=values,
+                new_profile_description=new_profile_description,
+                match_type=match_type,
+                existing_profiles=existing_profiles,
+                apply_pending_changes=apply_pending_changes,
+                exact_total_limit=exact_total_limit,
+            )
+        except NetskopeException:
+            raise
+        except Exception as err:
+            profile_name = (
+                new_profile_name
+                if existing_profile_name == "create"
+                else existing_profile_name
+            )
+            error_message = (
+                "Unexpected error occurred while adding Network Targets"
+                f" to destination profile '{profile_name}'."
+            )
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+
+    def _create_destination_profile(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile_name: str,
+        description: str,
+        match_type: str,
+        values: list,
+        existing_profiles: Dict,
+        exact_total_limit: Optional[int] = None,
+    ) -> int:
+        """Create a new destination profile with the given values.
+
+        Trims the value list to the available capacity for the
+        requested match type before issuing the create request, then
+        relies on the API to reject anything it still cannot accept.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile_name (str): Name of the profile to create.
+            description (str): Description for the new profile.
+            match_type (str): Match type for the new profile.
+            values (list): De-duplicated values to add.
+            existing_profiles (Dict): Existing profiles used for the
+                capacity computation.
+            exact_total_limit (Optional[int]): Tenant-wide exact-match
+                value limit override; ``None`` uses the default
+                constant.
+
+        Returns:
+            tuple: ``(shared_count, not_applied)`` where ``shared_count``
+                is the count of values successfully shared and
+                ``not_applied`` is the list of values dropped because of
+                capacity limits.
+        """
+        max_shareable, limit_label = self.netskope_helper._destination_profile_capacity(
+            existing_profiles=existing_profiles,
+            target_profile_name="",
+            match_type=match_type,
+            requested_count=len(values),
+            exact_total_limit=exact_total_limit,
+        )
+        if max_shareable <= 0:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: The destination profile "
+                    f"capacity for match type '{match_type}' is "
+                    f"exhausted on the Netskope Tenant ({limit_label} "
+                    "has been reached). Skipping creation of profile "
+                    f"'{profile_name}'."
+                ),
+                resolution=(
+                    "Remove unused values or profiles on the Netskope "
+                    "Tenant to free up capacity, then re-run the action."
+                ),
+            )
+            return 0, list(values)
+        bounded_values = values[:max_shareable]
+        capacity_overflow_values = values[max_shareable:]
+        capacity_overflow = len(capacity_overflow_values)
+        # The create POST body is also bound by the destination profile
+        # API payload limit, so only the first chunk that fits is sent on
+        # create; the remainder is appended on the values endpoint after
+        # the profile id is known.
+        budget = (
+            DESTINATION_PROFILE_PAYLOAD_LIMIT
+            - DESTINATION_PROFILE_PAYLOAD_SAFETY_BUFFER
+        )
+        base_overhead = len(
+            json.dumps(
+                {
+                    "name": profile_name,
+                    "description": description,
+                    "type": match_type,
+                    "values": [],
+                }
+            ).encode("utf-8")
+        )
+        post_chunk, post_overflow = (
+            self.netskope_helper._split_values_within_budget(
+                bounded_values, base_overhead, budget
+            )
+        )
+        # A single value can never realistically exceed the budget; if
+        # the metadata pushed the first value just over, still send it so
+        # the profile is created with at least one value.
+        if not post_chunk and bounded_values:
+            post_chunk = [bounded_values[0]]
+            post_overflow = bounded_values[1:]
+        payload = {
+            "name": profile_name,
+            "description": description,
+            "type": match_type,
+            "values": post_chunk,
+        }
+        url = f"{tenant_name}{URLS.get('V2_DESTINATION_PROFILE')}"
+        logger_msg = (
+            f"creating destination profile '{profile_name}' on the "
+            "Netskope Tenant"
+        )
+        self.logger.info(
+            f"{self.log_prefix}: Creating destination profile "
+            f"'{profile_name}' with {len(bounded_values)} "
+            "provided network target(s) on the Netskope "
+            "Tenant."
+        )
+        response = self.netskope_helper._api_call_helper(
+            url=url,
+            method="post",
+            error_codes=["CRE_1065", "CRE_1066"],
+            headers=headers,
+            json=payload,
+            proxies=self.proxy,
+            message=f"Error occurred while {logger_msg}",
+            logger_msg=logger_msg,
+            is_handle_error_required=False,
+        )
+        if response.status_code not in [200, 201]:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} Received "
+                    f"exit code {response.status_code}."
+                ),
+                details=str(response.text),
+                resolution=(
+                    "Verify the profile name is unique and the values "
+                    "are valid for the selected match type, then "
+                    "re-run the action."
+                ),
+            )
+            raise NetskopeException(error_message)
+        handle_status_code(
+            response,
+            error_code="CRE_1066",
+            custom_message=f"Error occurred while {logger_msg}",
+            plugin=self.log_prefix,
+            notify=False,
+            log=True,
+        )
+        # Append the values that did not fit the create POST (if any) to
+        # the freshly created profile via the values endpoint.
+        not_applied = list(capacity_overflow_values)
+        applied_count = len(post_chunk)
+        if post_overflow:
+            profile_id = ""
+            try:
+                profile_id = (response.json() or {}).get("id", "")
+            except Exception:
+                profile_id = ""
+            if not profile_id:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Could not determine the id "
+                        f"of the newly created destination profile "
+                        f"'{profile_name}', so {len(post_overflow)} "
+                        "value(s) that did not fit the create request "
+                        "could not be added."
+                    ),
+                    resolution=(
+                        "Re-run the action to add the remaining values "
+                        "to the now-existing destination profile."
+                    ),
+                )
+                not_applied.extend(post_overflow)
+            else:
+                failed_idx = self._append_destination_value_batches(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    profile_id=profile_id,
+                    profile_name=profile_name,
+                    values=post_overflow,
+                    apply_pending_changes="No",
+                )
+                applied_count += len(post_overflow) - len(failed_idx)
+                not_applied.extend(
+                    post_overflow[i] for i in sorted(failed_idx)
+                )
+        overflow_msg = ""
+        if capacity_overflow:
+            overflow_msg = (
+                f" Skipped {capacity_overflow} value(s) that exceeded "
+                f"{limit_label} on the Netskope Tenant."
+            )
+        self.logger.info(
+            f"{self.log_prefix}: Successfully created destination "
+            f"profile '{profile_name}' with {applied_count} "
+            f"value(s).{overflow_msg}"
+        )
+        return applied_count, not_applied
+
+    def _append_destination_profile_values(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile: dict,
+        values: list,
+        new_profile_description: str,
+        match_type: str,
+        existing_profiles: Dict,
+        apply_pending_changes: str,
+        exact_total_limit: Optional[int] = None,
+    ) -> int:
+        """Append values to an existing destination profile.
+
+        The whole value list (the profile's current values plus the
+        provided values) is sent in a single PATCH on the profile id
+        endpoint, together with the desired match ``type`` (always sent,
+        required by this endpoint) and ``description`` (sent only when it
+        differs from the fetched profile). Values already present on the
+        profile are **not** removed from the provided set: a destination
+        profile accepts duplicate values regardless of match type, so a
+        provided value already on the profile is added again. The
+        provided values are trimmed to the available capacity before the
+        request. A 409 pending-changes response is deployed and the PATCH
+        retried once when ``apply_pending_changes`` is ``"Yes"``;
+        otherwise it is logged and skipped.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile (dict): Target profile metadata (id, name, type,
+                description, values[, values_count]).
+            values (list): De-duplicated values to add to the profile.
+            new_profile_description (str): Desired description; sent only
+                if it differs from the existing one.
+            match_type (str): Desired match type; always sent as it is
+                required by the endpoint.
+            existing_profiles (Dict): Existing profiles used for the
+                capacity computation.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+            exact_total_limit (Optional[int]): Tenant-wide exact-match
+                value limit override; ``None`` uses the default
+                constant.
+
+        Returns:
+            tuple: ``(shared_count, not_applied)`` where ``shared_count``
+                is the count of values successfully added and
+                ``not_applied`` is the list of values dropped because of
+                capacity limits, or the whole provided set when the PATCH
+                itself is skipped/failed.
+        """
+        profile_id = profile.get("id", "")
+        profile_name = profile.get("name", "")
+        existing_type = profile.get("type", "")
+        existing_description = profile.get("description", "")
+        existing_values = list(profile.get("values", []) or [])
+        # For an append that also switches the type to regex, the by-id
+        # PATCH must re-send all existing values with the new type. If
+        # the existing value count alone exceeds the regex total limit,
+        # the PATCH will time out regardless of how many new values are
+        # added — short-circuit before making any API call.
+        if (
+            match_type == "regex"
+            and existing_type != "regex"
+            and len(existing_values)
+            > DESTINATION_PROFILE_REGEX_TOTAL_LIMIT
+        ):
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Cannot change the "
+                    f"match type of destination profile "
+                    f"'{profile_name}' to 'regex' — the "
+                    f"profile already holds "
+                    f"{len(existing_values)} value(s), which "
+                    "exceeds the regex total limit of "
+                    f"{DESTINATION_PROFILE_REGEX_TOTAL_LIMIT}."
+                    " Skipping action execution.."
+                ),
+                resolution=(
+                    "Reduce the profile's values to below "
+                    f"{DESTINATION_PROFILE_REGEX_TOTAL_LIMIT}"
+                    " before changing its match type to "
+                    "'regex', then re-run the action."
+                ),
+            )
+            return 0, list(values)
+        # The existing values stay on the profile, so the capacity
+        # baseline keeps the profile's current usage and only the newly
+        # provided values count as requested. Use match_type (the desired
+        # type) so that a type switch (e.g. exact → regex) is checked
+        # against the correct bucket; using existing_type would silently
+        # pass new values that the API will reject.
+        max_shareable, limit_label = self.netskope_helper._destination_profile_capacity(
+            existing_profiles=existing_profiles,
+            target_profile_name=profile_name,
+            match_type=match_type,
+            requested_count=len(values),
+            exact_total_limit=exact_total_limit,
+        )
+        type_changed = bool(match_type) and match_type != existing_type
+        desc_changed = bool(new_profile_description) and (
+            new_profile_description != existing_description
+        )
+        if max_shareable > 0:
+            bounded_new = values[:max_shareable]
+            capacity_overflow_values = values[max_shareable:]
+            if capacity_overflow_values:
+                self.logger.info(
+                    f"{self.log_prefix}: "
+                    f"{len(capacity_overflow_values)} of "
+                    f"{len(values)} provided network target(s)"
+                    f" exceed the capacity for destination "
+                    f"profile '{profile_name}' ({limit_label})"
+                    f"; only {len(bounded_new)} will be "
+                    "applied."
+                )
+        else:
+            bounded_new = []
+            capacity_overflow_values = list(values)
+        # Nothing new fits and the match type/description are unchanged:
+        # there is nothing to send.
+        if not bounded_new and not type_changed and not desc_changed:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: The destination profile "
+                    f"capacity for '{profile_name}' (match type "
+                    f"'{match_type}') is exhausted on the Netskope "
+                    f"Tenant ({limit_label} has been reached). "
+                    "Skipping adding values."
+                ),
+                resolution=(
+                    "Remove unused values or profiles on the Netskope "
+                    "Tenant to free up capacity, then re-run the action."
+                ),
+            )
+            return 0, list(values)
+        # The match type is always sent; the description only when it
+        # differs from the fetched profile.
+        metadata_body = {"type": match_type}
+        if desc_changed:
+            metadata_body["description"] = new_profile_description
+        # The existing values are kept on the profile, so they lead the
+        # value set the profile must end up holding; the provided
+        # (capacity-bounded) values follow and are the only ones
+        # attributed back to action ids.
+        return self._write_destination_profile_values(
+            tenant_name=tenant_name,
+            headers=headers,
+            profile_id=profile_id,
+            profile_name=profile_name,
+            metadata_body=metadata_body,
+            existing_values=existing_values,
+            new_values=bounded_new,
+            capacity_overflow_values=capacity_overflow_values,
+            apply_pending_changes=apply_pending_changes,
+            action_phrase="adding values to destination profile",
+            success_verb="added values to",
+            limit_label=limit_label,
+        )
+
+    def _replace_destination_profile_values(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile: dict,
+        values: list,
+        new_profile_description: str,
+        match_type: str,
+        existing_profiles: Dict,
+        apply_pending_changes: str,
+        exact_total_limit: Optional[int] = None,
+    ) -> int:
+        """Replace all values on an existing destination profile.
+
+        Overwrites the profile's value list in a single PATCH on the
+        profile id endpoint, which is far cheaper than removing the
+        existing values in capped batches. ``type`` is always sent (it
+        is required by this endpoint); ``description`` is included only
+        when it differs from the profile fetched from the API. The new
+        value set is trimmed to the
+        available capacity (the profile's current values are freed by
+        the replace). A 409 pending-changes response is deployed and
+        the PATCH retried once when ``apply_pending_changes`` is
+        ``"Yes"``; otherwise it is logged and skipped.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile (dict): Target profile metadata (id, name, type,
+                description).
+            values (list): De-duplicated values to set on the profile.
+            new_profile_description (str): Desired description; sent
+                only if it differs from the existing one.
+            match_type (str): Desired match type; always sent as it is
+                required by the endpoint.
+            existing_profiles (Dict): Existing profiles used for the
+                capacity computation.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+            exact_total_limit (Optional[int]): Tenant-wide exact-match
+                value limit override; ``None`` uses the default
+                constant.
+
+        Returns:
+            tuple: ``(shared_count, not_applied)`` where ``shared_count``
+                is the count of values the profile was replaced with and
+                ``not_applied`` is the list of values that could not be
+                applied (capacity overflow, or the whole value set when
+                the replace request itself is skipped/failed).
+        """
+        profile_id = profile.get("id", "")
+        profile_name = profile.get("name", "")
+        existing_type = profile.get("type", "")
+        existing_description = profile.get("description", "")
+        # Replacing frees the profile's current values, so treat its
+        # usage as zero when checking capacity for the new value set.
+        # Use match_type (the desired type after the replace), not
+        # existing_type: if the replace also changes the type bucket
+        # (exact ↔ regex), the capacity limits differ and using the old
+        # type would silently pass a value set that the API rejects.
+        capacity_profiles = dict(existing_profiles)
+        target_copy = dict(capacity_profiles.get(profile_name, {}))
+        target_copy["values_count"] = 0
+        capacity_profiles[profile_name] = target_copy
+        max_shareable, limit_label = self.netskope_helper._destination_profile_capacity(
+            existing_profiles=capacity_profiles,
+            target_profile_name=profile_name,
+            match_type=match_type,
+            requested_count=len(values),
+            exact_total_limit=exact_total_limit,
+        )
+        if max_shareable <= 0:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: The destination profile "
+                    f"capacity for '{profile_name}' (match type "
+                    f"'{match_type}') is exhausted on the Netskope "
+                    f"Tenant ({limit_label} has been reached). "
+                    "Skipping value replacement."
+                ),
+                resolution=(
+                    "Remove unused values or profiles on the Netskope "
+                    "Tenant to free up capacity, then re-run the action."
+                ),
+            )
+            return 0, list(values)
+        bounded_values = values[:max_shareable]
+        capacity_overflow_values = values[max_shareable:]
+        if capacity_overflow_values:
+            self.logger.info(
+                f"{self.log_prefix}: "
+                f"{len(capacity_overflow_values)} of "
+                f"{len(values)} provided network target(s) "
+                f"exceed the capacity for destination profile"
+                f" '{profile_name}' ({limit_label}); only "
+                f"{len(bounded_values)} will be applied."
+            )
+        # The match type is always sent; the description only when it
+        # differs from the fetched profile.
+        metadata_body = {"type": match_type}
+        if (
+            new_profile_description
+            and new_profile_description != existing_description
+        ):
+            metadata_body["description"] = new_profile_description
+        # Replace discards the profile's current values, so there are no
+        # existing values to preserve; the whole (capacity-bounded)
+        # provided set is what the profile must end up holding.
+        return self._write_destination_profile_values(
+            tenant_name=tenant_name,
+            headers=headers,
+            profile_id=profile_id,
+            profile_name=profile_name,
+            metadata_body=metadata_body,
+            existing_values=[],
+            new_values=bounded_values,
+            capacity_overflow_values=capacity_overflow_values,
+            apply_pending_changes=apply_pending_changes,
+            action_phrase="replacing the values of destination profile",
+            success_verb="replaced the values of",
+            limit_label=limit_label,
+        )
+
+    def _write_destination_profile_values(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile_id: str,
+        profile_name: str,
+        metadata_body: dict,
+        existing_values: list,
+        new_values: list,
+        capacity_overflow_values: list,
+        apply_pending_changes: str,
+        action_phrase: str,
+        success_verb: str,
+        limit_label: str,
+    ) -> tuple:
+        """Write a profile's value set, splitting at the payload budget.
+
+        Shared by the append and replace operations. The value set the
+        profile must end up holding is ``existing_values + new_values``
+        (``existing_values`` is empty for replace). The leading chunk
+        that fits the destination profile by-id PATCH payload budget —
+        together with the ``metadata_body`` (``type`` always,
+        ``description`` when changed) — is written with a single by-id
+        PATCH (which **replaces** the value list); whatever did not fit is
+        then added in batches of up to
+        ``DESTINATION_PROFILE_VALUES_PER_APPEND`` (10) values on the values
+        endpoint (``op: append``, which leaves the already-written values
+        in place). When the whole set fits the budget this collapses to a
+        single by-id PATCH.
+
+        Only the provided (``new_values``) values are attributed back to
+        action ids: a provided value is applied when it landed in the
+        PATCH chunk or in a batch that appended successfully. Existing
+        values that are re-sent only to preserve them are not attributed
+        (see the metadata-update transient-state risk in the workflow
+        doc).
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile_id (str): Id of the target profile.
+            profile_name (str): Name of the target profile (logging).
+            metadata_body (dict): ``type`` plus an optional
+                ``description`` to apply via the by-id PATCH.
+            existing_values (list): Values already on the profile that
+                must be preserved (empty for replace).
+            new_values (list): Capacity-bounded provided values; the only
+                ones attributed back to action ids.
+            capacity_overflow_values (list): Provided values dropped for
+                capacity before this call; reported as not applied.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+            action_phrase (str): Present-participle phrase for in-progress
+                / error logs, e.g. ``"adding values to destination
+                profile"``.
+            success_verb (str): Past-tense verb for the success summary,
+                e.g. ``"added values to"`` / ``"replaced the values of"``.
+            limit_label (str): Human-readable capacity limit description
+                used in the capacity-overflow part of the summary.
+
+        Returns:
+            tuple: ``(applied_count, not_applied)`` where ``applied_count``
+                is the number of provided values written and
+                ``not_applied`` is the list of provided values that could
+                not be written (capacity overflow, plus any payload batch
+                that was skipped/failed, or the whole provided set when
+                the by-id PATCH itself is skipped/failed).
+        """
+        budget = (
+            DESTINATION_PROFILE_PAYLOAD_LIMIT
+            - DESTINATION_PROFILE_PAYLOAD_SAFETY_BUFFER
+        )
+        combined = list(existing_values) + list(new_values)
+        new_offset = len(existing_values)
+        # The by-id PATCH body carries the metadata, so the first chunk
+        # must fit within the budget once the metadata overhead is
+        # accounted for.
+        patch_overhead = len(
+            json.dumps({**metadata_body, "values": []}).encode("utf-8")
+        )
+        patch_chunk, overflow = (
+            self.netskope_helper._split_values_within_budget(
+                combined, patch_overhead, budget
+            )
+        )
+        # A single value can never realistically exceed the budget; if
+        # the metadata pushed the first value just over, still send it in
+        # the PATCH (the API rejects a values-less PATCH).
+        if not patch_chunk and combined:
+            patch_chunk = [combined[0]]
+            overflow = combined[1:]
+        by_id_path = URLS.get(
+            "V2_DESTINATION_PROFILE_BY_ID"
+        ).format(profile_id)
+        by_id_url = f"{tenant_name}{by_id_path}"
+        patch_logger_msg = f"{action_phrase} '{profile_name}'"
+        if action_phrase.startswith("adding"):
+            self.logger.info(
+                f"{self.log_prefix}: Appending "
+                f"{len(new_values)} provided network "
+                f"target(s) to destination profile "
+                f"'{profile_name}'."
+            )
+        else:
+            self.logger.info(
+                f"{self.log_prefix}: Replacing the values "
+                f"of destination profile '{profile_name}' "
+                f"with {len(new_values)} provided network "
+                "target(s)."
+            )
+        if not self._send_destination_request(
+            url=by_id_url,
+            headers=headers,
+            method="patch",
+            body={**metadata_body, "values": patch_chunk},
+            profile_id=profile_id,
+            profile_name=profile_name,
+            apply_pending_changes=apply_pending_changes,
+            logger_msg=patch_logger_msg,
+        ):
+            # The by-id PATCH itself was skipped or failed, so nothing was
+            # written: every provided value is reported not applied.
+            return 0, list(capacity_overflow_values) + list(new_values)
+        # Append whatever did not fit the PATCH on the values endpoint.
+        failed_overflow_idx = set()
+        if overflow:
+            self.logger.info(
+                f"{self.log_prefix}: Payload limit (9 MB) reached for "
+                f"destination profile '{profile_name}' API call. Adding "
+                f"{len(patch_chunk)} or the {len(combined)} values to the "
+                "destinaton Profile in the initial API call. The remaining "
+                f"{len(overflow)} value(s) will be added via the append "
+                "values endpoint in batches of "
+                f"{DESTINATION_PROFILE_VALUES_PER_APPEND}."
+            )
+            failed_overflow_idx = self._append_destination_value_batches(
+                tenant_name=tenant_name,
+                headers=headers,
+                profile_id=profile_id,
+                profile_name=profile_name,
+                values=overflow,
+                apply_pending_changes=apply_pending_changes,
+            )
+        # Attribute applied vs not-applied for the provided values only.
+        patch_count = len(patch_chunk)
+        not_applied_new = []
+        for j, value in enumerate(new_values):
+            combined_index = new_offset + j
+            if combined_index < patch_count:
+                # Written by the by-id PATCH.
+                continue
+            if (combined_index - patch_count) in failed_overflow_idx:
+                not_applied_new.append(value)
+        applied_count = len(new_values) - len(not_applied_new)
+        not_applied = list(capacity_overflow_values) + not_applied_new
+        overflow_msg = ""
+        if capacity_overflow_values:
+            overflow_msg = (
+                f" Skipped {len(capacity_overflow_values)} value(s) that "
+                f"exceeded {limit_label} on the Netskope Tenant."
+            )
+        payload_skip_msg = ""
+        if not_applied_new:
+            payload_skip_msg = (
+                f" Could not add {len(not_applied_new)} value(s) to the "
+                "destination profile; the append request was skipped or "
+                "failed."
+            )
+        self.logger.info(
+            f"{self.log_prefix}: Successfully {success_verb} destination "
+            f"profile '{profile_name}' ({applied_count} provided "
+            f"value(s) applied).{overflow_msg}{payload_skip_msg}"
+        )
+        return applied_count, not_applied
+
+    def _append_destination_value_batches(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile_id: str,
+        profile_name: str,
+        values: list,
+        apply_pending_changes: str,
+    ) -> set:
+        """Append values to a profile via the values endpoint in batches.
+
+        The values endpoint accepts at most
+        ``DESTINATION_PROFILE_VALUES_PER_APPEND`` (10) values per call, so
+        ``values`` is split into batches of that many and each batch is
+        appended with a ``PATCH`` to the values endpoint
+        (``{"operation": {"op": "append", "values": [...]}}``), which
+        leaves the profile's existing values in place. (The payload size
+        budget applies only to the by-id PATCH / create POST that carry
+        the match type and description, not to this append endpoint, which
+        is bounded by a value count.) Each batch reuses the shared 409
+        pending-changes deploy + retry handling. Best effort: a batch that
+        is skipped or fails is recorded and the remaining batches are
+        still attempted.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile_id (str): Id of the target profile.
+            profile_name (str): Name of the target profile (logging).
+            values (list): Values to append, in order.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+
+        Returns:
+            set: Indices (into ``values``) whose batch was skipped or
+                failed to append; empty when every batch succeeded.
+        """
+        values_path = URLS.get(
+            "V2_DESTINATION_PROFILE_VALUES"
+        ).format(profile_id)
+        values_url = f"{tenant_name}{values_path}"
+        batch_size = DESTINATION_PROFILE_VALUES_PER_APPEND
+        total_batches = (len(values) + batch_size - 1) // batch_size
+        failed_idx = set()
+        for batch_index, start in enumerate(
+            range(0, len(values), batch_size), start=1
+        ):
+            batch = values[start:start + batch_size]
+            logger_msg = (
+                f"appending values to destination profile "
+                f"'{profile_name}' (batch {batch_index} of "
+                f"{total_batches})"
+            )
+            try:
+                self.logger.info(
+                    f"{self.log_prefix}: Appending "
+                    f"{len(batch)} value(s) to destination "
+                    f"profile '{profile_name}' "
+                    f"(batch {batch_index} of "
+                    f"{total_batches})."
+                )
+                if not self._send_destination_request(
+                    url=values_url,
+                    headers=headers,
+                    method="patch",
+                    body={
+                        "operation": {
+                            "op": "append",
+                            "values": batch,
+                        }
+                    },
+                    profile_id=profile_id,
+                    profile_name=profile_name,
+                    apply_pending_changes=apply_pending_changes,
+                    logger_msg=logger_msg,
+                ):
+                    failed_idx.update(
+                        range(start, start + len(batch))
+                    )
+                    continue
+                self.logger.info(
+                    f"{self.log_prefix}: Successfully "
+                    f"appended {len(batch)} value(s) to "
+                    f"destination profile '{profile_name}'"
+                    f" (batch {batch_index} of "
+                    f"{total_batches})."
+                )
+            except Exception as err:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Unexpected "
+                        "error while appending values to "
+                        f"destination profile '{profile_name}'"
+                        f" (batch {batch_index} of "
+                        f"{total_batches}). Error: {err}"
+                    ),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
+                    resolution=(
+                        "Re-run the action to retry the "
+                        "failed values."
+                    ),
+                )
+                failed_idx.update(
+                    range(start, start + len(batch))
+                )
+        return failed_idx
+
+    def _send_destination_request(
+        self,
+        url: str,
+        headers: dict,
+        method: str,
+        body: dict,
+        profile_id: str,
+        profile_name: str,
+        apply_pending_changes: str,
+        logger_msg: str,
+    ) -> bool:
+        """Send a destination profile write, handling pending changes.
+
+        The single request primitive shared by the by-id PATCH and the
+        values-endpoint append. A 409 pending-changes response triggers a
+        deploy + retry once when ``apply_pending_changes`` is ``"Yes"``;
+        otherwise it is logged and skipped.
+
+        Args:
+            url (str): Fully built request URL.
+            headers (dict): Request headers including the API token.
+            method (str): HTTP method (``"patch"``).
+            body (dict): Request body.
+            profile_id (str): Id of the target profile (used for the
+                deploy call on a 409).
+            profile_name (str): Name of the target profile (logging).
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+            logger_msg (str): Present-participle phrase for error logs,
+                e.g. ``"adding values to destination profile 'X'"``.
+
+        Returns:
+            bool: ``True`` on a 2xx response, ``False`` when the request
+                is skipped (pending changes not applied) or fails.
+        """
+        for attempt in range(2):
+            response = self.netskope_helper._api_call_helper(
+                url=url,
+                method=method,
+                error_codes=["CRE_1065", "CRE_1066"],
+                headers=headers,
+                json=body,
+                proxies=self.proxy,
+                message=f"Error occurred while {logger_msg}",
+                logger_msg=logger_msg,
+                is_handle_error_required=False,
+            )
+            response_text = (
+                response.text
+                if hasattr(response, "text")
+                else str(response)
+            )
+            if (
+                response.status_code == 409
+                and PENDING_CHANGES_DETECTED in response_text
+            ):
+                if apply_pending_changes == "Yes" and attempt == 0:
+                    self.logger.info(
+                        f"{self.log_prefix}: Pending changes detected "
+                        f"for destination profile '{profile_name}'. "
+                        "Applying pending changes and retrying."
+                    )
+                    if self._deploy_destination_profile([profile_id]):
+                        continue
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Could not apply "
+                            f"pending changes for destination profile "
+                            f"'{profile_name}'. Skipping action execution."
+                        ),
+                        details=response_text,
+                    )
+                    return False
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Pending changes detected "
+                        f"for destination profile '{profile_name}'. "
+                        "Skipping action execution."
+                    ),
+                    resolution=(
+                        "Set 'Apply Pending Changes' to 'Yes' in the "
+                        "action configuration, or manually apply the "
+                        "pending changes for destination profile "
+                        f"'{profile_name}' from the Netskope Tenant "
+                        "UI, then re-run the action."
+                    ),
+                    details=response_text,
+                )
+                return False
+            if response.status_code not in [200, 201]:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        f"{logger_msg}. Received exit code "
+                        f"{response.status_code}."
+                    ),
+                    details=response_text,
+                    resolution=(
+                        "Verify the values are valid for the profile "
+                        "match type and the profile capacity is not "
+                        "exceeded, then re-run the action."
+                    ),
+                )
+                return False
+            handle_status_code(
+                response,
+                error_code="CRE_1066",
+                custom_message=f"Error occurred while {logger_msg}",
+                plugin=self.log_prefix,
+                notify=False,
+                log=False,
+            )
+            return True
+        return False
+
+    def _get_network_profiles(
+        self,
+        is_values_required: bool = False,
+        name_contains: Optional[str] = None,
+    ) -> Dict:
+        """Fetch network profiles from the Netskope Tenant.
+
+        Iterates over the networks list endpoint using offset/limit
+        pagination and returns a mapping keyed by profile name. Each
+        value carries the metadata fields required for capacity checks.
+
+        Args:
+            is_values_required (bool): When True request the
+                full profile, including ``values`` (needed to
+                preserve them on the by-id PATCH, which replaces
+                the whole values array). ``values`` is not a
+                supported ``fields`` filter value, so the
+                ``fields`` param is omitted entirely in this case
+                and the API returns the full profile. Defaults to
+                False.
+            name_contains (Optional[str]): Restrict the fetch to
+                profiles whose name contains this text, using the
+                endpoint's ``filter=name co "..."``. Use it when only
+                one roll-over group is needed: every member of a group
+                (``base``, ``base 2``, ...) contains the base name, so
+                the result is a superset of the group and
+                ``_ordered_network_profile_group`` narrows it to the
+                exact members. ``co`` is a case-insensitive *partial*
+                match, so unrelated profiles can come back too - which
+                is why the result **must not** be used for tenant-wide
+                capacity maths (the value total or the profile count).
+                Ignored when the name contains a double quote, which
+                would break the filter's quoting.
+
+        Returns:
+            Dict: Mapping of profile name to profile metadata
+                (id, name, values_count, description, status
+                [, values]).
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{URLS.get('V2_NETWORK_PROFILE')}"
+        profiles = {}
+        offset = 0
+        limit = 100
+        logger_msg = "fetching network profiles from the Netskope Tenant"
+        self.logger.debug(
+            f"{self.log_prefix}: {logger_msg.capitalize()}."
+        )
+        try:
+            # Drive the loop off the page size rather than a returned
+            # total: stop once a page returns fewer than ``limit``
+            # items and advance the offset by the number actually
+            # returned, so a missing/incorrect total cannot cause an
+            # early stop or an infinite loop.
+            while True:
+                params = {
+                    "offset": offset,
+                    "limit": limit,
+                }
+                if not is_values_required:
+                    # Only the name-keyed consumers use this fetch (the
+                    # action-parameter validation list and the profile
+                    # dropdown), so ``status`` is deliberately absent -
+                    # it is a valid ``fields`` value on the tenant, just
+                    # an unread one here. Every reader of ``status``
+                    # (_ordered_network_profile_group,
+                    # _delete_network_profile) is fed by the
+                    # is_values_required=True fetch, which sends no
+                    # ``fields`` at all. Add it back only alongside a
+                    # light-fetch call site that actually reads it.
+                    params["fields"] = (
+                        "id,name,values_count,description"
+                    )
+                if name_contains and '"' not in name_contains:
+                    params["filter"] = f'name co "{name_contains}"'
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="get",
+                    error_codes=["CRE_1063", "CRE_1064"],
+                    headers=headers,
+                    params=params,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {logger_msg}",
+                    logger_msg=logger_msg,
+                )
+                elements = response.get("elements", [])
+                for profile in elements:
+                    profiles[profile.get("name", "")] = profile
+                if len(elements) < limit:
+                    break
+                offset += len(elements)
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+        self.logger.info(
+            f"{self.log_prefix}: Successfully fetched "
+            f"{len(profiles)} network profile(s)."
+        )
+        return profiles
+
+    def _deploy_network_profile(self, ids: list) -> bool:
+        """Apply pending changes for the given network profiles.
+
+        Calls the networks deploy endpoint so that profiles carrying
+        undeployed (pending) changes become editable again before
+        values are appended.
+
+        Args:
+            ids (list): Network profile ids to deploy.
+
+        Returns:
+            bool: True when every requested id was applied,
+                False otherwise.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{URLS.get('V2_NETWORK_PROFILE_DEPLOY')}"
+        payload = {"ids": ids}
+        logger_msg = (
+            "applying pending changes for network "
+            f"profile(s) {ids}"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {logger_msg.capitalize()}."
+        )
+        try:
+            response = self.netskope_helper._api_call_helper(
+                url=url,
+                method="post",
+                error_codes=["CRE_1067", "CRE_1068"],
+                headers=headers,
+                json=payload,
+                proxies=self.proxy,
+                message=f"Error occurred while {logger_msg}",
+                logger_msg=logger_msg,
+                is_handle_error_required=False,
+            )
+            if response.status_code not in [200, 201]:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        f"{logger_msg}. Received exit code "
+                        f"{response.status_code}."
+                    ),
+                    details=str(response.text),
+                )
+                return False
+            deploy_json = handle_status_code(
+                response,
+                error_code="CRE_1068",
+                custom_message=f"Error occurred while {logger_msg}",
+                plugin=self.log_prefix,
+                notify=False,
+                log=True,
+            )
+            applied = []
+            if isinstance(deploy_json, dict):
+                applied = deploy_json.get("applied", [])
+            success = all(str(i) in [str(a) for a in applied] for i in ids)
+            if not success:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Pending changes were not "
+                        f"applied for all network profile(s) {ids}."
+                    ),
+                    details=repr(deploy_json),
+                )
+            return success
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+
+    def _push_network_profile(
+        self,
+        network_values: list,
+        existing_profile_name: str,
+        new_profile_name: str,
+        new_profile_description: str,
+        apply_pending_changes: str = "No",
+        per_profile_limit: Optional[int] = None,
+        skip_excess_ips: str = "No",
+        default_value: str = NETWORK_PROFILE_EMPTY_PLACEHOLDER,
+    ) -> tuple:
+        """Add IP values to a network profile group.
+
+        The group orchestrator. A logical target is a *group*: the base
+        profile the user selected (or the action creates) plus its
+        numbered roll-over siblings ``base 2``, ``base 3`` ... When a
+        member reaches the per-profile value limit the remaining values
+        roll over into the next member, and a new sibling is created when
+        no existing member has room (unless ``skip_excess_ips`` is
+        ``"Yes"``, which gates *creating* profiles only - room that
+        already exists is always used).
+
+        Values are only ever **added**; nothing the group already holds is
+        removed. Taking a value off the group is ``revert_action``'s job,
+        which CE runs once a record no longer matches the business rule.
+
+        A network profile only accepts IPv4/IPv6 addresses, CIDR blocks
+        and ranges, so any value that does not match one of those formats
+        is dropped and reported before any capacity computation or write.
+
+        Args:
+            network_values (list): Resolved, de-duplicated IP values.
+            existing_profile_name (str): Selected profile name, or the
+                literal ``"create"`` to create a new profile.
+            new_profile_name (str): Name to use when creating a profile.
+            new_profile_description (str): Description for the profile.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy pending
+                changes on a 409, else ``"No"``.
+            per_profile_limit (Optional[int]): Per-profile value limit
+                override; ``None`` uses the default constant. The
+                tenant-wide total is fixed and never overridable.
+            skip_excess_ips (str): ``"Yes"`` to skip values that do not
+                fit the profiles that already exist instead of creating
+                roll-over siblings.
+            default_value (str): Comment placeholder written to a member
+                that has to be emptied.
+
+        Returns:
+            tuple: ``(shared_count, not_applied, added_counts,
+                already_present)`` where ``shared_count`` is the number
+                of provided values actually written, ``not_applied`` is
+                the list of values that were not written (bad format,
+                capacity, or a failed write), ``added_counts`` maps
+                profile name to how many values it received, and
+                ``already_present`` counts the values the group already
+                held. A value skipped because the group already holds it
+                is not a failure - the record asked for the value to be
+                on the profile, and it is - so it stays out of
+                ``not_applied``; it is reported separately rather than
+                folded into ``shared_count``, which would claim writes
+                that never happened.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        values = [value for value in network_values if value]
+        if not values:
+            self.logger.info(
+                f"{self.log_prefix}: No IP values to share "
+                "after removing empty entries. Skipping action execution."
+            )
+            return 0, [], {}, 0
+        valid_values = []
+        invalid_values = []
+        for value in values:
+            formatted = (
+                self.netskope_helper._format_network_profile_value(
+                    value
+                )
+            )
+            if formatted is None:
+                invalid_values.append(value)
+            else:
+                valid_values.append(formatted)
+        if invalid_values:
+            self.logger.info(
+                message=(
+                    f"{self.log_prefix}: Skipping "
+                    f"{len(invalid_values)} IP value(s) as they are "
+                    "not a valid IPv4/IPv6 address, IPv4/IPv6 CIDR "
+                    "block or IPv4/IPv6 range, and therefore cannot "
+                    "be added to the network profile."
+                ),
+                details=(
+                    "Skipped IP value(s): "
+                    + ", ".join(
+                        str(value) for value in invalid_values if value
+                    )
+                ),
+            )
+        if not valid_values:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: None of the provided IP values "
+                    "are in a format that can be added to the network "
+                    "profile. Skipping action execution."
+                ),
+                resolution=(
+                    "Provide a single IPv4/IPv6 address, an IPv4/IPv6 "
+                    "CIDR block or an IPv4/IPv6 range."
+                ),
+            )
+            return 0, list(invalid_values), {}, 0
+        base_name = (
+            new_profile_name
+            if existing_profile_name == "create"
+            else existing_profile_name
+        )
+        try:
+            existing_profiles = self._get_network_profiles(
+                is_values_required=True
+            )
+            members = (
+                self.netskope_helper._ordered_network_profile_group(
+                    existing_profiles, base_name, default_value
+                )
+            )
+            base_member = next(
+                (
+                    member
+                    for member in members
+                    if member["number"] == 1
+                ),
+                None,
+            )
+            if existing_profile_name != "create" and not base_member:
+                error_message = (
+                    f"Network profile '{existing_profile_name}' "
+                    "could not be found on the Netskope Tenant."
+                )
+                self.logger.error(
+                    message=f"{self.log_prefix}: {error_message}",
+                    resolution=(
+                        "Verify the network profile still exists "
+                        "on the Netskope Tenant and re-run the "
+                        "action."
+                    ),
+                )
+                raise NetskopeException(error_message)
+            # The base is the group's anchor: the action parameters name
+            # it, and once the tenant applies the delete the next run
+            # fails with "could not be found". Writing into the surviving
+            # siblings would fill a group that is about to become
+            # unusable, and the base cannot be written to or deployed
+            # while it is staged for deletion - so the whole action stops
+            # here, whatever 'Apply Pending Changes' is set to. Only a
+            # sibling's deletion is worked around (see below); the base
+            # needs a person to resolve it.
+            if (
+                base_member
+                and base_member["status"]
+                == NETWORK_PROFILE_STATUS_PENDING_DELETE
+            ):
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: The network profile "
+                        f"'{base_member['name']}' is staged for "
+                        "deletion on the Netskope Tenant, so no IP "
+                        "value(s) can be added to the network profile "
+                        f"group '{base_name}'. Skipping action "
+                        "execution."
+                    ),
+                    resolution=(
+                        "Apply or cancel the pending deletion of the "
+                        f"network profile '{base_member['name']}' on "
+                        "the Netskope Tenant, or select a different "
+                        "network profile in the action configuration, "
+                        "then re-run the action."
+                    ),
+                )
+                return (
+                    0,
+                    list(invalid_values) + list(valid_values),
+                    {},
+                    0,
+                )
+            # A member staged for deletion must never be written to or
+            # deployed - deploying it would apply the pending delete - so
+            # it is dropped from the writable group and its share rolls
+            # on to the next member. It still owns its name on the tenant
+            # until the delete is applied, though, so its number is kept
+            # in ``taken_numbers``: naming a new sibling from the
+            # writable members alone would pick a name that already
+            # exists and the create would come back 409.
+            taken_numbers = {member["number"] for member in members}
+            writable = []
+            skipped_members = []
+            for member in members:
+                if (
+                    member["status"]
+                    == NETWORK_PROFILE_STATUS_PENDING_DELETE
+                ):
+                    skipped_members.append(member["name"])
+                    continue
+                writable.append(member)
+            if skipped_members:
+                self.logger.info(
+                    message=(
+                        f"{self.log_prefix}: Skipping "
+                        f"{len(skipped_members)} network profile(s) in "
+                        f"the group '{base_name}' as they are staged "
+                        "for deletion on the Netskope Tenant."
+                    ),
+                    details=(
+                        "Skipped network profile(s): "
+                        + ", ".join(
+                            str(name) for name in skipped_members if name
+                        )
+                    ),
+                )
+            shared, not_applied, added_counts, already_present = (
+                self._append_network_profile_group(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    existing_profiles=existing_profiles,
+                    members=writable,
+                    taken_numbers=taken_numbers,
+                    base_name=base_name,
+                    values=valid_values,
+                    new_profile_description=new_profile_description,
+                    apply_pending_changes=apply_pending_changes,
+                    per_profile_limit=per_profile_limit,
+                    skip_excess_ips=skip_excess_ips,
+                )
+            )
+            self._compact_network_profile_group(
+                tenant_name=tenant_name,
+                headers=headers,
+                base_name=base_name,
+                per_profile_limit=per_profile_limit,
+                default_value=default_value,
+                apply_pending_changes=apply_pending_changes,
+            )
+            return (
+                shared,
+                list(invalid_values) + list(not_applied),
+                added_counts,
+                already_present,
+            )
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = (
+                "Error occurred while sharing IP values to the network "
+                f"profile group '{base_name}' on the Netskope Tenant."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {error_message} Error: {err}",
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+
+    def _append_network_profile_group(
+        self,
+        tenant_name: str,
+        headers: dict,
+        existing_profiles: Dict,
+        members: list,
+        base_name: str,
+        values: list,
+        new_profile_description: str,
+        apply_pending_changes: str,
+        per_profile_limit: Optional[int],
+        skip_excess_ips: str,
+        taken_numbers: Optional[set] = None,
+    ) -> tuple:
+        """Append values across a group, rolling over as members fill up.
+
+        De-duplicates the provided values against everything the group
+        already holds, then fills the existing members in order (base
+        first) and rolls the remainder into newly created siblings.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            existing_profiles (Dict): Every profile on the tenant.
+            members (list): Writable group members ordered by number.
+            base_name (str): Base profile name of the group.
+            values (list): Format-validated values to add.
+            new_profile_description (str): Description to apply.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on 409.
+            per_profile_limit (Optional[int]): Per-profile value limit.
+            skip_excess_ips (str): ``"Yes"`` to skip rather than create.
+            taken_numbers (Optional[set]): Every member number that
+                exists on the tenant, including members left out of
+                ``members`` because they are staged for deletion - those
+                still own their names until the delete is applied.
+                Defaults to the numbers in ``members``.
+
+        Returns:
+            tuple: ``(applied_count, not_applied, added_counts,
+                already_present)`` where ``applied_count`` counts only
+                the values actually written and ``already_present``
+                counts those the group already held. They are kept
+                apart so a caller can report each accurately.
+        """
+        # A value already on any member is not added again: the tenant
+        # allows duplicates, but re-adding burns capacity every sync and
+        # would eventually create siblings full of values already there.
+        # This plugin's placeholder is excluded, so it never matches; a
+        # comment the operator added is included but cannot match either,
+        # since a format-validated value is always an address.
+        present = set()
+        for member in members:
+            present.update(member["real_values"])
+        fresh = [value for value in values if value not in present]
+        already_present = len(values) - len(fresh)
+        if already_present:
+            self.logger.info(
+                f"{self.log_prefix}: Skipping {already_present} IP "
+                "value(s) that are already present on the network "
+                f"profile group '{base_name}'."
+            )
+        if not fresh:
+            # The count and the "nothing was added" outcome are both
+            # covered by the caller's summary, so there is no second
+            # line here - the log above already names the group.
+            return 0, [], {}, already_present
+        tenant_room, member_room, sibling_slots = (
+            self.netskope_helper._network_profile_group_capacity(
+                existing_profiles=existing_profiles,
+                members=members,
+                per_profile_limit=per_profile_limit,
+            )
+        )
+        added_counts = {}
+        not_applied = []
+        applied = 0
+        index = 0
+        # STEP 1 - fill the members that already exist, base first. The
+        # tenant budget is computed once and drawn down as values are
+        # placed, so it is never counted twice across members.
+        for position, member in enumerate(members):
+            if index >= len(fresh) or tenant_room <= 0:
+                break
+            take = min(
+                member_room[position], tenant_room, len(fresh) - index
+            )
+            if take <= 0:
+                continue
+            chunk = fresh[index:index + take]
+            index += take
+            member_applied, member_failed = (
+                self._append_network_profile_values(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    member=member,
+                    values=chunk,
+                    new_profile_description=new_profile_description,
+                    apply_pending_changes=apply_pending_changes,
+                )
+            )
+            applied += member_applied
+            not_applied.extend(member_failed)
+            if member_applied:
+                added_counts[member["name"]] = member_applied
+            tenant_room -= member_applied
+        remaining = fresh[index:]
+        # STEP 2 - roll the rest into new siblings.
+        if remaining:
+            not_placed, sibling_counts, sibling_applied = (
+                self._create_overflow_network_profiles(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    base_name=base_name,
+                    members=members,
+                    taken_numbers=(
+                        taken_numbers
+                        if taken_numbers is not None
+                        else {member["number"] for member in members}
+                    ),
+                    overflow_values=remaining,
+                    skip_excess_ips=skip_excess_ips,
+                    new_profile_description=new_profile_description,
+                    apply_pending_changes=apply_pending_changes,
+                    per_profile_limit=per_profile_limit,
+                    tenant_room=tenant_room,
+                    sibling_slots=sibling_slots,
+                )
+            )
+            applied += sibling_applied
+            not_applied.extend(not_placed)
+            added_counts.update(sibling_counts)
+        # The two counts are reported separately rather than summed: a
+        # duplicate is still a success for the record that supplied it
+        # (it never enters not_applied, so the record is not failed),
+        # but it was not written and must not be counted as added.
+        return applied, not_applied, added_counts, already_present
+
+    def _create_network_profile(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile_name: str,
+        description: str,
+        values: list,
+    ) -> tuple:
+        """Create a network profile holding the given values.
+
+        The values are already bounded by the caller's capacity maths, so
+        nothing is trimmed here. The create POST body is still bound by
+        the payload budget, so only the first chunk that fits is sent on
+        create and the remainder is appended on the values endpoint once
+        the profile id is known.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile_name (str): Name of the profile to create.
+            description (str): Description for the new profile.
+            values (list): Values the new profile must hold.
+
+        Returns:
+            tuple: ``(applied_count, not_applied, profile_id)``.
+
+        Raises:
+            NetworkProfileLimitReachedError: When the tenant refuses the
+                create because its profile limit is reached.
+            NetskopeException: On any other create failure.
+        """
+        budget = (
+            NETWORK_PROFILE_PAYLOAD_LIMIT
+            - NETWORK_PROFILE_PAYLOAD_SAFETY_BUFFER
+        )
+        base_overhead = len(
+            json.dumps(
+                {
+                    "name": profile_name,
+                    "description": description,
+                    "values": [],
+                }
+            ).encode("utf-8")
+        )
+        post_chunk, post_overflow = (
+            self.netskope_helper._split_values_within_budget(
+                values, base_overhead, budget
+            )
+        )
+        # A single value can never realistically exceed the budget; if
+        # the metadata pushed the first value just over, still send it so
+        # the profile is created with at least one value.
+        if not post_chunk and values:
+            post_chunk = [values[0]]
+            post_overflow = values[1:]
+        payload = {
+            "name": profile_name,
+            "description": description,
+            "values": post_chunk,
+        }
+        url = f"{tenant_name}{URLS.get('V2_NETWORK_PROFILE')}"
+        logger_msg = (
+            f"creating network profile '{profile_name}' on the "
+            "Netskope Tenant"
+        )
+        self.logger.info(
+            f"{self.log_prefix}: Creating network profile "
+            f"'{profile_name}' with {len(values)} "
+            "provided IP value(s) on the Netskope Tenant."
+        )
+        response = self.netskope_helper._api_call_helper(
+            url=url,
+            method="post",
+            error_codes=["CRE_1065", "CRE_1066"],
+            headers=headers,
+            json=payload,
+            proxies=self.proxy,
+            message=f"Error occurred while {logger_msg}",
+            logger_msg=logger_msg,
+            is_handle_error_required=False,
+        )
+        if response.status_code not in [200, 201]:
+            error_message = f"Error occurred while {logger_msg}."
+            response_text = str(response.text)
+            # A 403 is reused for "licensed feature not enabled", so the
+            # body has to be checked to tell a profile-count rejection
+            # apart from it.
+            lowered = response_text.lower()
+            if any(
+                marker in lowered
+                for marker in NETWORK_PROFILE_LIMIT_ERROR_MARKERS
+            ):
+                raise NetworkProfileLimitReachedError(response_text)
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} Received "
+                    f"exit code {response.status_code}."
+                ),
+                details=response_text,
+                resolution=(
+                    "Verify the profile name is unique and the values "
+                    "are valid IP values, then re-run the action."
+                ),
+            )
+            raise NetskopeException(error_message)
+        handle_status_code(
+            response,
+            error_code="CRE_1066",
+            custom_message=f"Error occurred while {logger_msg}",
+            plugin=self.log_prefix,
+            notify=False,
+            log=True,
+        )
+        not_applied = []
+        applied_count = len(post_chunk)
+        profile_id = ""
+        try:
+            profile_id = (response.json() or {}).get("id", "")
+        except Exception:
+            profile_id = ""
+        if post_overflow:
+            if not profile_id:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Could not determine the id "
+                        f"of the newly created network profile "
+                        f"'{profile_name}', so {len(post_overflow)} "
+                        "value(s) that did not fit the create request "
+                        "could not be added."
+                    ),
+                    resolution=(
+                        "Re-run the action to add the remaining values "
+                        "to the now-existing network profile."
+                    ),
+                )
+                not_applied.extend(post_overflow)
+            else:
+                failed_idx = self._append_network_value_batches(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    profile_id=profile_id,
+                    profile_name=profile_name,
+                    values=post_overflow,
+                    apply_pending_changes="No",
+                )
+                applied_count += len(post_overflow) - len(failed_idx)
+                not_applied.extend(
+                    post_overflow[i] for i in sorted(failed_idx)
+                )
+        self.logger.info(
+            f"{self.log_prefix}: Successfully created network "
+            f"profile '{profile_name}' with {applied_count} value(s)."
+        )
+        return applied_count, not_applied, profile_id
+
+    def _create_overflow_network_profiles(
+        self,
+        tenant_name: str,
+        headers: dict,
+        base_name: str,
+        members: list,
+        overflow_values: list,
+        skip_excess_ips: str,
+        new_profile_description: str,
+        apply_pending_changes: str,
+        per_profile_limit: Optional[int],
+        tenant_room: int,
+        sibling_slots: int,
+        taken_numbers: Optional[set] = None,
+    ) -> tuple:
+        """Place values that did not fit into newly created profiles.
+
+        Mirrors ``_create_overflow_siblings``. New profiles are numbered
+        past the highest number the group already uses, or named
+        ``base_name`` when the group does not exist yet.
+
+        The highest number comes from ``taken_numbers``, not from
+        ``members``: a member staged for deletion is left out of
+        ``members`` because it must not be written to, but it still holds
+        its name on the tenant until the delete is applied. Numbering
+        from ``members`` alone would reuse that name and the create would
+        be rejected with a 409, dropping the values.
+
+        ``skip_excess_ips`` gates **creating** profiles only. The base is
+        the action's primary target rather than a roll-over sibling, so
+        it is created even when the switch is on - the same rule the
+        private app action follows.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            base_name (str): Base profile name of the group.
+            members (list): Existing members ordered by number.
+            overflow_values (list): Values still to place, in order.
+            skip_excess_ips (str): ``"Yes"`` to skip instead of create.
+            new_profile_description (str): Description for new profiles.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on 409.
+            per_profile_limit (Optional[int]): Per-profile value limit.
+            tenant_room (int): Values the tenant can still hold.
+            sibling_slots (int): Profiles that may still be created.
+            taken_numbers (Optional[set]): Every member number the group
+                already occupies on the tenant, including members left
+                out of ``members`` because they are staged for deletion.
+                Defaults to the numbers in ``members``.
+
+        Returns:
+            tuple: ``(not_placed, added_counts, applied_count)``.
+        """
+        if not overflow_values:
+            return [], {}, 0
+        limit = (
+            per_profile_limit
+            if per_profile_limit is not None
+            else NETWORK_PROFILE_PER_PROFILE_LIMIT
+        )
+        added_counts = {}
+        applied_total = 0
+        # The base is created when the group does not exist yet; every
+        # other profile created here is a roll-over sibling.
+        base_needed = not members
+        if taken_numbers is None:
+            taken_numbers = {member["number"] for member in members}
+        next_number = (
+            max(taken_numbers) + 1 if taken_numbers else 2
+        )
+        pending = list(overflow_values)
+        created = 0
+        while pending:
+            if tenant_room <= 0:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: The tenant-wide network "
+                        "profile value limit of "
+                        f"{NETWORK_PROFILE_TENANT_TOTAL_LIMIT} has been "
+                        f"reached. Skipping {len(pending)} IP value(s) "
+                        f"for the network profile group '{base_name}'."
+                    ),
+                    resolution=(
+                        "Remove unused values or profiles on the "
+                        "Netskope Tenant to free up capacity, then "
+                        "re-run the action."
+                    ),
+                )
+                return pending, added_counts, applied_total
+            is_base = base_needed and created == 0
+            if skip_excess_ips == "Yes" and not is_base:
+                self.logger.info(
+                    f"{self.log_prefix}: 'Skip Excess IPs' is enabled; "
+                    f"skipping {len(pending)} excess IP value(s) that "
+                    "exceed the capacity of the existing network "
+                    f"profile(s) for '{base_name}'."
+                )
+                return pending, added_counts, applied_total
+            if sibling_slots <= 0:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Reached the tenant's "
+                        "maximum network profile limit of "
+                        f"{MAX_NETWORK_PROFILES} while creating "
+                        f"roll-over profiles for '{base_name}'. "
+                        f"Skipping {len(pending)} IP value(s) that "
+                        "could not be accommodated."
+                    ),
+                    resolution=(
+                        "Delete unused network profiles on the Netskope "
+                        "Tenant, then re-run the action."
+                    ),
+                )
+                return pending, added_counts, applied_total
+            take = min(limit, tenant_room, len(pending))
+            chunk = pending[:take]
+            if is_base:
+                profile_name = base_name
+            else:
+                profile_name = f"{base_name} {next_number}"
+                next_number += 1
+                if len(profile_name) > MAX_NETWORK_PROFILE_NAME_LENGTH:
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Cannot create the "
+                            f"roll-over network profile "
+                            f"'{profile_name}' as its name exceeds the "
+                            f"{MAX_NETWORK_PROFILE_NAME_LENGTH} "
+                            f"character limit. Skipping {len(pending)} "
+                            "IP value(s)."
+                        ),
+                        resolution=(
+                            "Use a shorter network profile name so the "
+                            "roll-over suffix fits, then re-run the "
+                            "action."
+                        ),
+                    )
+                    return pending, added_counts, applied_total
+                self.logger.info(
+                    f"{self.log_prefix}: Creating new network profile "
+                    f"'{profile_name}' to accommodate {len(chunk)} "
+                    "excess IP value(s) that exceed the capacity of the "
+                    f"existing network profile(s) for '{base_name}'."
+                )
+            try:
+                applied, not_applied, _ = self._create_network_profile(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    profile_name=profile_name,
+                    description=new_profile_description,
+                    values=chunk,
+                )
+            except NetworkProfileLimitReachedError as err:
+                # The markers that raised this only establish that *a*
+                # tenant limit was hit - the same "resource limit
+                # exceeded" phrasing covers a value limit too. Name the
+                # profile count only when the body actually says so,
+                # because "delete unused network profiles" is useless
+                # advice for a value-limit rejection.
+                detail_text = str(err)
+                lowered_detail = detail_text.lower()
+                is_profile_count_limit = any(
+                    re.search(pattern, lowered_detail)
+                    for pattern in NETWORK_PROFILE_COUNT_ERROR_PATTERNS
+                )
+                if is_profile_count_limit:
+                    limit_message = (
+                        f"{self.log_prefix}: Reached the tenant's "
+                        "maximum network profile limit while creating "
+                        f"roll-over profiles for '{base_name}'. "
+                        f"Skipping {len(pending)} IP value(s) that "
+                        "could not be accommodated."
+                    )
+                    limit_resolution = (
+                        "Delete unused network profiles on the Netskope "
+                        "Tenant, then re-run the action."
+                    )
+                else:
+                    limit_message = (
+                        f"{self.log_prefix}: The Netskope Tenant "
+                        "refused to create a roll-over network profile "
+                        f"for '{base_name}' because a tenant limit was "
+                        f"reached. Skipping {len(pending)} IP value(s) "
+                        "that could not be accommodated."
+                    )
+                    limit_resolution = (
+                        "Check the error details for the limit that was "
+                        "reached. If it is the number of network "
+                        "profiles, delete unused network profiles on "
+                        "the Netskope Tenant. If it is the number of IP "
+                        "values, reduce the values in use or contact "
+                        "Netskope support to raise the limit. Then "
+                        "re-run the action."
+                    )
+                self.logger.error(
+                    message=limit_message,
+                    details=detail_text,
+                    resolution=limit_resolution,
+                )
+                return pending, added_counts, applied_total
+            except NetskopeException as err:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Could not create the "
+                        f"network profile '{profile_name}'. Skipping "
+                        f"{len(pending)} IP value(s) that could not be "
+                        f"accommodated. Error: {err}"
+                    ),
+                    resolution=(
+                        "Verify the profile name is available on the "
+                        "Netskope Tenant, then re-run the action."
+                    ),
+                )
+                return pending, added_counts, applied_total
+            created += 1
+            sibling_slots -= 1
+            tenant_room -= applied
+            applied_total += applied
+            if applied:
+                added_counts[profile_name] = applied
+            pending = pending[take:]
+            if not_applied:
+                # Values the create could not write are not retried in a
+                # new profile: they failed for a reason a retry repeats.
+                return (
+                    list(not_applied) + pending,
+                    added_counts,
+                    applied_total,
+                )
+        return [], added_counts, applied_total
+
+    def _append_network_profile_values(
+        self,
+        tenant_name: str,
+        headers: dict,
+        member: dict,
+        values: list,
+        new_profile_description: str,
+        apply_pending_changes: str,
+    ) -> tuple:
+        """Add one member's share of the values to that member.
+
+        Two write shapes are possible and the cheaper one is preferred.
+        The by-id PATCH **replaces** the whole values array, so it has to
+        send back every value that was read - up to megabytes - and it
+        silently loses any change someone made between the read and the
+        write. ``op: append`` has neither problem but takes only
+        ``NETWORK_PROFILE_VALUES_PER_APPEND`` (10) values per call.
+
+        So a small batch goes through ``op: append``, and the by-id PATCH
+        is used when there are more values than that, when the
+        description has to change (the description rides on the by-id
+        PATCH), or when the member still holds this plugin's own
+        placeholder, which must be cleared out as the real values arrive.
+        An operator's own comment triggers none of that: it is a real
+        value here, so it is left in place and simply rewritten with the
+        rest.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            member (dict): Target member from the ordered group.
+            values (list): This member's share, already capacity-bounded.
+            new_profile_description (str): Desired description.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on 409.
+
+        Returns:
+            tuple: ``(applied_count, not_applied)``.
+        """
+        profile_id = member.get("id", "")
+        profile_name = member.get("name", "")
+        desc_changed = bool(new_profile_description) and (
+            new_profile_description != member.get("description", "")
+        )
+        has_placeholder = len(member["values"]) != len(
+            member["real_values"]
+        )
+        if (
+            not desc_changed
+            and not has_placeholder
+            and len(values) <= NETWORK_PROFILE_VALUES_PER_APPEND
+        ):
+            self.logger.info(
+                f"{self.log_prefix}: Appending {len(values)} provided "
+                f"IP value(s) to network profile '{profile_name}'."
+            )
+            failed_idx = self._append_network_value_batches(
+                tenant_name=tenant_name,
+                headers=headers,
+                profile_id=profile_id,
+                profile_name=profile_name,
+                values=values,
+                apply_pending_changes=apply_pending_changes,
+            )
+            not_applied = [values[i] for i in sorted(failed_idx)]
+            return len(values) - len(not_applied), not_applied
+        metadata_body = {}
+        if desc_changed:
+            metadata_body["description"] = new_profile_description
+        # The member's real values lead the array so they are preserved -
+        # including any comment the operator put there, which counts as a
+        # real value and must survive the rewrite. Only this plugin's own
+        # placeholder is dropped, since the member now holds real values
+        # again.
+        return self._write_network_profile_values(
+            tenant_name=tenant_name,
+            headers=headers,
+            profile_id=profile_id,
+            profile_name=profile_name,
+            metadata_body=metadata_body,
+            existing_values=member["real_values"],
+            new_values=values,
+            capacity_overflow_values=[],
+            apply_pending_changes=apply_pending_changes,
+            action_phrase="adding values to network profile",
+            success_verb="added values to",
+            limit_label="",
+        )
+
+    def _replace_network_profile_values(
+        self,
+        tenant_name: str,
+        headers: dict,
+        member: dict,
+        values: list,
+        new_profile_description: str,
+        apply_pending_changes: str,
+    ) -> tuple:
+        """Make one member hold exactly the given values.
+
+        The by-id PATCH replaces the whole values array, which is exactly
+        the semantics a replace needs, so there is no ``op: append``
+        shortcut here. Everything the member held is discarded, including
+        this plugin's placeholder and any comment the operator put there
+        - a replace means the member ends up holding exactly ``values``.
+        Compaction passes the member's real values through this, so a
+        comment is only lost where the caller genuinely intends to
+        overwrite the whole profile.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            member (dict): Target member from the ordered group.
+            values (list): The values this member must end up holding.
+            new_profile_description (str): Desired description.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on 409.
+
+        Returns:
+            tuple: ``(applied_count, not_applied)``.
+        """
+        metadata_body = {}
+        if new_profile_description and (
+            new_profile_description != member.get("description", "")
+        ):
+            metadata_body["description"] = new_profile_description
+        return self._write_network_profile_values(
+            tenant_name=tenant_name,
+            headers=headers,
+            profile_id=member.get("id", ""),
+            profile_name=member.get("name", ""),
+            metadata_body=metadata_body,
+            existing_values=[],
+            new_values=values,
+            capacity_overflow_values=[],
+            apply_pending_changes=apply_pending_changes,
+            action_phrase="replacing the values of network profile",
+            success_verb="replaced the values of",
+            limit_label="",
+        )
+
+    def _compact_network_profile_group(
+        self,
+        tenant_name: str,
+        headers: dict,
+        base_name: str,
+        per_profile_limit: Optional[int],
+        default_value: str,
+        apply_pending_changes: str,
+    ) -> None:
+        """Re-pack a group into the fewest profiles after an append.
+
+        A revert removes values in place, which leaves the group holding
+        partly filled members (``X``=20000, ``X 2``=4000, ``X 3``=1200)
+        or members reduced to this plugin's placeholder. This moves the
+        real values up into the lowest-numbered members and disposes of
+        the trailing ones, freeing profile slots out of
+        ``MAX_NETWORK_PROFILES``. An operator's comment travels with the
+        real values, since it occupies a value slot like any address.
+
+        It only runs when it would actually free a slot, so a group that
+        is already packed costs nothing beyond one fetch. The group is
+        only ever shrunk, never grown, and no real value is dropped.
+
+        Best effort: any failure is logged and swallowed, so a compaction
+        problem never fails the action that triggered it.
+
+        **Disposal ordering.** The re-pack moves values off the trailing
+        members before those members are disposed of, so a member is
+        removed only once every re-pack write has landed. If any write
+        fails the disposal is abandoned and no member is deleted - the
+        group keeps one profile slot more than it needs, which costs
+        nothing, whereas a half-applied re-pack would delete a member
+        whose values were never written anywhere else.
+
+        **This is an ordering guarantee, not atomicity.** Abandoning the
+        disposal leaves the *untouched* members exactly as they were
+        found, but it cannot undo a write that already landed. A single
+        member's rewrite is itself not atomic:
+        ``_write_network_profile_values`` sends a by-id PATCH that
+        **replaces** the whole value list, then appends whatever did not
+        fit the payload budget in batches of
+        ``NETWORK_PROFILE_VALUES_PER_APPEND``. If the PATCH lands and an
+        append batch then fails, that member has already been truncated
+        to the PATCH chunk, and any value in the failed tail that lived
+        only on that member is at that point on no profile at all.
+
+        **Extreme edge case - not reachable on any normal
+        configuration.** A rewrite only splits into PATCH-plus-appends
+        when the chunk exceeds the payload budget, and a chunk is
+        bounded by ``limit``. At the default per-profile limit of
+        ``NETWORK_PROFILE_PER_PROFILE_LIMIT`` (20000) a chunk is roughly
+        1.7 MB at ~80 chars/value, so it never splits: the rewrite is a
+        single PATCH and the truncation window does not exist at all.
+        Reaching it needs ``Network Profile Value Limit`` raised to
+        roughly 125000 or more (validation permits up to 300000), and a
+        single network profile holding 120000+ values is extremely rare
+        in practice. Bounding the compaction chunk to what fits one
+        by-id PATCH would close the window outright if that ever stops
+        being true.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            base_name (str): Base profile name of the group.
+            per_profile_limit (Optional[int]): Per-profile value limit.
+            default_value (str): Comment placeholder used when emptying.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on 409.
+        """
+        try:
+            limit = (
+                per_profile_limit
+                if per_profile_limit is not None
+                else NETWORK_PROFILE_PER_PROFILE_LIMIT
+            )
+            # Re-fetch: the append just mutated the group - it changed
+            # member value lists and may have created new siblings, so
+            # the caller's snapshot is stale.
+            #
+            # Only this group is needed (compaction never looks at
+            # tenant-wide totals), so the fetch is narrowed with
+            # ``filter=name co "<base>"``. Without it every profile on
+            # the tenant would be pulled back with its full values
+            # array, which near the 300000-value ceiling is a large read
+            # and a large amount of memory just to decide, most of the
+            # time, that there is nothing to compact.
+            existing_profiles = self._get_network_profiles(
+                is_values_required=True,
+                name_contains=base_name,
+            )
+            # ``co`` is a case-insensitive PARTIAL match, so this fetch
+            # also brings back profiles that merely contain the base name
+            # ('<base>-Legacy', 'My-<base>', '<BASE> 4'). Membership is
+            # decided here, by the anchored case-sensitive pattern in
+            # _ordered_network_profile_group - never by what the API
+            # chose to return.
+            members = [
+                member
+                for member in (
+                    self.netskope_helper._ordered_network_profile_group(
+                        existing_profiles, base_name, default_value
+                    )
+                )
+                if member["status"]
+                != NETWORK_PROFILE_STATUS_PENDING_DELETE
+            ]
+            if len(members) <= 1:
+                # A lone profile cannot be consolidated, and it stays as
+                # the group's anchor even when it holds nothing but this
+                # plugin's placeholder.
+                return
+            all_values = []
+            seen = set()
+            for member in members:
+                for value in member["real_values"]:
+                    if value not in seen:
+                        seen.add(value)
+                        all_values.append(value)
+            if not all_values:
+                # Nothing real to consolidate; the members are left as-is
+                # so the group keeps its anchor.
+                return
+            target_count = (len(all_values) + limit - 1) // limit
+            if len(members) <= target_count:
+                # Already using the minimum number of profiles, so there
+                # is no slot to reclaim. Skip to avoid needless churn.
+                return
+            self.logger.info(
+                f"{self.log_prefix}: Compacting network profile group "
+                f"'{base_name}' from {len(members)} profile(s) to "
+                f"{target_count} profile(s)."
+            )
+            chunks = [
+                all_values[index:index + limit]
+                for index in range(0, len(all_values), limit)
+            ]
+            # The re-pack is a shuffle, not a copy: a member's values are
+            # rewritten onto a lower-numbered member and the trailing
+            # members are then disposed of. Every write therefore has to
+            # be checked. _replace_network_profile_values reports a
+            # failure by returning it - it does not raise - so an
+            # unchecked call leaves the enclosing except blind to it.
+            repack_failed = False
+            for index, chunk in enumerate(chunks):
+                member = members[index]
+                if chunk == member["real_values"]:
+                    # Already holds exactly these values; skip the write.
+                    continue
+                _, not_written = self._replace_network_profile_values(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    member=member,
+                    values=chunk,
+                    new_profile_description="",
+                    apply_pending_changes=apply_pending_changes,
+                )
+                if not_written:
+                    # Stop at the first failure rather than carrying on:
+                    # a later chunk written successfully would overwrite
+                    # values the failed write was meant to carry, losing
+                    # them without any member being deleted at all.
+                    repack_failed = True
+                    break
+            if repack_failed:
+                # Compaction is an optimization - abandoning it costs a
+                # profile slot and nothing else. Removing the trailing
+                # members now would drop the values that never landed.
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Could not re-pack the "
+                        f"network profile group '{base_name}', so no "
+                        "network profile was removed. Every IP value "
+                        "the group held is still on the Netskope "
+                        "Tenant."
+                    ),
+                    resolution=(
+                        "Check the earlier error reported for this "
+                        "network profile group, then re-run the action "
+                        "to retry the consolidation."
+                    ),
+                )
+                return
+            for member in members[len(chunks):]:
+                self._remove_surplus_network_profile(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    member=member,
+                    is_base=member["number"] == 1,
+                    default_value=default_value,
+                    apply_pending_changes=apply_pending_changes,
+                    reason=(
+                        "as part of compacting the roll-over group "
+                        f"'{base_name}'"
+                    ),
+                )
+        except Exception as err:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Error occurred while compacting "
+                    f"the network profile group '{base_name}'. The "
+                    "values were shared successfully; only the cleanup "
+                    f"was skipped. Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+
+    def _write_network_profile_values(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile_id: str,
+        profile_name: str,
+        metadata_body: dict,
+        existing_values: list,
+        new_values: list,
+        capacity_overflow_values: list,
+        apply_pending_changes: str,
+        action_phrase: str,
+        success_verb: str,
+        limit_label: str,
+    ) -> tuple:
+        """Write a profile's value set, splitting at the payload budget.
+
+        Shared by the add path and by compaction's whole-profile rewrite
+        (the action itself has no Replace operation). The value set the
+        profile must end up holding is ``existing_values + new_values``
+        (``existing_values`` is empty for a compaction rewrite). The
+        leading chunk that fits the network profile by-id PATCH budget —
+        together with the ``metadata_body`` (``description`` when
+        changed) — is written with a single by-id PATCH (which
+        **replaces** the value list); whatever did not fit is then added
+        in batches of up to ``NETWORK_PROFILE_VALUES_PER_APPEND`` (10)
+        values on the values endpoint (``op: append``, which leaves the
+        already-written values in place). When the whole set fits the
+        budget this collapses to a single by-id PATCH.
+
+        Only the provided (``new_values``) values are attributed back to
+        action ids: a provided value is applied when it landed in the
+        PATCH chunk or in a batch that appended successfully. Existing
+        values that are re-sent only to preserve them are not attributed.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile_id (str): Id of the target profile.
+            profile_name (str): Name of the target profile (logging).
+            metadata_body (dict): Optional ``description`` to apply via
+                the by-id PATCH.
+            existing_values (list): Values already on the profile that
+                must be preserved (empty for replace).
+            new_values (list): Capacity-bounded provided values; the only
+                ones attributed back to action ids.
+            capacity_overflow_values (list): Provided values dropped for
+                capacity before this call; reported as not applied.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+            action_phrase (str): Present-participle phrase for in-progress
+                / error logs, e.g. ``"adding values to network
+                profile"``.
+            success_verb (str): Past-tense verb for the success summary,
+                e.g. ``"added values to"`` / ``"replaced the values of"``.
+            limit_label (str): Human-readable capacity limit description
+                used in the capacity-overflow part of the summary.
+
+        Returns:
+            tuple: ``(applied_count, not_applied)`` where ``applied_count``
+                is the number of provided values written and
+                ``not_applied`` is the list of provided values that could
+                not be written (capacity overflow, plus any payload batch
+                that was skipped/failed, or the whole provided set when
+                the by-id PATCH itself is skipped/failed).
+        """
+        budget = (
+            NETWORK_PROFILE_PAYLOAD_LIMIT
+            - NETWORK_PROFILE_PAYLOAD_SAFETY_BUFFER
+        )
+        combined = list(existing_values) + list(new_values)
+        new_offset = len(existing_values)
+        # The by-id PATCH body carries the metadata, so the first chunk
+        # must fit within the budget once the metadata overhead is
+        # accounted for.
+        patch_overhead = len(
+            json.dumps({**metadata_body, "values": []}).encode("utf-8")
+        )
+        patch_chunk, overflow = (
+            self.netskope_helper._split_values_within_budget(
+                combined, patch_overhead, budget
+            )
+        )
+        # A single value can never realistically exceed the budget; if
+        # the metadata pushed the first value just over, still send it in
+        # the PATCH (the API rejects a values-less PATCH).
+        if not patch_chunk and combined:
+            patch_chunk = [combined[0]]
+            overflow = combined[1:]
+        by_id_path = URLS.get("V2_NETWORK_PROFILE_BY_ID").format(
+            profile_id
+        )
+        by_id_url = f"{tenant_name}{by_id_path}"
+        patch_logger_msg = f"{action_phrase} '{profile_name}'"
+        if action_phrase.startswith("adding"):
+            self.logger.info(
+                f"{self.log_prefix}: Appending "
+                f"{len(new_values)} provided IP "
+                f"value(s) to network profile "
+                f"'{profile_name}'."
+            )
+        else:
+            self.logger.info(
+                f"{self.log_prefix}: Replacing the values "
+                f"of network profile '{profile_name}' "
+                f"with {len(new_values)} provided IP "
+                "value(s)."
+            )
+        if not self._send_network_request(
+            url=by_id_url,
+            headers=headers,
+            method="patch",
+            body={**metadata_body, "values": patch_chunk},
+            profile_id=profile_id,
+            profile_name=profile_name,
+            apply_pending_changes=apply_pending_changes,
+            logger_msg=patch_logger_msg,
+        ):
+            # The by-id PATCH itself was skipped or failed, so nothing was
+            # written: every provided value is reported not applied.
+            return 0, list(capacity_overflow_values) + list(new_values)
+        # Append whatever did not fit the PATCH on the values endpoint.
+        failed_overflow_idx = set()
+        if overflow:
+            payload_limit_mb = NETWORK_PROFILE_PAYLOAD_LIMIT // (1024 * 1024)
+            self.logger.info(
+                f"{self.log_prefix}: Payload limit ({payload_limit_mb} MB) "
+                f"reached for network profile '{profile_name}' API call. "
+                "Adding "
+                f"{len(patch_chunk)} of the {len(combined)} values to "
+                "the network profile in the initial API call. The "
+                f"remaining {len(overflow)} value(s) will be added via "
+                "the append values endpoint in batches of "
+                f"{NETWORK_PROFILE_VALUES_PER_APPEND}."
+            )
+            failed_overflow_idx = self._append_network_value_batches(
+                tenant_name=tenant_name,
+                headers=headers,
+                profile_id=profile_id,
+                profile_name=profile_name,
+                values=overflow,
+                apply_pending_changes=apply_pending_changes,
+            )
+        # Attribute applied vs not-applied for the provided values only.
+        patch_count = len(patch_chunk)
+        not_applied_new = []
+        for j, value in enumerate(new_values):
+            combined_index = new_offset + j
+            if combined_index < patch_count:
+                # Written by the by-id PATCH.
+                continue
+            if (combined_index - patch_count) in failed_overflow_idx:
+                not_applied_new.append(value)
+        applied_count = len(new_values) - len(not_applied_new)
+        not_applied = list(capacity_overflow_values) + not_applied_new
+        overflow_msg = ""
+        if capacity_overflow_values:
+            overflow_msg = (
+                f" Skipped {len(capacity_overflow_values)} value(s) that "
+                f"exceeded {limit_label} on the Netskope Tenant."
+            )
+        payload_skip_msg = ""
+        if not_applied_new:
+            payload_skip_msg = (
+                f" Could not add {len(not_applied_new)} value(s) to the "
+                "network profile; the append request was skipped or "
+                "failed."
+            )
+        self.logger.info(
+            f"{self.log_prefix}: Successfully {success_verb} network "
+            f"profile '{profile_name}' ({applied_count} provided "
+            f"value(s) applied).{overflow_msg}{payload_skip_msg}"
+        )
+        return applied_count, not_applied
+
+    def _append_network_value_batches(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile_id: str,
+        profile_name: str,
+        values: list,
+        apply_pending_changes: str,
+    ) -> set:
+        """Append values to a profile via the values endpoint in batches.
+
+        The values endpoint accepts at most
+        ``NETWORK_PROFILE_VALUES_PER_APPEND`` (10) values per call, so
+        ``values`` is split into batches of that many and each batch is
+        appended with a ``PATCH`` to the values endpoint
+        (``{"operation": {"op": "append", "values": [...]}}``), which
+        leaves the profile's existing values in place. (The payload size
+        budget applies only to the by-id PATCH / create POST that carry
+        the description, not to this append endpoint, which is bounded
+        by a value count.) Each batch reuses the shared 409
+        pending-changes deploy + retry handling. Best effort: a batch that
+        is skipped or fails is recorded and the remaining batches are
+        still attempted.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile_id (str): Id of the target profile.
+            profile_name (str): Name of the target profile (logging).
+            values (list): Values to append, in order.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+
+        Returns:
+            set: Indices (into ``values``) whose batch was skipped or
+                failed to append; empty when every batch succeeded.
+        """
+        values_path = URLS.get("V2_NETWORK_PROFILE_VALUES").format(
+            profile_id
+        )
+        values_url = f"{tenant_name}{values_path}"
+        batch_size = NETWORK_PROFILE_VALUES_PER_APPEND
+        total_batches = (len(values) + batch_size - 1) // batch_size
+        failed_idx = set()
+        for batch_index, start in enumerate(
+            range(0, len(values), batch_size), start=1
+        ):
+            batch = values[start:start + batch_size]
+            logger_msg = (
+                f"appending values to network profile "
+                f"'{profile_name}' (batch {batch_index} of "
+                f"{total_batches})"
+            )
+            try:
+                self.logger.info(
+                    f"{self.log_prefix}: Appending "
+                    f"{len(batch)} value(s) to network "
+                    f"profile '{profile_name}' "
+                    f"(batch {batch_index} of "
+                    f"{total_batches})."
+                )
+                if not self._send_network_request(
+                    url=values_url,
+                    headers=headers,
+                    method="patch",
+                    body={
+                        "operation": {
+                            "op": "append",
+                            "values": batch,
+                        }
+                    },
+                    profile_id=profile_id,
+                    profile_name=profile_name,
+                    apply_pending_changes=apply_pending_changes,
+                    logger_msg=logger_msg,
+                ):
+                    failed_idx.update(
+                        range(start, start + len(batch))
+                    )
+                    continue
+                self.logger.info(
+                    f"{self.log_prefix}: Successfully "
+                    f"appended {len(batch)} value(s) to "
+                    f"network profile '{profile_name}'"
+                    f" (batch {batch_index} of "
+                    f"{total_batches})."
+                )
+            except Exception as err:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Unexpected "
+                        "error while appending values to "
+                        f"network profile '{profile_name}'"
+                        f" (batch {batch_index} of "
+                        f"{total_batches}). Error: {err}"
+                    ),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
+                    resolution=(
+                        "Re-run the action to retry the "
+                        "failed values."
+                    ),
+                )
+                failed_idx.update(
+                    range(start, start + len(batch))
+                )
+        return failed_idx
+
+    def _remove_network_value_batches(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile_id: str,
+        profile_name: str,
+        values: list,
+        apply_pending_changes: str,
+    ) -> set:
+        """Remove values from a profile via the values endpoint.
+
+        The mirror image of ``_append_network_value_batches``: the values
+        endpoint takes at most ``NETWORK_PROFILE_VALUES_PER_APPEND`` (10)
+        values per call, so ``values`` is split into batches of that many
+        and each is sent with ``{"operation": {"op": "remove", ...}}``.
+
+        ``op: remove`` is used rather than a by-id PATCH because it only
+        sends the values being removed: it cannot overwrite values that
+        another still-matching record needs, and it has no payload size
+        problem. It also removes **every** matching entry, so duplicates
+        added by earlier runs are cleaned up in the same call.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile_id (str): Id of the target profile.
+            profile_name (str): Name of the target profile (logging).
+            values (list): Values to remove, in order.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+
+        Returns:
+            set: Indices (into ``values``) whose batch was skipped or
+                failed; empty when every batch succeeded.
+        """
+        values_path = URLS.get("V2_NETWORK_PROFILE_VALUES").format(
+            profile_id
+        )
+        values_url = f"{tenant_name}{values_path}"
+        batch_size = NETWORK_PROFILE_VALUES_PER_APPEND
+        total_batches = (len(values) + batch_size - 1) // batch_size
+        failed_idx = set()
+        for batch_index, start in enumerate(
+            range(0, len(values), batch_size), start=1
+        ):
+            batch = values[start:start + batch_size]
+            logger_msg = (
+                f"removing values from network profile "
+                f"'{profile_name}' (batch {batch_index} of "
+                f"{total_batches})"
+            )
+            try:
+                if not self._send_network_request(
+                    url=values_url,
+                    headers=headers,
+                    method="patch",
+                    body={
+                        "operation": {
+                            "op": "remove",
+                            "values": batch,
+                        }
+                    },
+                    profile_id=profile_id,
+                    profile_name=profile_name,
+                    apply_pending_changes=apply_pending_changes,
+                    logger_msg=logger_msg,
+                ):
+                    failed_idx.update(
+                        range(start, start + len(batch))
+                    )
+                    continue
+                self.logger.info(
+                    f"{self.log_prefix}: Successfully removed "
+                    f"{len(batch)} value(s) from network profile "
+                    f"'{profile_name}' (batch {batch_index} of "
+                    f"{total_batches})."
+                )
+            except Exception as err:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Unexpected error while "
+                        f"removing values from network profile "
+                        f"'{profile_name}' (batch {batch_index} of "
+                        f"{total_batches}). Error: {err}"
+                    ),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
+                    resolution=(
+                        "Re-run the revert to retry the failed values."
+                    ),
+                )
+                failed_idx.update(
+                    range(start, start + len(batch))
+                )
+        return failed_idx
+
+    def _delete_network_profile(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile: dict,
+        apply_pending_changes: str,
+        reason: str = "",
+    ) -> str:
+        """Delete a network profile by id.
+
+        Mirrors ``_delete_private_app`` but reports *why* a delete did
+        not happen, because the caller's fallback depends on it.
+
+        A ``409`` has two possible causes and the response body cannot be
+        used to tell them apart: the tenant does return
+        ``err_code`` ``60309`` for the referenced case, but that code is
+        not verified to be identical on every tenant, so nothing branches
+        on it. They are separated by state instead - the profile's own
+        ``status`` says whether it carries pending changes. A pending
+        profile is deployed and the delete retried once (when
+        ``Apply Pending Changes`` is ``Yes``); anything else, including a
+        second 409 after that retry, is reported as ``referenced``.
+
+        Deploying here is safe, unlike in the write paths: this flow
+        *wants* the profile gone, so applying a staged pending-delete
+        reaches the same end state.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile (dict): ``{name, id, status}`` of the profile.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+            reason (str): Trailing clause naming *why* this profile is
+                being deleted, appended to the logger phrase so an
+                error says which flow triggered it - this method is
+                reached both from the add action's compaction and from a
+                revert. Phrase it to follow "deleting the network
+                profile '<name>'", e.g. ``"as part of compacting the
+                roll-over group 'X'"``. Empty keeps the bare phrase.
+
+        Returns:
+            str: ``"deleted"`` (gone, a profile slot is freed),
+                ``"pending"`` (the tenant staged a pending-delete instead
+                of applying it), ``"referenced"`` (refused - a policy is
+                using it) or ``"failed"`` (any other error).
+        """
+        profile_id = profile.get("id", "")
+        profile_name = profile.get("name", "")
+        status = str(profile.get("status", "") or "")
+        if status == NETWORK_PROFILE_STATUS_PENDING_DELETE:
+            # Already staged for deletion; deleting again is pointless
+            # and deploying it is the caller's decision, not ours.
+            self.logger.debug(
+                f"{self.log_prefix}: Network profile '{profile_name}' is "
+                "already staged for deletion; skipping the delete call."
+            )
+            return "pending"
+        logger_msg = f"deleting the network profile '{profile_name}'"
+        if reason:
+            logger_msg = f"{logger_msg} {reason}"
+        url = (
+            f"{tenant_name}"
+            f"{URLS.get('V2_NETWORK_PROFILE_BY_ID').format(profile_id)}"
+        )
+        has_pending_changes = status.startswith("pending")
+        for attempt in range(2):
+            try:
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="delete",
+                    error_codes=["CRE_1071", "CRE_1072"],
+                    headers=headers,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {logger_msg}",
+                    logger_msg=logger_msg,
+                    is_handle_error_required=False,
+                )
+            except Exception as err:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        f"{logger_msg}. Error: {err}"
+                    ),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
+                )
+                return "failed"
+            if response.status_code in [200, 201, 204]:
+                self.logger.info(
+                    f"{self.log_prefix}: Successfully deleted the "
+                    f"network profile '{profile_name}' from the "
+                    "Netskope Tenant."
+                )
+                return "deleted"
+            if response.status_code == 202:
+                # The tenant staged the delete instead of applying it.
+                # The profile now reports status "pending-delete", so a
+                # later run must skip it and must never deploy it.
+                self.logger.info(
+                    f"{self.log_prefix}: The Netskope Tenant staged the "
+                    f"deletion of network profile '{profile_name}' as a "
+                    "pending change instead of applying it. The profile "
+                    "will be skipped by later runs until the pending "
+                    "change is applied on the tenant."
+                )
+                return "pending"
+            if response.status_code == 404:
+                self.logger.debug(
+                    f"{self.log_prefix}: Network profile "
+                    f"'{profile_name}' no longer exists on the Netskope "
+                    "Tenant; nothing to delete."
+                )
+                return "deleted"
+            if response.status_code == 409:
+                if (
+                    has_pending_changes
+                    and apply_pending_changes == "Yes"
+                    and attempt == 0
+                ):
+                    self.logger.info(
+                        f"{self.log_prefix}: Pending changes detected "
+                        f"for network profile '{profile_name}' while "
+                        "deleting it. Applying pending changes and "
+                        "retrying the delete."
+                    )
+                    if self._deploy_network_profile([profile_id]):
+                        continue
+                # Not a pending conflict we can clear, so a policy is
+                # using this profile. The caller decides the fallback.
+                self.logger.debug(
+                    f"{self.log_prefix}: Delete of network profile "
+                    f"'{profile_name}' was refused with a conflict; "
+                    "treating it as referenced by a policy.",
+                )
+                return "referenced"
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Unable to delete the network "
+                    f"profile '{profile_name}'. Received exit code "
+                    f"{response.status_code}."
+                ),
+                details=str(response.text),
+            )
+            return "failed"
+        return "referenced"
+
+    def _empty_network_profile(
+        self,
+        tenant_name: str,
+        headers: dict,
+        profile: dict,
+        default_value: str,
+        apply_pending_changes: str,
+    ) -> bool:
+        """Reset a profile so it holds nothing but a comment placeholder.
+
+        Used when a profile must stop matching traffic but cannot be
+        removed - the base profile (never deleted, because the action
+        parameters point at it by name) and a sibling whose delete the
+        tenant refused.
+
+        The placeholder is a ``#``-prefixed comment rather than an IP
+        address on purpose: a profile that could not be deleted is one a
+        policy is still using, and writing any real address - even a
+        loopback - would make that policy start matching traffic.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            profile (dict): ``{name, id}`` of the profile to empty.
+            default_value (str): Comment placeholder to write.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+
+        Returns:
+            bool: True when the profile was reset.
+        """
+        profile_id = profile.get("id", "")
+        profile_name = profile.get("name", "")
+        placeholder = (
+            default_value or NETWORK_PROFILE_EMPTY_PLACEHOLDER
+        ).strip()
+        by_id_path = URLS.get("V2_NETWORK_PROFILE_BY_ID").format(
+            profile_id
+        )
+        return self._send_network_request(
+            url=f"{tenant_name}{by_id_path}",
+            headers=headers,
+            method="patch",
+            body={"values": [placeholder]},
+            profile_id=profile_id,
+            profile_name=profile_name,
+            apply_pending_changes=apply_pending_changes,
+            logger_msg=f"emptying the network profile '{profile_name}'",
+        )
+
+    def _remove_surplus_network_profile(
+        self,
+        tenant_name: str,
+        headers: dict,
+        member: dict,
+        is_base: bool,
+        default_value: str,
+        apply_pending_changes: str,
+        reason: str = "",
+    ) -> bool:
+        """Dispose of a group member that should no longer hold values.
+
+        Mirrors ``_remove_surplus_private_app``: try the delete, and fall
+        back to a harmless state when the tenant refuses.
+
+        The **base is never deleted**. The action parameters name it, so
+        deleting it would make the next sync fail with "network profile
+        could not be found" and mark every record failed. It is emptied
+        instead.
+
+        A refused delete is expected to be the *normal* path rather than
+        a rare one - these profiles exist so that policies can use them,
+        and a referenced profile cannot be deleted.
+
+        Args:
+            tenant_name (str): Netskope tenant base URL.
+            headers (dict): Request headers including the API token.
+            member (dict): ``{name, id, status}`` of the member.
+            is_base (bool): True when this member is the group's base.
+            default_value (str): Comment placeholder used when emptying.
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+            reason (str): Trailing clause naming why the member is being
+                disposed of, passed through to the delete's logger
+                phrase. See ``_delete_network_profile``.
+
+        Returns:
+            bool: True when the member was deleted or emptied, False when
+                it may still hold stale values.
+        """
+        profile_name = member.get("name", "")
+        if not is_base:
+            outcome = self._delete_network_profile(
+                tenant_name=tenant_name,
+                headers=headers,
+                profile=member,
+                apply_pending_changes=apply_pending_changes,
+                reason=reason,
+            )
+            if outcome in ["deleted", "pending"]:
+                return True
+            if outcome == "referenced":
+                if self._empty_network_profile(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    profile=member,
+                    default_value=default_value,
+                    apply_pending_changes=apply_pending_changes,
+                ):
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Unable to delete the "
+                            f"network profile '{profile_name}' as it is "
+                            "being referenced in a policy on the "
+                            "Netskope Tenant. Its values have been "
+                            "removed instead, so it no longer matches "
+                            "any traffic."
+                        ),
+                        resolution=(
+                            f"The network profile '{profile_name}' is "
+                            "being referenced in a policy. To delete "
+                            "this profile, remove it from the policy on "
+                            "the Netskope Tenant and then delete the "
+                            "profile manually."
+                        ),
+                    )
+                    return True
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Unable to delete or empty "
+                        f"the network profile '{profile_name}'. It may "
+                        "still hold stale IP value(s)."
+                    ),
+                    resolution=(
+                        f"Remove the network profile '{profile_name}' "
+                        "from any policy referencing it on the Netskope "
+                        "Tenant, then delete the profile manually."
+                    ),
+                )
+                return False
+            # "failed" - the delete errored for some other reason. Still
+            # try to empty it so no stale values are left behind.
+        if self._empty_network_profile(
+            tenant_name=tenant_name,
+            headers=headers,
+            profile=member,
+            default_value=default_value,
+            apply_pending_changes=apply_pending_changes,
+        ):
+            self.logger.info(
+                f"{self.log_prefix}: Removed all IP value(s) from "
+                f"network profile '{profile_name}'."
+            )
+            return True
+        self.logger.error(
+            message=(
+                f"{self.log_prefix}: Unable to remove the IP value(s) "
+                f"from network profile '{profile_name}'. It may still "
+                "hold stale IP value(s)."
+            ),
+            resolution=(
+                "Verify the profile is editable on the Netskope Tenant "
+                "and re-run the action."
+            ),
+        )
+        return False
+
+    def _send_network_request(
+        self,
+        url: str,
+        headers: dict,
+        method: str,
+        body: dict,
+        profile_id: str,
+        profile_name: str,
+        apply_pending_changes: str,
+        logger_msg: str,
+    ) -> bool:
+        """Send a network profile write, handling pending changes.
+
+        The single request primitive shared by the by-id PATCH and the
+        values-endpoint append. A 409 pending-changes response triggers a
+        deploy + retry once when ``apply_pending_changes`` is ``"Yes"``;
+        otherwise it is logged and skipped.
+
+        Args:
+            url (str): Fully built request URL.
+            headers (dict): Request headers including the API token.
+            method (str): HTTP method (``"patch"``).
+            body (dict): Request body.
+            profile_id (str): Id of the target profile (used for the
+                deploy call on a 409).
+            profile_name (str): Name of the target profile (logging).
+            apply_pending_changes (str): ``"Yes"`` to auto-deploy on a
+                409, else ``"No"``.
+            logger_msg (str): Present-participle phrase for error logs,
+                e.g. ``"adding values to network profile 'X'"``.
+
+        Returns:
+            bool: ``True`` on a 2xx response, ``False`` when the request
+                is skipped (pending changes not applied) or fails.
+        """
+        for attempt in range(2):
+            response = self.netskope_helper._api_call_helper(
+                url=url,
+                method=method,
+                error_codes=["CRE_1065", "CRE_1066"],
+                headers=headers,
+                json=body,
+                proxies=self.proxy,
+                message=f"Error occurred while {logger_msg}",
+                logger_msg=logger_msg,
+                is_handle_error_required=False,
+            )
+            response_text = (
+                response.text
+                if hasattr(response, "text")
+                else str(response)
+            )
+            if (
+                response.status_code == 409
+                and PENDING_CHANGES_DETECTED in response_text
+            ):
+                if apply_pending_changes == "Yes" and attempt == 0:
+                    self.logger.info(
+                        f"{self.log_prefix}: Pending changes detected "
+                        f"for network profile '{profile_name}'. "
+                        "Applying pending changes and retrying."
+                    )
+                    if self._deploy_network_profile([profile_id]):
+                        continue
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Could not apply "
+                            f"pending changes for network profile "
+                            f"'{profile_name}'. Skipping action execution."
+                        ),
+                        details=response_text,
+                    )
+                    return False
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Pending changes detected "
+                        f"for network profile '{profile_name}'. "
+                        "Skipping action execution."
+                    ),
+                    resolution=(
+                        "Set 'Apply Pending Changes' to 'Yes' in the "
+                        "action configuration, or manually apply the "
+                        "pending changes for network profile "
+                        f"'{profile_name}' from the Netskope Tenant "
+                        "UI, then re-run the action."
+                    ),
+                    details=response_text,
+                )
+                return False
+            if response.status_code not in [200, 201]:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        f"{logger_msg}. Received exit code "
+                        f"{response.status_code}."
+                    ),
+                    details=response_text,
+                    resolution=(
+                        "Verify the values are valid IP values and the "
+                        "profile capacity is not exceeded, then re-run "
+                        "the action."
+                    ),
+                )
+                return False
+            handle_status_code(
+                response,
+                error_code="CRE_1066",
+                custom_message=f"Error occurred while {logger_msg}",
+                plugin=self.log_prefix,
+                notify=False,
+                log=False,
+            )
+            return True
+        return False
+
+    def _get_dns_profiles(self) -> Dict:
+        """Fetch DNS profiles from the Netskope Tenant.
+
+        Paginates through ``GET /api/v2/profiles/dns`` requesting only
+        the ``id`` and ``name`` fields and returns a mapping of profile
+        name to profile id, suitable for building action dropdowns.
+
+        Returns:
+            Dict: Mapping of DNS profile name to its id.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{URLS.get('V2_DNS_PROFILE')}"
+        profiles = {}
+        offset = 0
+        limit = 150
+        page_number = 1
+        params = {
+            "offset": offset,
+            "limit": limit,
+            # No space after the comma in the fields query parameter
+            # else the Netskope API returns an error.
+            "fields": "id,name",
+        }
+        logger_msg = "fetching DNS profiles from the Netskope Tenant"
+        self.logger.debug(f"{self.log_prefix}: {logger_msg.capitalize()}.")
+        try:
+            # Drive the loop off the page size: stop once a page returns
+            # fewer than ``limit`` items and advance the offset by the
+            # count actually returned, so a missing total cannot cause an
+            # early stop or an infinite loop.
+            while True:
+                page_msg = f"{logger_msg} for page {page_number}"
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="get",
+                    error_codes=["CRE_1063", "CRE_1064"],
+                    headers=headers,
+                    params=params,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {page_msg}",
+                    logger_msg=page_msg,
+                )
+                dns_profiles = response.get("profiles", [])
+                for dns_profile in dns_profiles:
+                    profile_name = dns_profile.get("name", "")
+                    profile_id = dns_profile.get("id")
+                    if profile_name and profile_id:
+                        profiles[profile_name] = profile_id
+                if len(dns_profiles) < limit:
+                    break
+                offset += len(dns_profiles)
+                params["offset"] = offset
+                page_number += 1
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+        self.logger.debug(
+            f"{self.log_prefix}: Successfully fetched {len(profiles)} "
+            "DNS profile(s) from the Netskope Tenant."
+        )
+        return profiles
+
+    def _get_dns_profile_by_name(self, name: str) -> Dict:
+        """Fetch a single DNS profile by its name.
+
+        Args:
+            name (str): Name of the DNS profile to look up.
+
+        Returns:
+            Dict: The full DNS profile object as returned by the API,
+            or an empty dict if no profile with that name exists.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{URLS.get('V2_DNS_PROFILE')}"
+        params = {
+            "filter": f'name eq "{name}"',
+            "offset": 0,
+            "limit": 150,
+            # No space after the comma in the fields query parameter
+            # else the Netskope API returns an error.
+            "fields": "id,name,description,domain_config,status",
+        }
+        logger_msg = (
+            f"fetching DNS profile '{name}' from the Netskope Tenant"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)}."
+        )
+        try:
+            response = self.netskope_helper._api_call_helper(
+                url=url,
+                method="get",
+                error_codes=["CRE_1063", "CRE_1064"],
+                headers=headers,
+                params=params,
+                proxies=self.proxy,
+                message=f"Error occurred while {logger_msg}",
+                logger_msg=logger_msg,
+            )
+            for profile in response.get("profiles", []):
+                if profile.get("name") == name:
+                    return profile
+            return {}
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+
+    def _get_security_categories(self) -> List[str]:
+        """Fetch DNS security categories from the Netskope Tenant.
+
+        Paginates through ``GET /api/v2/profiles/dns/domaincategories``,
+        keeps only categories whose ``category_type`` is ``security``
+        and expands each into ``"<name> (Block)"`` and
+        ``"<name> (Sinkhole)"`` choices for the action dropdown.
+
+        Returns:
+            List[str]: Expanded security category choice strings.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{URLS.get('V2_DNS_DOMAIN_CATEGORIES')}"
+        categories = []
+        offset = 0
+        limit = 150
+        page_number = 1
+        logger_msg = (
+            "fetching DNS security categories from the Netskope Tenant"
+        )
+        self.logger.debug(f"{self.log_prefix}: {logger_msg.capitalize()}.")
+        try:
+            # Drive the loop off the page size: stop once a page returns
+            # fewer than ``limit`` items and advance the offset by the
+            # count actually returned.
+            while True:
+                page_msg = f"{logger_msg} for page {page_number}"
+                params = {
+                    "offset": offset,
+                    "limit": limit,
+                    "sortby": "name",
+                    "sortorder": "asc",
+                }
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="get",
+                    error_codes=["CRE_1063", "CRE_1064"],
+                    headers=headers,
+                    params=params,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {page_msg}",
+                    logger_msg=page_msg,
+                )
+                domain_categories = response.get("domaincategories", [])
+                for category in domain_categories:
+                    category_name = category.get("name", "")
+                    category_type = category.get(
+                        "category_type", ""
+                    ).lower()
+                    if category_name and category_type == "security":
+                        categories.extend(
+                            [
+                                f"{category_name} (Block)",
+                                f"{category_name} (Sinkhole)",
+                            ]
+                        )
+                if len(domain_categories) < limit:
+                    break
+                offset += len(domain_categories)
+                page_number += 1
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+        self.logger.debug(
+            f"{self.log_prefix}: Successfully fetched "
+            f"{len(categories)} DNS security category choice(s) "
+            "from the Netskope Tenant."
+        )
+        return categories
+
+    def _get_record_types(self) -> List[str]:
+        """Fetch DNS record types from the Netskope Tenant.
+
+        Paginates through ``GET /api/v2/profiles/dns/recordtypes`` and
+        returns the list of record type names for the action dropdown.
+
+        Returns:
+            List[str]: List of DNS record type names.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{URLS.get('V2_DNS_RECORD_TYPES')}"
+        record_types = []
+        offset = 0
+        limit = 150
+        page_number = 1
+        logger_msg = (
+            "fetching DNS record types from the Netskope Tenant"
+        )
+        self.logger.debug(f"{self.log_prefix}: {logger_msg.capitalize()}.")
+        try:
+            # Drive the loop off the page size: stop once a page returns
+            # fewer than ``limit`` items and advance the offset by the
+            # count actually returned.
+            while True:
+                page_msg = f"{logger_msg} for page {page_number}"
+                params = {
+                    "offset": offset,
+                    "limit": limit,
+                    "sortby": "name",
+                    "sortorder": "asc",
+                }
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="get",
+                    error_codes=["CRE_1063", "CRE_1064"],
+                    headers=headers,
+                    params=params,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {page_msg}",
+                    logger_msg=page_msg,
+                )
+                elements = response.get("recordtypes", [])
+                for record_type in elements:
+                    record_type_name = record_type.get("name", "")
+                    if record_type_name:
+                        record_types.append(record_type_name)
+                if len(elements) < limit:
+                    break
+                offset += len(elements)
+                page_number += 1
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+        self.logger.debug(
+            f"{self.log_prefix}: Successfully fetched "
+            f"{len(record_types)} DNS record type(s) from the "
+            "Netskope Tenant."
+        )
+        return record_types
+
+    def _parse_security_categories(
+        self, raw_categories: List[str]
+    ) -> List[Dict]:
+        """Parse '<name> (Block|Sinkhole)' strings into payload dicts.
+
+        Args:
+            raw_categories (List[str]): Selected category choice
+                strings of the form ``"<name> (Block)"`` or
+                ``"<name> (Sinkhole)"``.
+
+        Returns:
+            List[Dict]: A list of ``{"name": ..., "action": ...}``
+            dicts, one per input string that matches the expected
+            format. Strings that don't match are skipped silently.
+        """
+        pattern = re.compile(
+            r"^(?P<name>.+?)\s*\((?P<action>Block|Sinkhole)\)$"
+        )
+        parsed: List[Dict] = []
+        for category in raw_categories:
+            match = pattern.match(category)
+            if not match:
+                continue
+            parsed.append(
+                {
+                    "name": match.group("name").strip(),
+                    "action": match.group("action"),
+                }
+            )
+        return parsed
+
+    def _push_dns_profile(
+        self,
+        domains: List[str],
+        existing_profile_name: str,
+        new_profile_name: str,
+        action_type: str,
+        action_params: Dict,
+        operation: str = "append",
+    ) -> int:
+        """Share domains to a DNS profile on the Netskope Tenant.
+
+        When ``existing_profile_name`` is ``"create"`` a new profile
+        is created (POST) carrying the profile config and as many of
+        the resolved ``domains`` as fit under the payload budget. When
+        an existing profile is selected, a minimal-diff PATCH body is
+        built and the new domains are packed into the matching list
+        under the same budget. Domains that are not properly formatted
+        (``REGEX_FOR_DOMAIN``) or exceed the RFC length limits are
+        validated out and reported before sharing; domains dropped
+        because they exceed the ``DNS_PROFILE_PAYLOAD_LIMIT`` are
+        likewise reported and skipped.
+
+        Args:
+            domains (List[str]): Resolved, de-duplicated domain names
+                to share to the profile.
+            existing_profile_name (str): Selected profile name, or the
+                literal ``"create"`` to create a new profile.
+            new_profile_name (str): Name to use when creating a profile.
+            action_type (str): ``add_to_allow_list`` or
+                ``add_to_block_list``.
+            action_params (Dict): Resolved action parameters.
+
+        Returns:
+            tuple: ``(shared_count, not_applied)`` where ``shared_count``
+                is the count of domains successfully shared to the
+                profile and ``not_applied`` is the list of domains that
+                were not applied — those dropped as invalid/over-length
+                and those skipped because the payload size budget was
+                exhausted. Used by the bulk caller to attribute unshared
+                domains back to their originating action ids.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        # The DNS profile endpoint only accepts properly formatted
+        # domains. Since values arrive directly from the action's
+        # Static/Source field (not as typed indicators), validate each
+        # against the domain format regex and the RFC length limits
+        # before sharing; malformed entries are dropped and reported.
+        valid_domains = []
+        invalid_domains = []
+        for domain in domains:
+            if not domain:
+                continue
+            if (
+                re.match(REGEX_FOR_DOMAIN, domain)
+                and self.netskope_helper.is_valid_domain_length(domain)
+            ):
+                valid_domains.append(domain)
+            else:
+                invalid_domains.append(domain)
+        if invalid_domains:
+            self.logger.info(
+                f"{self.log_prefix}: Skipping {len(invalid_domains)} "
+                "value(s) as they were either not domains or were of "
+                "invalid format, and therefore cannot be added to the "
+                "DNS profile."
+            )
+        if not valid_domains:
+            self.logger.info(
+                f"{self.log_prefix}: No valid domains to share to the "
+                "DNS profile. Skipping action execution."
+            )
+            return 0, list(invalid_domains)
+        if action_type == "add_to_allow_list":
+            list_key = "allow_list"
+            list_key_label = "allowlist"
+        elif action_type == "add_to_block_list":
+            list_key = "block_list"
+            list_key_label = "blocklist"
+        else:
+            error_message = (
+                f"Invalid action type '{action_type}'. Valid values "
+                "are 'add_to_allow_list' or 'add_to_block_list'."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {error_message}",
+                resolution=(
+                    "Re-run the action with a valid Action Type "
+                    "selection."
+                ),
+            )
+            raise NetskopeException(error_message)
+        security_categories = self._parse_security_categories(
+            action_params.get("dns_security_categories", [])
+        )
+        try:
+            if existing_profile_name == "create":
+                profile_name = new_profile_name
+                existing_profile = self._get_dns_profile_by_name(
+                    profile_name
+                )
+                # Re-running the action with the same parameters would
+                # otherwise attempt to create a duplicate profile, which
+                # the API rejects with an "already exists" error. If a
+                # profile with the requested name already exists, share
+                # the domains to it instead of creating a new one.
+                if existing_profile:
+                    self.logger.info(
+                        f"{self.log_prefix}: DNS profile "
+                        f"'{profile_name}' already exists on the "
+                        "Netskope Tenant; adding domains to the "
+                        "existing profile instead of creating a new one."
+                    )
+                    body = self.netskope_helper._build_dns_patch_body(
+                        existing_profile=existing_profile,
+                        action_params=action_params,
+                        action_type=action_type,
+                        operation=operation,
+                        security_categories=security_categories,
+                    )
+                    method = "patch"
+                    profile_path = URLS.get(
+                        "V2_DNS_PROFILE_BY_ID"
+                    ).format(existing_profile.get("id"))
+                    url = f"{tenant_name}{profile_path}"
+                    log_action = (
+                        f"updating DNS profile '{profile_name}' on the "
+                        "Netskope Tenant"
+                    )
+                else:
+                    body = self.netskope_helper._build_dns_create_body(
+                        profile_name=profile_name,
+                        action_params=action_params,
+                        action_type=action_type,
+                        security_categories=security_categories,
+                    )
+                    method = "post"
+                    url = f"{tenant_name}{URLS.get('V2_DNS_PROFILE')}"
+                    log_action = (
+                        f"creating DNS profile '{profile_name}' on the "
+                        "Netskope Tenant"
+                    )
+            else:
+                profile_name = existing_profile_name
+                existing_profile = self._get_dns_profile_by_name(
+                    profile_name
+                )
+                if not existing_profile:
+                    error_message = (
+                        f"DNS profile '{profile_name}' could not be "
+                        "found on the Netskope Tenant."
+                    )
+                    self.logger.error(
+                        message=f"{self.log_prefix}: {error_message}",
+                        resolution=(
+                            "Verify the DNS profile still exists on the "
+                            "Netskope Tenant and re-run the action."
+                        ),
+                    )
+                    raise NetskopeException(error_message)
+                body = self.netskope_helper._build_dns_patch_body(
+                    existing_profile=existing_profile,
+                    action_params=action_params,
+                    action_type=action_type,
+                    operation=operation,
+                    security_categories=security_categories,
+                )
+                method = "patch"
+                profile_path = URLS.get(
+                    "V2_DNS_PROFILE_BY_ID"
+                ).format(existing_profile.get("id"))
+                url = f"{tenant_name}{profile_path}"
+                log_action = (
+                    f"updating DNS profile '{profile_name}' on the "
+                    "Netskope Tenant"
+                )
+            budget = (
+                DNS_PROFILE_PAYLOAD_LIMIT
+                - DNS_PROFILE_PAYLOAD_SAFETY_BUFFER
+            )
+            accepted, skipped = self.netskope_helper._pack_domains_within_budget(
+                body=body,
+                list_key=list_key,
+                candidate_domains=valid_domains,
+                budget_bytes=budget,
+            )
+            # In the patch flow, if the packer accepted zero candidates
+            # and the trailing target entry has no domains, drop it so
+            # the patch body never carries a meaningless empty entry.
+            if method == "patch":
+                list_entries = body.get("domain_config", {}).get(
+                    list_key, []
+                )
+                if list_entries and not list_entries[-1].get(
+                    "domain_names"
+                ):
+                    list_entries.pop()
+            if not accepted:
+                self.logger.info(
+                    f"{self.log_prefix}: DNS profile API payload size "
+                    f"limit reached for {list_key_label} before any "
+                    f"domains could be added; skipping all "
+                    f"{len(skipped)} domain(s)."
+                )
+                return 0, list(invalid_domains) + list(skipped)
+            self.logger.info(
+                f"{self.log_prefix}: Out of {len(valid_domains)} "
+                f"domain(s), attempting to share {len(accepted)} "
+                f"domain(s) to {list_key_label} of DNS profile "
+                f"'{profile_name}'. Skipping {len(skipped)} domain(s) "
+                "due to exceeding the DNS profile API payload size "
+                f"limit of {DNS_PROFILE_PAYLOAD_LIMIT / (1024 * 1024)}"
+                " MB."
+            )
+            self.netskope_helper._api_call_helper(
+                url=url,
+                method=method,
+                error_codes=["CRE_1063", "CRE_1064"],
+                headers=headers,
+                json=body,
+                proxies=self.proxy,
+                message=f"Error occurred while {log_action}",
+                logger_msg=log_action,
+            )
+        except NetskopeException:
+            raise
+        except Exception as err:
+            profile_name = (
+                new_profile_name
+                if existing_profile_name == "create"
+                else existing_profile_name
+            )
+            error_message = (
+                "Unexpected error occurred while sharing domains to the DNS "
+                f"profile '{profile_name}'."
+            )
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+        self.logger.info(
+            f"{self.log_prefix}: Successfully added {len(accepted)} "
+            f"domain(s) to {list_key_label} of DNS profile "
+            f"'{profile_name}' on the Netskope Tenant."
+        )
+        return len(accepted), list(invalid_domains) + list(skipped)
+
+    def _get_service_profiles(
+        self,
+        custom_only: bool = True,
+        name: str = None,
+    ) -> Dict:
+        """Fetch service profiles from the Netskope Tenant.
+
+        Paginates through ``GET /api/v2/profiles/serviceobjects``
+        requesting the ``id``, ``name``, ``type``, ``protocols`` and
+        ``description`` fields and returns a mapping of profile name to
+        its full metadata. When ``custom_only`` is True only profiles whose
+        ``type`` equals ``CUSTOM`` (compared case-insensitively, since
+        the list endpoint returns ``CUSTOM``/``PREDEFINED`` while the
+        create endpoint returns lowercase) are kept, because only
+        CUSTOM service profiles are editable. An optional ``name``
+        narrows the listing to a single profile via the API's exact
+        ``name eq`` filter.
+
+        Args:
+            custom_only (bool): When True, keep only ``CUSTOM`` (i.e.
+                editable) service profiles. Defaults to True.
+            name (str): When provided, fetch only the profile with this
+                exact name. Defaults to None.
+
+        Returns:
+            Dict: Mapping of service profile name to its metadata
+                (id, name, type, protocols).
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = f"{tenant_name}{V2_SERVICE_PROFILE}"
+        profiles = {}
+        offset = 0
+        limit = SERVICE_PROFILE_PAGE_SIZE
+        page_number = 1
+        logger_msg = (
+            "fetching service profiles from the Netskope Tenant"
+        )
+        if name:
+            logger_msg = (
+                f"fetching service profile '{name}' from the "
+                "Netskope Tenant"
+            )
+        self.logger.debug(
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)}."
+        )
+        try:
+            # Drive the loop off the page size: stop once a page returns
+            # fewer than ``limit`` items and advance the offset by the
+            # count actually returned.
+            while True:
+                page_msg = f"{logger_msg} for page {page_number}"
+                params = {
+                    "offset": offset,
+                    "limit": limit,
+                    # No space after the comma in the fields query
+                    # parameter else the Netskope API returns an error.
+                    "fields": "id,name,type,protocols,description",
+                }
+                if name:
+                    params["filter"] = f'name eq "{name}"'
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="get",
+                    error_codes=["CRE_1063", "CRE_1064"],
+                    headers=headers,
+                    params=params,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {page_msg}",
+                    logger_msg=page_msg,
+                )
+                services = response.get("services", [])
+                for service in services:
+                    profile_name = service.get("name", "")
+                    profile_type = str(
+                        service.get("type", "")
+                    ).upper()
+                    if not profile_name:
+                        continue
+                    if (
+                        custom_only
+                        and profile_type != SERVICE_PROFILE_TYPE_CUSTOM
+                    ):
+                        continue
+                    profiles[profile_name] = service
+                if len(services) < limit:
+                    break
+                offset += len(services)
+                page_number += 1
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+        if name and len(profiles) > 0:
+            if len(profiles) > 0:
+                self.logger.debug(
+                    f"{self.log_prefix}: Successfully fetched Service "
+                    f"Profile '{name}' from the Netskope Tenant."
+                )
+        elif not name:
+            self.logger.debug(
+                f"{self.log_prefix}: Successfully fetched {len(profiles)} "
+                "service profile(s) from the Netskope Tenant."
+            )
+        return profiles
+
+    def _get_service_profile_by_name(self, name: str) -> Dict:
+        """Fetch a single CUSTOM service profile by its name.
+
+        Performs an exact ``name eq`` lookup against the service
+        profile listing and returns the matching CUSTOM profile,
+        including its existing ``protocols`` (needed to union ports
+        for an Append operation). PREDEFINED profiles are excluded
+        because they cannot be edited.
+
+        Args:
+            name (str): Name of the service profile to look up.
+
+        Returns:
+            Dict: The matching CUSTOM service profile object, or an
+                empty dict if no editable profile with that name
+                exists.
+        """
+        profiles = self._get_service_profiles(
+            custom_only=True,
+            name=name,
+        )
+        return profiles.get(name, {})
+
+    def _push_service_profile(
+        self,
+        operation: str,
+        profile_name: str,
+        description: str,
+        tcp: List[str],
+        udp: List[str],
+        tcp_udp: List[str],
+        icmp: bool,
+    ) -> tuple:
+        """Create or update a service profile on the Netskope Tenant.
+
+        When no editable (CUSTOM) profile named ``profile_name``
+        exists, a new profile is created via ``POST`` carrying the
+        assembled ``protocols``. Otherwise the existing profile is
+        updated via ``PATCH`` on its id. For an ``append`` operation
+        the new ports are unioned (de-duplicated, order preserved)
+        with the profile's existing ports for each protocol; for a
+        ``replace`` operation only the supplied ports are sent. Empty
+        protocol arrays are omitted from the payload. The selected ICMP
+        value is honoured on update for both operations (enabled adds
+        ``icmp: true``, disabled omits it), so an ``append`` can turn an
+        existing ICMP off as well as on. The ``description`` is also
+        applied on update, sent only when a value is provided that
+        differs from the profile's current description.
+
+        Every resolved port is validated before it reaches the request
+        body. A value is accepted when it is a port in 0-65535 or a
+        range ``lower-upper`` whose ends are both in that span and whose
+        lower end is strictly smaller; anything else is dropped and
+        reported. Ranges are not compared against each other, so an
+        overlapping range or a single port already covered by a range is
+        passed through untouched.
+
+        PREDEFINED profiles cannot be updated: a ``PATCH`` against
+        such an id returns HTTP 404. That case is detected explicitly
+        (``is_handle_error_required=False``) and surfaced as a clear
+        "predefined/not found" error.
+
+        Args:
+            operation (str): ``append`` to union with existing ports,
+                ``replace`` to overwrite with only the new ports.
+            profile_name (str): Target service profile name (existing
+                CUSTOM profile to update, or the name to create).
+            description (str): Description used when creating a profile.
+            tcp (List[str]): TCP ports/ranges to add.
+            udp (List[str]): UDP ports/ranges to add.
+            tcp_udp (List[str]): TCP_UDP ports/ranges to add.
+            icmp (bool): Whether ICMP is enabled for the profile.
+
+        Returns:
+            tuple: ``(applied_count, not_applied)`` where
+                ``applied_count`` is the number of ports applied and
+                ``not_applied`` is the list of ports that could not be
+                applied. A service profile update is all-or-nothing — the
+                API does not report a partial port rejection — so on
+                success ``not_applied`` holds only the ports dropped as
+                malformed before the request was built, and every port
+                that was sent is counted as applied; a total failure
+                raises and is attributed to the action ids by the caller.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        # Port values arrive straight from the action's Static/Source
+        # fields rather than as typed indicators, and validate_action
+        # defers any value containing "$" to execution - so a
+        # Source-bound port reaches here unchecked. Re-run the same
+        # check on every resolved value before it goes into the request
+        # body; a malformed entry is dropped and reported rather than
+        # sent, since the API rejects the whole update rather than the
+        # offending port.
+        #
+        # A value is valid when it is a port in 0-65535, or a range
+        # "lower-upper" whose ends are both in that span and whose lower
+        # end is strictly smaller. Ranges are deliberately NOT compared
+        # against one another: an overlapping range, or a single port
+        # already covered by a range, is left exactly as supplied - the
+        # tenant accepts both and collapsing them is not this action's
+        # job.
+        new_ports = {}
+        invalid_ports = []
+        for proto, ports in (
+            ("tcp", tcp),
+            ("udp", udp),
+            ("tcp_udp", tcp_udp),
+        ):
+            valid_ports = []
+            for port in ports or []:
+                if not port:
+                    continue
+                if self.netskope_helper._validate_port(port):
+                    valid_ports.append(port)
+                else:
+                    invalid_ports.append(port)
+            new_ports[proto] = valid_ports
+        if invalid_ports:
+            self.logger.info(
+                message=(
+                    f"{self.log_prefix}: Skipping {len(invalid_ports)} "
+                    "value(s) as they were not a valid port or port "
+                    "range, and therefore cannot be added to the "
+                    "service profile."
+                ),
+                details=(
+                    "Skipped port value(s): "
+                    + ", ".join(
+                        str(port) for port in invalid_ports if port
+                    )
+                ),
+            )
+        # Only short-circuit when values were actually supplied and none
+        # survived: with nothing to write and no ICMP the request would
+        # either create an empty profile or strip the ports off an
+        # existing one, neither of which the record asked for. A call
+        # that legitimately carries no ports at all is left on its
+        # existing path.
+        if invalid_ports and not any(new_ports.values()) and not icmp:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: None of the provided port "
+                    "value(s) are a valid port or port range and ICMP "
+                    "is not enabled. Skipping action execution."
+                ),
+                resolution=(
+                    "Provide a port between 0 and 65535, or a port "
+                    "range 'lower-upper' where lower is smaller than "
+                    "upper, or enable ICMP."
+                ),
+            )
+            return 0, list(invalid_ports)
+        existing_profile = self._get_service_profile_by_name(
+            profile_name
+        )
+        if existing_profile:
+            profile_id = existing_profile.get("id")
+            existing_protocols = existing_profile.get(
+                "protocols", {}
+            )
+            protocols = {}
+            for proto, ports in new_ports.items():
+                if operation == "append":
+                    merged = list(
+                        existing_protocols.get(proto, [])
+                    )
+                    for port in ports:
+                        if port not in merged:
+                            merged.append(port)
+                    if merged:
+                        protocols[proto] = merged
+                elif ports:
+                    protocols[proto] = ports
+            # The selected ICMP value is honoured for both Append and
+            # Replace: enabling adds ``icmp: true`` and disabling omits
+            # it from the protocols object (the PATCH replaces the whole
+            # object), so an Append can now turn an existing ICMP off as
+            # well as on, matching the user's selection.
+            if icmp:
+                protocols["icmp"] = True
+            body = {"protocols": protocols}
+            # The Description is applied on update too (it was previously
+            # sent only on create); send it only when a value is provided
+            # that differs from the profile's current description, so a
+            # no-op re-run does not clobber it.
+            existing_description = existing_profile.get("description", "")
+            if description and description != existing_description:
+                body["description"] = description
+            method = "patch"
+            profile_path = V2_SERVICE_PROFILE_BY_ID.format(profile_id)
+            url = f"{tenant_name}{profile_path}"
+            logger_msg = (
+                f"updating service profile '{profile_name}' on the "
+                "Netskope Tenant"
+            )
+        else:
+            protocols = {
+                proto: ports
+                for proto, ports in new_ports.items()
+                if ports
+            }
+            if icmp:
+                protocols["icmp"] = True
+            body = {
+                "name": profile_name,
+                "description": description,
+                "protocols": protocols,
+            }
+            method = "post"
+            url = f"{tenant_name}{V2_SERVICE_PROFILE}"
+            logger_msg = (
+                f"creating service profile '{profile_name}' on the "
+                "Netskope Tenant"
+            )
+        self.logger.debug(
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)}."
+        )
+        try:
+            response = self.netskope_helper._api_call_helper(
+                url=url,
+                method=method,
+                error_codes=["CRE_1063", "CRE_1064"],
+                headers=headers,
+                json=body,
+                proxies=self.proxy,
+                message=f"Error occurred while {logger_msg}",
+                logger_msg=logger_msg,
+                is_handle_error_required=False,
+            )
+            if method == "patch" and response.status_code == 404:
+                error_message = (
+                    f"Service profile '{profile_name}' could not be "
+                    "updated because it was not found or is a "
+                    "PREDEFINED profile. Only CUSTOM service profiles "
+                    "are editable."
+                )
+                self.logger.error(
+                    message=f"{self.log_prefix}: {error_message}",
+                    details=str(response.text),
+                    resolution=(
+                        "Select a CUSTOM service profile (PREDEFINED "
+                        "profiles cannot be modified) or create a new "
+                        "service profile, then re-run the action."
+                    ),
+                )
+                raise NetskopeException(error_message)
+            handle_status_code(
+                response,
+                error_code="CRE_1064",
+                custom_message=f"Error occurred while {logger_msg}",
+                plugin=self.log_prefix,
+                notify=False,
+                log=True,
+            )
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+        action_verb = "updated" if method == "patch" else "created"
+        self.logger.info(
+            f"{self.log_prefix}: Successfully {action_verb} service "
+            f"profile '{profile_name}' on the Netskope Tenant."
+        )
+        applied_count = (
+            len(new_ports["tcp"])
+            + len(new_ports["udp"])
+            + len(new_ports["tcp_udp"])
+        )
+        return applied_count, list(invalid_ports)
+
+    def _get_device_classifications(self) -> Dict:
+        """Fetch device classifications from the Netskope Tenant.
+
+        Paginates through ``GET /api/v2/deviceclassification/tags`` and
+        returns a mapping of device classification name to its id,
+        suitable for building action dropdowns and for checking whether a
+        classification already exists before creating it. The endpoint
+        returns a bare JSON array of classification objects.
+
+        Returns:
+            Dict: Mapping of device classification name to its id.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = (
+            f"{tenant_name}"
+            f"{URLS.get('V2_DEVICE_CLASSIFICATION_TAGS')}"
+        )
+        classifications = {}
+        offset = 0
+        limit = DEVICE_CLASSIFICATION_PAGE_SIZE
+        page_number = 1
+        logger_msg = (
+            "fetching device classifications from the Netskope Tenant"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {logger_msg.capitalize()}."
+        )
+        try:
+            while True:
+                page_msg = f"{logger_msg} for page {page_number}"
+                params = {"offset": offset, "limit": limit}
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="get",
+                    error_codes=["CRE_1063", "CRE_1064"],
+                    headers=headers,
+                    params=params,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {page_msg}",
+                    logger_msg=page_msg,
+                )
+                tags = (
+                    response
+                    if isinstance(response, list)
+                    else response.get("data", [])
+                )
+                if not tags:
+                    break
+                for tag in tags:
+                    name = tag.get("name", "")
+                    tag_id = tag.get("id")
+                    if name and tag_id is not None:
+                        classifications[name] = tag_id
+                if len(tags) < limit:
+                    break
+                offset += limit
+                page_number += 1
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=str(traceback.format_exc()),
+            )
+            raise NetskopeException(error_message)
+        self.logger.debug(
+            f"{self.log_prefix}: Successfully fetched "
+            f"{len(classifications)} device classification(s) from the "
+            "Netskope Tenant."
+        )
+        return classifications
+
+    def _get_device_classification_rules(self) -> List[Dict]:
+        """Fetch device classification rules from the Netskope Tenant.
+
+        Paginates through ``GET /api/v2/deviceclassification/rules`` and
+        returns the full rule objects (including ``id``, ``name``,
+        ``label``, ``os`` and ``conditions``). The conditions are needed
+        to union the existing device tags for an Append operation, and
+        the id is needed to target a rule for an update. The endpoint
+        returns a bare JSON array of rule objects.
+
+        Returns:
+            List[Dict]: List of device classification rule objects.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = (
+            f"{tenant_name}"
+            f"{URLS.get('V2_DEVICE_CLASSIFICATION_RULES')}"
+        )
+        rules = []
+        offset = 0
+        limit = DEVICE_CLASSIFICATION_PAGE_SIZE
+        page_number = 1
+        logger_msg = (
+            "fetching device classification rules from the Netskope "
+            "Tenant"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {logger_msg.capitalize()}."
+        )
+        try:
+            while True:
+                page_msg = f"{logger_msg} for page {page_number}"
+                params = {"offset": offset, "limit": limit}
+                response = self.netskope_helper._api_call_helper(
+                    url=url,
+                    method="get",
+                    error_codes=["CRE_1063", "CRE_1064"],
+                    headers=headers,
+                    params=params,
+                    proxies=self.proxy,
+                    message=f"Error occurred while {page_msg}",
+                    logger_msg=page_msg,
+                )
+                page_rules = (
+                    response
+                    if isinstance(response, list)
+                    else response.get("data", [])
+                )
+                if not page_rules:
+                    break
+                rules.extend(page_rules)
+                if len(page_rules) < limit:
+                    break
+                offset += limit
+                page_number += 1
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=str(traceback.format_exc()),
+            )
+            raise NetskopeException(error_message)
+        self.logger.debug(
+            f"{self.log_prefix}: Successfully fetched {len(rules)} "
+            "device classification rule(s) from the Netskope Tenant."
+        )
+        return rules
+
+    def _create_device_classification(
+        self,
+        name: str,
+        existing_classifications: Dict,
+    ) -> None:
+        """Create a device classification on the Netskope Tenant.
+
+        Creates the classification via ``POST`` only when one with the
+        same name does not already exist, so re-running the action with
+        the same name reuses the existing classification instead of
+        attempting a duplicate create (which the API rejects). The
+        request body is a JSON array carrying a single classification
+        object, as required by the endpoint.
+
+        Args:
+            name (str): Name of the device classification to create.
+            existing_classifications (Dict): Mapping of existing
+                classification name to id, used to skip creation when the
+                classification already exists.
+        """
+        if name in existing_classifications:
+            self.logger.info(
+                f"{self.log_prefix}: Device classification '{name}' "
+                "already exists on the Netskope Tenant; reusing it "
+                "instead of creating a new one."
+            )
+            return
+        tenant_name, headers = self._get_tenant_and_headers()
+        url = (
+            f"{tenant_name}"
+            f"{URLS.get('V2_DEVICE_CLASSIFICATION_TAGS')}"
+        )
+        body = [
+            {
+                "name": name,
+                "description": DEVICE_CLASSIFICATION_DEFAULT_DESCRIPTION,
+            }
+        ]
+        logger_msg = (
+            f"creating device classification '{name}' on the Netskope "
+            "Tenant"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)}."
+        )
+        response = self.netskope_helper._api_call_helper(
+            url=url,
+            method="post",
+            error_codes=["CRE_1063", "CRE_1064"],
+            headers=headers,
+            json=body,
+            proxies=self.proxy,
+            message=f"Error occurred while {logger_msg}",
+            logger_msg=logger_msg,
+        )
+        if (
+            isinstance(response, dict)
+            and not response.get("status", True)
+        ):
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=f"{self.log_prefix}: {error_message}",
+                details=str(response),
+                resolution=(
+                    "Verify the device classification name is valid and "
+                    "does not already exist, then re-run the action."
+                ),
+            )
+            raise NetskopeException(error_message)
+        self.logger.info(
+            f"{self.log_prefix}: Successfully {logger_msg}."
+        )
+
+    def _send_classification_rule_request(
+        self, method, url, body, headers, logger_msg
+    ):
+        """Send a device classification rule create/update request.
+
+        Issues the ``POST`` (create) or ``PUT`` (update) request for a
+        device classification rule and handles its responses: an HTTP
+        409 (the same classification criteria already exist on another
+        rule) is surfaced with the conflicting rule's message, and any
+        other non-2xx status is routed through ``handle_status_code``.
+        The rule endpoints return an empty body on success, so the
+        error handler is only invoked for non-success status codes.
+        Raises ``NetskopeException`` on any failure.
+
+        Args:
+            method (str): ``post`` to create a rule or ``put`` to update
+                an existing rule by id.
+            url (str): Fully-qualified rule endpoint URL.
+            body (Union[dict, list]): Request body (a single-object
+                array for create, a rule object for update).
+            headers (dict): Request headers carrying the v2 API token.
+            logger_msg (str): Present-participle description of the call
+                used in error and conflict messages.
+        """
+        try:
+            response = self.netskope_helper._api_call_helper(
+                url=url,
+                method=method,
+                error_codes=["CRE_1063", "CRE_1064"],
+                headers=headers,
+                json=body,
+                proxies=self.proxy,
+                message=f"Error occurred while {logger_msg}",
+                logger_msg=logger_msg,
+                is_handle_error_required=False,
+            )
+            # The rule create/update endpoints return an empty body on
+            # success (201/200), so only invoke the error handler for
+            # non-success status codes to avoid parsing an empty body.
+            if response.status_code == 409:
+                try:
+                    conflict_msg = response.json().get(
+                        "message",
+                        "A conflicting device classification rule"
+                        " already exists.",
+                    )
+                except Exception:
+                    conflict_msg = (
+                        "A conflicting device classification rule"
+                        " already exists."
+                    )
+                error_message = (
+                    f"Error occurred while {logger_msg}."
+                    f" {conflict_msg}"
+                )
+                self.logger.error(
+                    message=f"{self.log_prefix}: {error_message}",
+                    resolution=(
+                        "A device classification rule with the same"
+                        " classification criteria already exists on"
+                        " the Netskope Tenant. Modify the Tags,"
+                        " Match Type, or Operating System to make"
+                        " the rule criteria unique."
+                    ),
+                )
+                raise NetskopeException(error_message)
+            elif not 200 <= response.status_code < 300:
+                handle_status_code(
+                    response,
+                    error_code="CRE_1064",
+                    custom_message=f"Error occurred while {logger_msg}",
+                    plugin=self.log_prefix,
+                    notify=False,
+                    log=True,
+                )
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = f"Error occurred while {logger_msg}."
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: {error_message} "
+                    f"Error: {err}"
+                ),
+                details=str(traceback.format_exc()),
+            )
+            raise NetskopeException(error_message)
+
+    def _move_rule_classification(
+        self,
+        rule_id,
+        existing_rule,
+        label,
+        rule_name,
+        os,
+        tenant_name,
+        headers,
+    ):
+        """Reassign an existing rule to a different classification.
+
+        Used when a short-circuit (the rule is already full, every
+        provided tag is already on the rule, or no device tag is left to
+        apply) means the rule's device tags do not change, but the
+        selected device classification differs from the rule's current
+        one. A Netskope rule can belong to only one classification, so
+        the rule is updated in place with its existing conditions left
+        untouched and only its ``label`` (the classification) changed.
+        Raises ``NetskopeException`` on failure.
+
+        Args:
+            rule_id (str): Id of the rule to update.
+            existing_rule (dict): The rule object fetched from the
+                tenant; its ``conditions`` are preserved verbatim.
+            label (str): The new device classification name to move the
+                rule to.
+            rule_name (str): Rule name (used in the body and logs).
+            os (str): Target operating system of the rule.
+            tenant_name (str): Base tenant URL.
+            headers (dict): Request headers carrying the v2 API token.
+        """
+        rule_path = URLS.get(
+            "V2_DEVICE_CLASSIFICATION_RULE_BY_ID"
+        ).format(rule_id)
+        url = f"{tenant_name}{rule_path}"
+        body = {
+            "conditions": existing_rule.get("conditions", {}),
+            "label": label,
+            "name": rule_name,
+            "os": os,
+        }
+        logger_msg = (
+            f"moving device classification rule '{rule_name}' to"
+            f" classification '{label}' on the Netskope Tenant"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)}."
+        )
+        self._send_classification_rule_request(
+            "put", url, body, headers, logger_msg
+        )
+        self.logger.info(
+            f"{self.log_prefix}: Successfully moved device"
+            f" classification rule '{rule_name}' to classification"
+            f" '{label}' on the Netskope Tenant."
+        )
+
+    def _push_device_classification(
+        self,
+        operation: str,
+        classification_value: str,
+        new_classification_name: str,
+        rule_value: str,
+        new_rule_name: str,
+        os: str,
+        operator: str,
+        group_operator: str,
+        tags: List[str],
+    ) -> tuple:
+        """Create/update a device classification and its rule.
+
+        Ensures the target device classification exists (creating it when
+        'Create new Device Classification' was selected), resolves the
+        provided device tag names to ids, builds the rule's condition tree
+        and then creates the rule (``POST`` with a single-object array) or
+        updates an existing rule (``PUT`` on its id). For an Append
+        operation against an existing rule the new device tags are unioned
+        with the rule's current tags; for Replace the rule's device tags
+        are overwritten with only the new tags. When updating an existing
+        rule, only its device tag checks are changed (via
+        ``_replace_rule_tag_checks``) and every other condition branch is
+        preserved; a brand-new rule gets a freshly built condition tree.
+        The action fails (raises)
+        if any provided device tag does not exist on the Netskope Tenant
+        (tags are never created here).
+
+        Args:
+            operation (str): ``append`` to union with the existing rule's
+                device tags, ``replace`` to overwrite them.
+            classification_value (str): Selected classification name, or
+                the literal ``"create"`` to create a new one.
+            new_classification_name (str): Name used when creating a
+                classification.
+            rule_value (str): Packed ``name<sep>id`` of the selected rule,
+                or a ``<sep>create`` value to create a new rule.
+            new_rule_name (str): Name used when creating a rule.
+            os (str): Target operating system for the rule.
+            operator (str): ``and`` or ``or`` inner tag group logical
+                operator (from Match Type).
+            group_operator (str): ``and`` or ``or`` outer container
+                operator joining multiple tag groups (from Group Match
+                Type).
+            tags (List[str]): Device tag names to reference in the rule.
+
+        Returns:
+            tuple: ``(applied_count, not_applied, action_status)`` where
+                ``applied_count`` is the number of NEW device tags added
+                to the rule (device tags already present on the rule are
+                not counted), ``not_applied`` is the list of provided tag
+                names that were skipped because of the rule's tag limit
+                (tags beyond the first 5, the new tags that did not fit an
+                existing rule, or every provided tag when the rule is
+                already full) so the caller can attribute each back to its
+                originating action id(s) via ``value_to_ids``, and
+                ``action_status`` is ``"created"`` when a new rule was
+                created or ``"updated"`` when an existing rule was
+                targeted (including the self-heal case and the skip
+                paths). Tags that do not exist on the Netskope Tenant
+                still raise (the whole group fails). A failure to create
+                the classification, resolve the tags or push the rule
+                raises and is attributed to the action id(s) by the
+                caller.
+        """
+        tenant_name, headers = self._get_tenant_and_headers()
+        # Resolve the classification label, creating the classification
+        # when 'Create new Device Classification' was selected.
+        if classification_value == "create":
+            label = new_classification_name
+            existing_classifications = (
+                self._get_device_classifications()
+            )
+            self._create_device_classification(
+                label, existing_classifications
+            )
+        else:
+            label = classification_value
+        # Resolve the target rule: an existing rule is updated by id; a
+        # new rule name is created, or updated if a rule with that name
+        # and OS already exists so that re-runs do not duplicate it. When
+        # the matched rule sits in a different classification, it is moved
+        # to the selected one as part of the normal update (a rule belongs
+        # to exactly one classification).
+        rule_name, _, rule_id_token = rule_value.rpartition(
+            CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION
+        )
+        existing_rule = {}
+        if rule_id_token == "create":
+            rule_name = new_rule_name
+            rule_id = None
+            for rule in self._get_device_classification_rules():
+                if rule.get("name", "") != rule_name:
+                    # A different rule -- keep searching for the name.
+                    continue
+                # A rule with this name already exists on the tenant
+                # (rule names are unique, so a create with an existing
+                # name is rejected with a 409). Its OS cannot be changed
+                # -- mirroring the Netskope UI -- so when the selected OS
+                # differs from the existing rule's OS the action is
+                # short-circuited with an error instead of issuing a POST
+                # that the tenant rejects with a 409.
+                existing_os = rule.get("os", "")
+                if str(existing_os).lower() != os.lower():
+                    error_message = (
+                        "Cannot change the operating system for device"
+                        f" classification rule '{rule_name}' from"
+                        f" '{existing_os}' to '{os}'; hence skipping the"
+                        " Create Device Classification action execution."
+                    )
+                    self.logger.error(
+                        message=f"{self.log_prefix}: {error_message}",
+                        resolution=(
+                            "The operating system of an existing rule"
+                            " cannot be changed. Provide the rule's"
+                            f" current operating system '{existing_os}',"
+                            " either use a different rule or create a new"
+                            f" rule for with operating system {os}."
+                        ),
+                    )
+                    raise NetskopeException(error_message)
+                # Same name and OS -> reuse (update) the existing rule
+                # instead of creating a duplicate.
+                rule_id = rule.get("id")
+                existing_rule = rule
+                self.logger.info(
+                    f"{self.log_prefix}: Device classification rule "
+                    f"'{rule_name}' already exists on the Netskope "
+                    "Tenant; updating it instead of creating a new "
+                    "one."
+                )
+                break
+        else:
+            rule_id = rule_id_token
+            for rule in self._get_device_classification_rules():
+                if str(rule.get("id", "")) == str(rule_id):
+                    existing_rule = rule
+                    break
+            if not existing_rule:
+                error_message = (
+                    f"Device classification rule '{rule_name}' could "
+                    "not be found on the Netskope Tenant."
+                )
+                self.logger.error(
+                    message=f"{self.log_prefix}: {error_message}",
+                    resolution=(
+                        "Verify the device classification rule still "
+                        "exists on the Netskope Tenant and re-run the "
+                        "action."
+                    ),
+                )
+                raise NetskopeException(error_message)
+            # Case 1: the operating system of an existing rule cannot be
+            # changed (the Netskope UI does not allow it either), so a
+            # mismatch is an error and the action is short-circuited for
+            # this rule rather than attempting a forbidden OS change.
+            existing_os = existing_rule.get("os", "")
+            if str(existing_os).lower() != os.lower():
+                error_message = (
+                    "Cannot change the operating system for device"
+                    f" classification rule '{rule_name}' from"
+                    f" '{existing_os}' to '{os}'; hence skipping the"
+                    " Create Device Classification action execution."
+                )
+                self.logger.error(
+                    message=f"{self.log_prefix}: {error_message}",
+                    resolution=(
+                        "The operating system of an existing rule"
+                        " cannot be changed. Select the rule's current"
+                        f" operating system '{existing_os}' in the"
+                        " action configuration, or create a new rule"
+                        " for the desired operating system."
+                    ),
+                )
+                raise NetskopeException(error_message)
+        # A rule targeted by id (an existing rule, including the
+        # self-heal case where a create resolves to an existing rule) is
+        # updated; otherwise a brand-new rule is created. This status is
+        # returned so the caller can log/report the right verb.
+        action_status = "updated" if rule_id is not None else "created"
+        # The selected device classification becomes the rule's label.
+        # A Netskope rule can belong to only one classification, so when
+        # an existing rule's current classification differs from the
+        # selected one the rule must be moved to it even if its device
+        # tags do not change (the short-circuit paths below).
+        existing_label = (
+            existing_rule.get("label", "") if existing_rule else ""
+        )
+        label_changed = bool(existing_rule) and existing_label != label
+        # Tags that exceed DEVICE_CLASSIFICATION_TAGS_PER_GROUP per group
+        # are split into additional condition groups instead of discarded.
+        existing_tag_ids = []
+        if existing_rule:
+            existing_tag_ids = self.netskope_helper._extract_rule_tag_ids(
+                existing_rule.get("conditions", {})
+            )
+        # Resolve all provided device tag names to ids. Tags that do not
+        # exist on the Netskope Tenant cause the whole group to fail.
+        tag_cache = self._fetch_all_tags()
+        new_tag_ids, not_found = self.netskope_helper._resolve_classification_tag_ids(
+            tags, tag_cache
+        )
+        if not_found:
+            error_message = (
+                "Some of the provided Tags do not exist on the "
+                "Netskope Tenant. Hence skipping the Create Device "
+                "Classification action execution."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {error_message}",
+                details=(
+                    "Tags not found on the Netskope Tenant: "
+                    f"{', '.join(not_found)}."
+                ),
+                resolution=(
+                    "Create these device tags on the Netskope Tenant "
+                    "or provide existing device tag names, then re-run "
+                    "the action."
+                ),
+            )
+            raise NetskopeException(error_message)
+        # Map resolved tag ids back to the provided names for logging.
+        id_to_name = {}
+        for tag in tags:
+            resolved_id = tag_cache.get(str(tag).strip().lower())
+            if resolved_id is not None and resolved_id not in id_to_name:
+                id_to_name[resolved_id] = str(tag).strip()
+        # Append unions the new device tags with the rule's current tags;
+        # tags that exceed DEVICE_CLASSIFICATION_TAGS_PER_GROUP per group
+        # are split into additional condition groups instead of discarded.
+        # Replace (or a brand-new rule) uses only the new tags.
+        # ``added_tag_ids`` are the newly added tags only — tags already
+        # present on the rule are never counted.
+        if existing_rule and operation == "append":
+            final_tag_ids = list(existing_tag_ids)
+            added_tag_ids = []
+            for tag_id in new_tag_ids:
+                if tag_id in final_tag_ids:
+                    # Already on the rule — not a newly added tag.
+                    continue
+                final_tag_ids.append(tag_id)
+                added_tag_ids.append(tag_id)
+            if new_tag_ids and not added_tag_ids:
+                self.logger.info(
+                    f"{self.log_prefix}: All the provided tags already "
+                    "exist in the device classification rule "
+                    f"'{rule_name}'. Hence skipping the action "
+                    "execution. 0 new device tag(s) were added."
+                )
+                # The rule's device tags do not change, but if the
+                # selected classification differs the rule is still
+                # moved to it.
+                if label_changed:
+                    self._move_rule_classification(
+                        rule_id,
+                        existing_rule,
+                        label,
+                        rule_name,
+                        os,
+                        tenant_name,
+                        headers,
+                    )
+                return (
+                    0,
+                    list(not_found),
+                    action_status,
+                )
+        else:
+            final_tag_ids = list(new_tag_ids)
+            added_tag_ids = [
+                tag_id
+                for tag_id in new_tag_ids
+                if tag_id not in existing_tag_ids
+            ]
+        if not final_tag_ids:
+            self.logger.info(
+                f"{self.log_prefix}: No device tags were provided to "
+                f"apply to the device classification rule "
+                f"'{rule_name}'. Skipping action execution."
+            )
+            # No device tag change, but if the selected classification
+            # differs the rule is still moved to it. The rule's existing
+            # conditions are sent verbatim, so a rule with no conditions
+            # to preserve is left untouched (never wiped to empty).
+            if label_changed and existing_rule.get("conditions"):
+                self._move_rule_classification(
+                    rule_id,
+                    existing_rule,
+                    label,
+                    rule_name,
+                    os,
+                    tenant_name,
+                    headers,
+                )
+            return (
+                0,
+                list(not_found),
+                action_status,
+            )
+        # When updating an existing rule, touch ONLY its device tags:
+        # swap the tag checks inside the existing conditions and leave
+        # every other condition branch (min OS version, not-compromised,
+        # ...) intact. A brand-new rule gets a freshly built tree.
+        if existing_rule:
+            conditions = self.netskope_helper._replace_rule_tag_checks(
+                existing_rule.get("conditions", {}),
+                final_tag_ids,
+                operator,
+                group_operator,
+            )
+        else:
+            conditions = self.netskope_helper._build_rule_conditions(
+                final_tag_ids, operator, group_operator
+            )
+        rule_body = {
+            "conditions": conditions,
+            "label": label,
+            "name": rule_name,
+            "os": os,
+        }
+        if rule_id is not None:
+            method = "put"
+            rule_path = URLS.get(
+                "V2_DEVICE_CLASSIFICATION_RULE_BY_ID"
+            ).format(rule_id)
+            url = f"{tenant_name}{rule_path}"
+            body = rule_body
+            logger_msg = (
+                f"updating device classification rule '{rule_name}'"
+                f" in classification '{label}' on the Netskope"
+                " Tenant"
+            )
+            final_logger = (
+                f"updated device classification rule '{rule_name}'"
+                f" in classification '{label}' on the Netskope"
+                " Tenant"
+            )
+        else:
+            method = "post"
+            url = (
+                f"{tenant_name}"
+                f"{URLS.get('V2_DEVICE_CLASSIFICATION_RULES')}"
+            )
+            body = [rule_body]
+            logger_msg = (
+                f"creating device classification rule '{rule_name}'"
+                f" in classification '{label}' on the Netskope"
+                " Tenant"
+            )
+            final_logger = (
+                f"created device classification rule '{rule_name}'"
+                f" in classification '{label}' on the Netskope"
+                " Tenant"
+            )
+        self.logger.debug(
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)}."
+        )
+        self._send_classification_rule_request(
+            method, url, body, headers, logger_msg
+        )
+        self.logger.info(
+            f"{self.log_prefix}: Successfully {final_logger}."
+            f" Added {len(added_tag_ids)} new device tag(s) to the"
+            f" rule '{rule_name}'."
+        )
+        return (
+            len(added_tag_ids),
+            list(not_found),
+            action_status,
+        )
+
     def get_actions(self):
         """Get available actions."""
         return [
@@ -1275,6 +6563,24 @@ class NetskopePlugin(PluginBase):
             ),
             ActionWithoutParams(
                 label="Tag/Untag Device", value="tag_device"
+            ),
+            ActionWithoutParams(
+                label="Add to Destination Profile",
+                value="destination_profile",
+            ),
+            ActionWithoutParams(
+                label="Add to Network Profile",
+                value="network_profile",
+            ),
+            ActionWithoutParams(
+                label="Add to DNS Profile", value="dns_profile"
+            ),
+            ActionWithoutParams(
+                label="Add to Service Profile", value="service_profile"
+            ),
+            ActionWithoutParams(
+                label="Create Device Classification",
+                value="device_classification",
             ),
             ActionWithoutParams(label="No actions", value="generate"),
         ]
@@ -1730,7 +7036,7 @@ class NetskopePlugin(PluginBase):
         )
         logger_msg = f"creating group '{name}'"
         self.logger.debug(
-            f"{self.log_prefix}: {logger_msg.capitalize()} on "
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)} on "
             "the Netskope Tenant."
         )
         try:
@@ -1921,6 +7227,18 @@ class NetskopePlugin(PluginBase):
                 success=False,
                 message=err_msg,
             )
+
+        # Validate required fields in entity mappings
+        is_valid, err_msg = self._validate_required_field_in_entity_mappings()
+        if not is_valid:
+            self.logger.error(
+                message=(
+                        f"{self.log_prefix}: Validation error occurred. "
+                        f"{err_msg}"
+                    )
+            )
+            return ValidationResult(success=False, message=err_msg)
+
         try:
             helper = AlertsHelper()
             self.tenant = helper.get_tenant(configuration.get("tenant", ""))
@@ -1964,22 +7282,42 @@ class NetskopePlugin(PluginBase):
                     "alerts": ["uba"],
                 }
             modified_type_map = type_map.copy()
-            if "events" in modified_type_map and "clientstatus" in modified_type_map.get("events", []):
+            clientstatus_requested = (
+                "events" in modified_type_map
+                and "clientstatus" in modified_type_map.get("events", [])
+            )
+            if clientstatus_requested:
+                modified_type_map["events"] = [
+                    event_type
+                    for event_type in modified_type_map.get("events", [])
+                    if event_type != "clientstatus"
+                ]
+            else:
                 try:
-                    provider.client_status_validation()
-                    modified_type_map["events"] = [
-                        event_type
-                        for event_type in modified_type_map.get("events", [])
-                        if event_type != "clientstatus"
-                    ]
+                    provider.unregister_client_status_consumer(
+                        "cre", self.name
+                    )
                 except Exception as e:
-                    return ValidationResult(success=False, message=str(e))
+                    self.logger.error(
+                        f"{self.log_prefix}: Error while releasing "
+                        f"client_status subscription for CRE plugin "
+                        f"'{self.name}': {e}"
+                    )
 
             provider.permission_check(
                 modified_type_map,
                 plugin_name=self.plugin_name,
                 configuration_name=self.name,
             )
+
+            # Register only after all other validations pass — prevents a
+            # stale True subscriber leaf when permission_check fails and the
+            # plugin stays disabled.
+            if clientstatus_requested:
+                try:
+                    provider.register_client_status_consumer("cre", self.name)
+                except Exception as e:
+                    return ValidationResult(success=False, message=str(e))
 
             logger_msg = (
                 "Successfully validated the plugin "
@@ -2007,37 +7345,775 @@ class NetskopePlugin(PluginBase):
                 message=f"{err_msg} Check logs for more details.",
             )
 
-    def _validate_port(self, port):
-        """Validate the port or port range.
+    def cleanup(self, action_type: str = "disable"):
+        """
+        Release this CRE plugin configuration's hold on the shared
+        client_status iterator when the plugin is disabled or deleted.
+
+        Resolves the associated tenant, fetches the Netskope provider, and
+        calls ``unregister_client_status_consumer("cre", self.name, ...)``
+        with ``deleted`` derived from ``action_type``:
+
+          * ``action_type == "delete"`` -> ``deleted=True``: the leaf is
+            removed from the subscriber registry entirely (config is gone).
+          * ``action_type == "disable"`` (or anything else) ->
+            ``deleted=False``: the leaf is set to False (config still
+            exists but is opted out of client_status).
+
+        If this call drops the last active subscriber, the provider will
+        delete the shared iterator on the tenant.
+
+        Errors are caught and logged rather than raised so a transient
+        provider problem cannot block plugin disable/delete.
 
         Args:
-            port: Port number as int/str or port range as 'lower-upper' string
+            action_type (str): Cleanup action identifier passed by the
+                framework — typically the value of
+                ``ActionType.DELETE`` (``"delete"``) or
+                ``ActionType.DISABLE`` (``"disable"``). Defaults to
+                ``"disable"``, the safer of the two: the leaf is set to
+                False (opted out) rather than removed, so the shared
+                iterator is not torn down on an ambiguous call.
 
         Returns:
-            bool: True if port or port range is valid, False otherwise
+            None
         """
-        # Handle port range (e.g., '1000-2000')
-        if isinstance(port, str) and '-' in port:
-            try:
-                lower, upper = port.split('-')
-                lower_port = int(lower.strip())
-                upper_port = int(upper.strip())
-                # Check if ports are within valid range
-                if not (0 <= lower_port <= 65535 and 0 <= upper_port <= 65535):
-                    return False
-                # Check if lower is less than upper and they are not equal
-                if lower_port >= upper_port:
-                    return False
-                return True
-            except (ValueError, AttributeError):
-                return False
-
-        # Handle single port
         try:
-            port = int(port)
-            return 0 <= port <= 65535
-        except (ValueError, TypeError):
-            return False
+            helper = AlertsHelper()
+            tenant_name = helper.get_tenant_crev2(self.name).name
+            provider = plugin_provider_helper.get_provider(
+                tenant_name=tenant_name
+            )
+            provider.unregister_client_status_consumer(
+                "cre", self.name, deleted=(action_type == "delete")
+            )
+        except Exception as e:
+            self.logger.error(
+                f"{self.log_prefix}: Error while releasing client_status "
+                f"subscription on CRE plugin '{self.name}' "
+                f"(action_type={action_type}): {e}"
+            )
+
+    def _validate_required_field_in_entity_mappings(self):
+        """Validate if required fields are present in entity mappings."""
+        mapped_entities = (
+            self.mappedEntities if hasattr(self, "mappedEntities") else []
+        )
+
+        required_fields_by_entity = {
+            "Users": ["email"],
+            "Applications": ["applicationName"],
+            "Devices": [
+                "Device ID",
+                "Hostname",
+                "Netskope Device UID",
+                "Device Serial Number",
+                "User Key",
+            ],
+        }
+
+        error_messages = []
+
+        if mapped_entities:
+            for mapped_entity in mapped_entities:
+                entity_name = mapped_entity.get("entity")
+                if entity_name not in required_fields_by_entity:
+                    continue
+
+                mapped_source_fields = set()
+                for field in mapped_entity.get("fields", []):
+                    mapped_source_field = field.get("source", "")
+                    if mapped_source_field:
+                        mapped_source_fields.add(mapped_source_field)
+
+                missing_fields = [
+                    field
+                    for field in required_fields_by_entity[entity_name]
+                    if field not in mapped_source_fields
+                ]
+
+                if missing_fields:
+                    formatted_fields = ", ".join(
+                        f"'{field}'" for field in missing_fields
+                    )
+                    error_messages.append(
+                        f"Missing required fields {formatted_fields}"
+                        f" in entity mappings for {entity_name}."
+                    )
+
+        if error_messages:
+            return False, " ".join(error_messages)
+
+        return True, ""
+
+    def _validate_parameters(
+        self,
+        field_name: str,
+        field_value,
+        field_type: type,
+        parameter_type: Literal["configuration", "action"],
+        allowed_values: Dict = None,
+        custom_validation_func: Callable = None,
+        is_required: bool = True,
+        validation_err_msg: str = "Validation error occurred. ",
+        check_dollar: bool = False,
+        is_source_field_allowed: bool = True,
+    ) -> Union[ValidationResult, None]:
+        """Validate a configuration or action parameter.
+
+        Args:
+            field_name (str): Parameter name.
+            field_value: Parameter value.
+            field_type (type): Expected type.
+            parameter_type (Literal["configuration", "action"]):
+                Type of parameter used in error messages.
+            allowed_values (Dict, optional): Dict or list of allowed
+                values.
+            custom_validation_func (Callable, optional): Custom
+                validation function.
+            is_required (bool): Whether the field is required.
+            validation_err_msg (str): Error message prefix.
+            check_dollar (bool): Skip validation if source field.
+            is_source_field_allowed (bool): Whether source fields
+                are allowed.
+
+        Returns:
+            ValidationResult or None.
+        """
+        if (
+            not is_source_field_allowed
+            and isinstance(field_value, str)
+            and "$" in field_value
+        ):
+            err_msg = (
+                f"'{field_name}' can only contain the Static Field."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {err_msg}",
+                resolution=(
+                    f"Ensure that Static is selected for the"
+                    f" field '{field_name}' in the action"
+                    " configuration."
+                ),
+            )
+            return ValidationResult(success=False, message=err_msg)
+
+        if field_type is str and isinstance(field_value, str):
+            field_value = field_value.strip()
+
+        if (
+            check_dollar
+            and isinstance(field_value, str)
+            and "$" in field_value
+        ):
+            self.logger.info(
+                message=(
+                    f"{self.log_prefix}: '{field_name}' contains"
+                    " the Source Field hence validation for this"
+                    " field will be performed while executing the"
+                    " action."
+                ),
+            )
+            return None
+
+        if (
+            is_required
+            and not isinstance(field_value, (int, float))
+            and not field_value
+        ):
+            err_msg = (
+                f"'{field_name}' is a required"
+                f" {parameter_type} parameter."
+            )
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: "
+                    f"{validation_err_msg}{err_msg}"
+                ),
+                resolution=(
+                    "Ensure that some value is provided for"
+                    f" field {field_name}."
+                ),
+            )
+            return ValidationResult(success=False, message=err_msg)
+
+        if is_required and not isinstance(field_value, field_type):
+            err_msg = (
+                f"Invalid value provided for the {parameter_type}"
+                f" parameter '{field_name}'."
+            )
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: "
+                    f"{validation_err_msg}{err_msg}"
+                ),
+                resolution=(
+                    "Ensure that a valid value is provided for"
+                    f" {field_name} field."
+                ),
+            )
+            return ValidationResult(success=False, message=err_msg)
+
+        if custom_validation_func and not custom_validation_func(
+            field_value
+        ):
+            err_msg = (
+                f"Invalid value provided for the {parameter_type}"
+                f" parameter '{field_name}'."
+            )
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: "
+                    f"{validation_err_msg}{err_msg}"
+                ),
+                resolution=(
+                    "Ensure that a valid value is provided for"
+                    f" {field_name} field."
+                ),
+            )
+            return ValidationResult(success=False, message=err_msg)
+
+        if allowed_values and isinstance(field_value, str):
+            if field_value not in allowed_values:
+                if len(allowed_values) <= 5:
+                    err_msg = (
+                        f"Invalid value provided for the"
+                        f" {parameter_type} parameter '{field_name}'."
+                        " Allowed values are"
+                        f" {', '.join(str(v) for v in allowed_values)}."
+                    )
+                else:
+                    err_msg = (
+                        f"Invalid value for '{field_name}' provided"
+                        f" in the {parameter_type} parameters."
+                    )
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: "
+                        f"{validation_err_msg}{err_msg}"
+                    ),
+                    resolution=(
+                        "Ensure that a valid value is provided"
+                        " from the allowed values."
+                    ),
+                )
+                return ValidationResult(
+                    success=False, message=err_msg
+                )
+        return None
+
+    def _validate_network_profile_action(
+        self, action: Action
+    ) -> ValidationResult:
+        """Validate the Add to Network Profile action parameters.
+
+        Extracted verbatim from the ``network_profile`` branch of
+        ``validate_action``; the dispatch there is now one line. The
+        branch never depended on anything ``validate_action`` had
+        already computed, so nothing is threaded in beyond the
+        action itself.
+
+        Args:
+            action (Action): Action object carrying the configured
+                parameters.
+
+        Returns:
+            ValidationResult: Success when every parameter is valid,
+                otherwise the first failure found.
+        """
+        try:
+            existing_profiles = self._get_network_profiles()
+        except Exception as e:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Error occurred while "
+                    f"fetching network profiles for action "
+                    f"parameter validation. Error: {e}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            return ValidationResult(success=False, message=str(e))
+        # No 'Operation' parameter to validate: this action always
+        # appends. See the note above NETWORK_PROFILE_ACTION_PARAMS.
+        profile_name = action.parameters.get(
+            "network_profile_name", ""
+        )
+        valid_profiles = list(existing_profiles.keys())
+        valid_profiles.append("create")
+        if profile_name not in valid_profiles:
+            err_msg = (
+                "Invalid value provided for the action"
+                " parameter 'Network Profile'."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {err_msg}",
+                resolution=(
+                    "Select a valid Network Profile from the"
+                    " dropdown or select 'Create new profile'."
+                ),
+            )
+            return ValidationResult(
+                success=False, message=err_msg
+            )
+        if profile_name == "create":
+            new_name = (
+                action.parameters.get("new_profile_name") or ""
+            ).strip()
+            if validation_result := self._validate_parameters(
+                field_name="Create New Network Profile",
+                field_value=new_name,
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+            ):
+                return validation_result
+            if validation_result := self.netskope_helper._validate_max_length(
+                field_name="Create New Network Profile",
+                field_value=new_name,
+                max_length=MAX_NETWORK_PROFILE_NAME_LENGTH,
+            ):
+                return validation_result
+            if validation_result := self.netskope_helper._validate_forbidden_chars(
+                field_name="Create New Network Profile",
+                field_value=new_name,
+                forbidden_chars=NETWORK_PROFILE_NAME_FORBIDDEN_CHARS,
+                disallow_non_printable=True,
+            ):
+                return validation_result
+        new_description = (
+            action.parameters.get("new_profile_description") or ""
+        )
+        if validation_result := self._validate_parameters(
+            field_name="Description",
+            field_value=new_description,
+            field_type=str,
+            parameter_type="action",
+            is_required=False,
+            is_source_field_allowed=False,
+        ):
+            return validation_result
+        if validation_result := self.netskope_helper._validate_max_length(
+            field_name="Description",
+            field_value=new_description,
+            max_length=MAX_NETWORK_PROFILE_DESC_LENGTH,
+        ):
+            return validation_result
+        if validation_result := self._validate_parameters(
+            field_name="Apply Pending Changes",
+            field_value=action.parameters.get(
+                "apply_pending_changes", ""
+            ),
+            field_type=str,
+            parameter_type="action",
+            is_source_field_allowed=False,
+            allowed_values=["Yes", "No"],
+        ):
+            return validation_result
+        # Multiple mapped Source/Static fields arrive as a list, so
+        # collapse them to the comma-separated form the checks below
+        # already expect.
+        network_values = self.netskope_helper._join_multi_source_value(
+            action.parameters.get("network_values") or ""
+        )
+        if validation_result := self._validate_parameters(
+            field_name="IPs",
+            field_value=network_values,
+            field_type=str,
+            parameter_type="action",
+            check_dollar=True,
+            custom_validation_func=(
+                lambda v: (
+                    items := [
+                        item for item in v.split(",") if item.strip()
+                    ]
+                )
+                and all(
+                    self.netskope_helper
+                    ._format_network_profile_value(item)
+                    is not None
+                    for item in items
+                )
+            ),
+        ):
+            return validation_result
+        # Normalize to a stripped string so the shared validator's
+        # fixed field_type check works whether the number field
+        # arrives as an int or a string; the custom check tolerates
+        # an empty value (falls back to the default) and otherwise
+        # requires a positive integer.
+        per_profile_limit = str(
+            action.parameters.get("network_profile_value_limit", "")
+        ).strip()
+        if validation_result := self._validate_parameters(
+            field_name="Network Profile Value Limit",
+            field_value=per_profile_limit,
+            field_type=str,
+            parameter_type="action",
+            is_required=False,
+            is_source_field_allowed=False,
+            custom_validation_func=(
+                lambda v: v == "" or (v.isdigit() and int(v) > 0)
+            ),
+        ):
+            return validation_result
+        # The tenant-wide total is a platform limit that cannot be
+        # raised, so a per-profile limit above it is unreachable by
+        # definition - and harmful: the capacity maths would believe
+        # a single profile has room for more values than the whole
+        # tenant can hold, so roll-over never engages and the create
+        # is sized only by the tenant budget. Bounded here, naming
+        # the ceiling, rather than surfacing as an API rejection
+        # once the action runs.
+        if (
+            per_profile_limit
+            and int(per_profile_limit)
+            > NETWORK_PROFILE_TENANT_TOTAL_LIMIT
+        ):
+            err_msg = (
+                "Invalid value provided for the action parameter "
+                "'Network Profile Value Limit'. It cannot exceed "
+                "the tenant-wide network profile value limit of "
+                f"{NETWORK_PROFILE_TENANT_TOTAL_LIMIT}."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {err_msg}",
+                resolution=(
+                    "Provide a value between 1 and "
+                    f"{NETWORK_PROFILE_TENANT_TOTAL_LIMIT}, or "
+                    "leave the field empty to use the default of "
+                    f"{NETWORK_PROFILE_PER_PROFILE_LIMIT}."
+                ),
+            )
+            return ValidationResult(success=False, message=err_msg)
+        if validation_result := self._validate_parameters(
+            field_name="Skip Excess IPs",
+            field_value=action.parameters.get("skip_excess_ips", ""),
+            field_type=str,
+            parameter_type="action",
+            is_source_field_allowed=False,
+            allowed_values=["Yes", "No"],
+        ):
+            return validation_result
+        # The placeholder written to a profile this action has to
+        # empty must be a comment, never an IP: an emptied profile
+        # may still be referenced by a policy, and any real address
+        # would make that policy start matching traffic.
+        default_value = (
+            action.parameters.get("default_value") or ""
+        ).strip()
+        if validation_result := self._validate_parameters(
+            field_name="Default Value",
+            field_value=default_value,
+            field_type=str,
+            parameter_type="action",
+            is_required=False,
+            is_source_field_allowed=False,
+            custom_validation_func=(
+                lambda v: v == ""
+                or (
+                    v.startswith(NETWORK_PROFILE_COMMENT_PREFIXES)
+                    and len(v) > 1
+                )
+            ),
+        ):
+            return validation_result
+        if validation_result := self.netskope_helper._validate_max_length(
+            field_name="Default Value",
+            field_value=default_value,
+            max_length=MAX_NETWORK_PROFILE_VALUE_LENGTH,
+        ):
+            return validation_result
+        # A roll-over profile is named "<base> 2", "<base> 10", ...
+        # so the base has to leave room for the suffix. Blocking it
+        # here is better than discovering at run time that no
+        # sibling can be created.
+        base_name = (
+            (action.parameters.get("new_profile_name") or "").strip()
+            if profile_name == "create"
+            else profile_name
+        )
+        if (
+            action.parameters.get("skip_excess_ips", "No") != "Yes"
+            and len(base_name) + len(NETWORK_PROFILE_SIBLING_SUFFIX)
+            > MAX_NETWORK_PROFILE_NAME_LENGTH
+        ):
+            max_base_length = (
+                MAX_NETWORK_PROFILE_NAME_LENGTH
+                - len(NETWORK_PROFILE_SIBLING_SUFFIX)
+            )
+            err_msg = (
+                "The network profile name is too long to create "
+                "roll-over profiles. Provide a name of at most "
+                f"{max_base_length} characters, or set 'Skip Excess "
+                "IPs' to 'Yes'."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {err_msg}",
+                resolution=(
+                    "A roll-over profile is named '<profile name> 2',"
+                    " so the name must leave room for the suffix."
+                ),
+            )
+            return ValidationResult(success=False, message=err_msg)
+        return ValidationResult(
+            success=True, message="Validation successful."
+        )
+
+    def _execute_network_profile_actions(
+        self, actions: list, failed_action_ids: list
+    ) -> ActionResult:
+        """Execute the Add to Network Profile action in bulk.
+
+        Extracted verbatim from the ``network_profile`` branch of
+        ``execute_actions``; the dispatch there is now one line.
+        ``failed_action_ids`` is passed in rather than created here
+        so the accumulate-then-dedupe behaviour is unchanged.
+
+        Args:
+            actions (list): ``{id, params}`` entries for the records
+                this action is running for.
+            failed_action_ids (list): Accumulator extended in place
+                with the ids of records whose values were not
+                applied.
+
+        Returns:
+            ActionResult: Always successful; per-record failures are
+                reported through ``failed_action_ids``.
+        """
+        profile_groups = {}
+        # Every value the format check rejects, for any reason - not
+        # only malformed ranges.
+        invalid_values = []
+        for action_dict in actions:
+            id, action = (
+                action_dict.get("id"),
+                action_dict.get("params"),
+            )
+            params = action.parameters
+            selected_profile = params.get(
+                "network_profile_name", ""
+            )
+            # new_profile_name only matters when creating a profile; for
+            # an existing profile it is left at its (possibly per-record
+            # source) default, so excluding it from the key keeps all
+            # records targeting the same existing profile in one group.
+            group_key = (
+                selected_profile,
+                params.get("new_profile_name", "")
+                if selected_profile == "create"
+                else "",
+            )
+            group = profile_groups.setdefault(
+                group_key,
+                {
+                    "params": params,
+                    "values": [],
+                    "ids": [],
+                    "value_to_ids": {},
+                },
+            )
+            group["ids"].append(id)
+            normalized = self.netskope_helper._normalize_csv_values(
+                params.get("network_values", "")
+            )
+            # An uncompressed IPv6 range entered as "start - end" can
+            # exceed the network profile's 80-character element
+            # limit; stripping the spaces around the hyphen brings it
+            # back under the limit. A value that does not parse as an
+            # address, CIDR block or range is not shareable in any
+            # form, so it is dropped here and the record that
+            # supplied it is marked failed.
+            formatted_values = []
+            for value in normalized:
+                formatted = (
+                    self.netskope_helper
+                    ._format_network_profile_value(value)
+                )
+                if formatted is None:
+                    invalid_values.append(value)
+                    failed_action_ids.append(id)
+                    continue
+                formatted_values.append(formatted)
+            normalized = formatted_values
+            group["values"].extend(normalized)
+            # Track which action id(s) each value came from so that a
+            # value that fails or is skipped can be attributed back
+            # to the originating action(s) as a failed action id.
+            for value in normalized:
+                group["value_to_ids"].setdefault(value, set()).add(id)
+        # One generic reason covers every rejection: the values are
+        # not classified by *how* they failed, so a per-reason count
+        # would mean re-testing each value just to bucket it. The
+        # values themselves go in details, joined defensively - a
+        # None entry would make str.join raise and turn a routine
+        # skip log into an unhandled error.
+        if invalid_values:
+            self.logger.info(
+                message=(
+                    f"{self.log_prefix}: Skipped "
+                    f"{len(invalid_values)} IP value(s) as they "
+                    "were not valid IPv4/IPv6 addresses, IP CIDR "
+                    "blocks or IP ranges, and therefore cannot be "
+                    "added to the network profile."
+                ),
+                details=(
+                    "Skipped IP value(s): "
+                    + ", ".join(
+                        str(value)
+                        for value in invalid_values
+                        if value
+                    )
+                ),
+            )
+        for group in profile_groups.values():
+            params = group["params"]
+            batch_ids = group["ids"]
+            value_to_ids = group["value_to_ids"]
+            values = self.netskope_helper._normalize_csv_values(
+                group["values"]
+            )
+            # Optional per-action override for the per-profile value
+            # limit; empty/invalid falls back to the default constant
+            # inside the capacity helper. The tenant-wide total is
+            # fixed and is always taken from the constant.
+            raw_limit = params.get("network_profile_value_limit", "")
+            try:
+                per_profile_limit = (
+                    int(raw_limit)
+                    if str(raw_limit).strip() != ""
+                    else None
+                )
+            except (TypeError, ValueError):
+                per_profile_limit = None
+            try:
+                (
+                    shared,
+                    not_applied,
+                    added_counts,
+                    already_present,
+                ) = (
+                    self._push_network_profile(
+                        network_values=values,
+                        existing_profile_name=params.get(
+                            "network_profile_name", ""
+                        ),
+                        new_profile_name=params.get(
+                            "new_profile_name", ""
+                        ),
+                        new_profile_description=params.get(
+                            "new_profile_description", ""
+                        ),
+                        apply_pending_changes=params.get(
+                            "apply_pending_changes", "No"
+                        ),
+                        per_profile_limit=per_profile_limit,
+                        skip_excess_ips=params.get(
+                            "skip_excess_ips", "No"
+                        ),
+                        default_value=(
+                            params.get("default_value", "")
+                            or NETWORK_PROFILE_EMPTY_PLACEHOLDER
+                        ),
+                    )
+                )
+                self.netskope_helper._attribute_failed_ids(
+                    not_applied, value_to_ids, failed_action_ids
+                )
+                # Values the group already held were not written, so
+                # they are reported as skipped rather than added -
+                # "added N across 0 profile(s)" contradicts itself,
+                # and folding them in inflates every recurring sync,
+                # where most values are re-supplied by records that
+                # still match. The added sentence is dropped entirely
+                # when duplicates explain the zero.
+                summary_parts = []
+                if shared:
+                    summary_parts.append(
+                        f"Successfully added {shared} IP "
+                        f"value(s) across {len(added_counts)} "
+                        "network profile(s)."
+                    )
+                elif not already_present:
+                    # Nothing was written and duplicates do not explain
+                    # it: capacity was exhausted, the base is staged for
+                    # deletion, or every write failed. Each of those is
+                    # reported where it happens, so this sentence only
+                    # has to stop a zero-write run reading as a success.
+                    # It is not always a failure either - a full group
+                    # with 'Skip Excess IPs' enabled lands here on a
+                    # healthy run - so it states the outcome and the
+                    # count without blaming anything.
+                    summary_parts.append(
+                        f"Added {shared} IP value(s) to the network "
+                        f"profile(s). {len(not_applied)} IP value(s) "
+                        "could not be applied."
+                    )
+                if already_present:
+                    summary_parts.append(
+                        f"Skipped adding {already_present} IP "
+                        "value(s) as they are already present in "
+                        "the network profile(s)."
+                    )
+                summary = " ".join(summary_parts)
+                # Counts go in the message, names and values in
+                # details. Only the profile names are listed, not a
+                # per-profile count: after an Append the group is
+                # consolidated, which can move values between profiles
+                # and remove a profile that received some, so any
+                # per-profile figure captured here may not describe the
+                # final layout. When nothing was written, the values
+                # that missed out are what an operator needs instead.
+                # Both joins are defensive - a None entry would make
+                # str.join raise and turn a routine summary into an
+                # unhandled error.
+                if added_counts:
+                    summary_details = (
+                        "Network profile(s) written to: "
+                        + ", ".join(
+                            str(name) for name in added_counts if name
+                        )
+                    )
+                elif not_applied:
+                    summary_details = (
+                        "IP value(s) not applied: "
+                        + ", ".join(
+                            str(value) for value in not_applied if value
+                        )
+                    )
+                else:
+                    summary_details = (
+                        "No network profile received values."
+                    )
+                self.logger.info(
+                    message=f"{self.log_prefix}: {summary}",
+                    details=summary_details,
+                )
+            except Exception as e:
+                failed_action_ids.extend(batch_ids)
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        "adding IP values to the "
+                        f"network profile. Error: {e}"
+                    ),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
+                )
+        return ActionResult(
+            success=True,
+            message=(
+                "Successfully added IP values to "
+                "network profiles."
+            ),
+            failed_action_ids=list(set(failed_action_ids)),
+        )
 
     def validate_action(self, action: Action):
         """Validate Netskope configuration.
@@ -2105,22 +8181,121 @@ class NetskopePlugin(PluginBase):
                 self.logger.info(
                     f"{self.log_prefix}: "
                     f"Exception occurred while validating action parameters.",
-                    details=traceback.format_exc(),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
                     error_code="CRE_1042",
                 )
                 return ValidationResult(success=False, message=str(e))
 
-            tags = action.parameters.get("tags", "")
+            skip_excess_hosts = action.parameters.get(
+                "skip_excess_hosts", False
+            )
+            if skip_excess_hosts not in [True, False]:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Invalid value provided for the "
+                        "action parameter 'Skip Excess Hosts'."
+                    ),
+                    resolution=(
+                        "Select either 'Yes' or 'No' for 'Skip Excess "
+                        "Hosts' from the Static field dropdown."
+                    ),
+                )
+                return ValidationResult(
+                    success=False,
+                    message="Invalid Skip Excess Hosts provided.",
+                )
+
+            # Multiple mapped Source/Static fields arrive as a list, so
+            # collapse them to the comma-separated form the checks below
+            # already expect.
+            tags = self.netskope_helper._join_multi_source_value(
+                action.parameters.get("tags", "")
+            )
+            # For a Static Tags field, validate every tag at save time and
+            # fail the configuration if any tag is empty or exceeds the
+            # maximum allowed length. For a Source field ("$" present) the
+            # validation is deferred to action execution, where invalid
+            # tags are skipped and the remaining valid tags are pushed.
             if tags and "$" not in tags:
-                for tag in tags.split(","):
-                    if len(tag.strip()) > 30:
-                        return ValidationResult(
-                            success=False,
-                            message=(
-                                "Each tag should be less than or equal "
-                                "to 30 characters."
-                            ),
-                        )
+                tags_to_validate = [
+                    tag.strip() for tag in tags.split(",") if tag.strip()
+                ]
+                _, skipped_tags, skip_count = (
+                    self.netskope_helper.validate_tags_for_private_app(
+                        tags_to_push=tags_to_validate,
+                        private_app_name=action.parameters.get(
+                            "private_app_name", ""
+                        ),
+                    )
+                )
+                if skip_count > 0:
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: {skip_count} tag(s) "
+                            "provided in the Tags field are empty or exceed "
+                            "the maximum allowed character limit of "
+                            f"{PRIVATE_APP_TAG_MAX_LENGTH}."
+                        ),
+                        details=f"Invalid Tags: {', '.join(skipped_tags)}",
+                        resolution=(
+                            "Provide tags that are non-empty and do not "
+                            f"exceed {PRIVATE_APP_TAG_MAX_LENGTH} characters."
+                        ),
+                    )
+                    return ValidationResult(
+                        success=False,
+                        message=(
+                            "Each tag should be non-empty and less than or "
+                            f"equal to {PRIVATE_APP_TAG_MAX_LENGTH} "
+                            "characters."
+                        ),
+                    )
+
+            host = self.netskope_helper._join_multi_source_value(
+                action.parameters.get("host", "")
+            )
+            # For a Static Host field, validate every comma-separated value
+            # at save time and fail the configuration if any value is empty
+            # or is not a valid IPv4 address, IPv4 CIDR block, hostname, or
+            # domain. For a Source field ("$" present) the validation is
+            # deferred to action execution, where invalid host values are
+            # skipped and the remaining valid values are pushed.
+            if host and "$" not in host:
+                _, skipped_hosts, skip_host_count = (
+                    self.netskope_helper.validate_hosts_for_private_app(
+                        hosts_to_push=host.split(","),
+                        private_app_name=action.parameters.get(
+                            "private_app_name", ""
+                        ),
+                    )
+                )
+                if skip_host_count > 0:
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: {skip_host_count} value(s) "
+                            "provided in the Host field are empty or are not "
+                            "a valid IPv4 address, IPv4 CIDR block, hostname, "
+                            "or domain."
+                        ),
+                        details=f"Invalid Host(s): {', '.join(skipped_hosts)}",
+                        resolution=(
+                            "Provide non-empty host values, each a valid "
+                            "IPv4 address, IPv4 CIDR block, hostname, or "
+                            "domain (max 253 characters with each label "
+                            "between 1 and 63 characters)."
+                        ),
+                    )
+                    return ValidationResult(
+                        success=False,
+                        message=(
+                            "Each host should be a non-empty valid IPv4 "
+                            "address, IPv4 CIDR block, hostname, or domain."
+                        ),
+                    )
             list_of_private_apps_list = list(existing_private_apps.keys())
             list_of_private_apps_list.append("create")
             if (
@@ -2152,10 +8327,7 @@ class NetskopePlugin(PluginBase):
                     )
 
             protocols = action.parameters.get("protocol", [])
-            if (
-                action.parameters.get("private_app_name", "") == "create"
-                and not protocols
-            ):
+            if not protocols:
                 return ValidationResult(
                     success=False,
                     message=(
@@ -2181,6 +8353,17 @@ class NetskopePlugin(PluginBase):
             ]
 
             if "TCP" in protocols:
+                # Port values only matter when the protocol is selected, so
+                # the Source-field check is scoped to this block.
+                if "$" in tcp_port:
+                    return ValidationResult(
+                        success=False,
+                        message=(
+                            "'TCP Ports' contains a Source field value. "
+                            "Please provide TCP port(s) in the Static "
+                            "field only."
+                        ),
+                    )
                 if not tcp_port_list:
                     return ValidationResult(
                         success=False,
@@ -2190,7 +8373,7 @@ class NetskopePlugin(PluginBase):
                         ),
                     )
                 if not all(
-                    self._validate_port(port) for port in tcp_port_list
+                    self.netskope_helper._validate_port(port) for port in tcp_port_list
                 ):
                     return ValidationResult(
                         success=False,
@@ -2200,6 +8383,17 @@ class NetskopePlugin(PluginBase):
                         ),
                     )
             if "UDP" in protocols:
+                # Port values only matter when the protocol is selected, so
+                # the Source-field check is scoped to this block.
+                if "$" in udp_port:
+                    return ValidationResult(
+                        success=False,
+                        message=(
+                            "'UDP Ports' contains a Source field value. "
+                            "Please provide UDP port(s) in the Static "
+                            "field only."
+                        ),
+                    )
                 if not udp_port_list:
                     return ValidationResult(
                         success=False,
@@ -2209,7 +8403,7 @@ class NetskopePlugin(PluginBase):
                         ),
                     )
                 if not all(
-                    self._validate_port(port) for port in udp_port_list
+                    self.netskope_helper._validate_port(port) for port in udp_port_list
                 ):
                     return ValidationResult(
                         success=False,
@@ -2295,6 +8489,791 @@ class NetskopePlugin(PluginBase):
             return ValidationResult(
                 success=True, message="Validation successful."
             )
+        elif action.value == "destination_profile":
+            try:
+                existing_profiles = self._get_destination_profiles()
+            except Exception as e:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        f"fetching destination profiles for action "
+                        f"parameter validation. Error: {e}"
+                    ),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
+                )
+                return ValidationResult(success=False, message=str(e))
+            if validation_result := self._validate_parameters(
+                field_name="Operation",
+                field_value=action.parameters.get("operation", ""),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(OPERATION_OPTIONS.keys()),
+            ):
+                return validation_result
+            profile_name = action.parameters.get(
+                "destination_profile_name", ""
+            )
+            valid_profiles = list(existing_profiles.keys())
+            valid_profiles.append("create")
+            if profile_name not in valid_profiles:
+                err_msg = (
+                    "Invalid value provided for the action"
+                    " parameter 'Destination Profile'."
+                )
+                self.logger.error(
+                    message=f"{self.log_prefix}: {err_msg}",
+                    resolution=(
+                        "Select a valid Destination Profile from the"
+                        " dropdown or select 'Create new profile'."
+                    ),
+                )
+                return ValidationResult(
+                    success=False, message=err_msg
+                )
+            if profile_name == "create":
+                new_name = (
+                    action.parameters.get("new_profile_name") or ""
+                ).strip()
+                if validation_result := self._validate_parameters(
+                    field_name="Create New Profile",
+                    field_value=new_name,
+                    field_type=str,
+                    parameter_type="action",
+                    is_source_field_allowed=False,
+                ):
+                    return validation_result
+                if validation_result := self.netskope_helper._validate_max_length(
+                    field_name="Create New Profile",
+                    field_value=new_name,
+                    max_length=MAX_DESTINATION_PROFILE_NAME_LENGTH,
+                ):
+                    return validation_result
+                if validation_result := self.netskope_helper._validate_forbidden_chars(
+                    field_name="Create New Profile",
+                    field_value=new_name,
+                    forbidden_chars=DESTINATION_PROFILE_NAME_FORBIDDEN_CHARS,
+                ):
+                    return validation_result
+            new_description = (
+                action.parameters.get("new_profile_description") or ""
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Profile Description",
+                field_value=new_description,
+                field_type=str,
+                parameter_type="action",
+                is_required=False,
+                is_source_field_allowed=False,
+            ):
+                return validation_result
+            if validation_result := self.netskope_helper._validate_max_length(
+                field_name="Profile Description",
+                field_value=new_description,
+                max_length=MAX_DESTINATION_PROFILE_DESC_LENGTH,
+            ):
+                return validation_result
+            if validation_result := self._validate_parameters(
+                field_name="Match Type",
+                field_value=action.parameters.get(
+                    "profile_match_type", ""
+                ),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(MATCH_TYPE_OPTIONS.keys()),
+            ):
+                return validation_result
+            if validation_result := self._validate_parameters(
+                field_name="Apply Pending Changes",
+                field_value=action.parameters.get(
+                    "apply_pending_changes", ""
+                ),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=["Yes", "No"],
+            ):
+                return validation_result
+            # Multiple mapped Source/Static fields arrive as a list, so
+            # collapse them to the comma-separated form the checks below
+            # already expect.
+            destination_values = self.netskope_helper._join_multi_source_value(
+                action.parameters.get("destination_values") or ""
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Network Targets",
+                field_value=destination_values,
+                field_type=str,
+                parameter_type="action",
+                check_dollar=True,
+            ):
+                return validation_result
+            # Normalize to a stripped string so the shared validator's
+            # fixed field_type check works whether the number field
+            # arrives as an int or a string; the custom check tolerates
+            # an empty value (falls back to the default) and otherwise
+            # requires a positive integer.
+            exact_total_limit = str(
+                action.parameters.get("exact_match_total_limit", "")
+            ).strip()
+            if validation_result := self._validate_parameters(
+                field_name="Tenant Exact-Match Value Limit",
+                field_value=exact_total_limit,
+                field_type=str,
+                parameter_type="action",
+                is_required=False,
+                is_source_field_allowed=False,
+                custom_validation_func=(
+                    lambda v: v == "" or (v.isdigit() and int(v) > 0)
+                ),
+            ):
+                return validation_result
+            return ValidationResult(
+                success=True, message="Validation successful."
+            )
+        elif action.value == "network_profile":
+            return self._validate_network_profile_action(action)
+        elif action.value == "dns_profile":
+            try:
+                existing_profiles = self._get_dns_profiles()
+                security_categories = self._get_security_categories()
+                record_types = self._get_record_types()
+            except Exception as e:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        f"fetching DNS profile metadata for action "
+                        f"parameter validation. Error: {e}"
+                    ),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
+                )
+                return ValidationResult(success=False, message=str(e))
+            if validation_result := self._validate_parameters(
+                field_name="Operation",
+                field_value=action.parameters.get("operation", ""),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(OPERATION_OPTIONS.keys()),
+            ):
+                return validation_result
+            if validation_result := self._validate_parameters(
+                field_name="Action Type",
+                field_value=action.parameters.get(
+                    "dns_profile_action_type", ""
+                ),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(
+                    DNS_PROFILE_ACTION_TYPE_OPTIONS.keys()
+                ),
+            ):
+                return validation_result
+            profile_value = action.parameters.get("dns_profile_name", "")
+            valid_profiles = [
+                f"{name}{CUSTOM_SEPARATOR}{profile_id}"
+                for name, profile_id in existing_profiles.items()
+            ]
+            valid_profiles.append(
+                f"Create new DNS Profile{CUSTOM_SEPARATOR}create"
+            )
+            if validation_result := self._validate_parameters(
+                field_name="DNS Profile",
+                field_value=profile_value,
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=valid_profiles,
+            ):
+                return validation_result
+            if profile_value.endswith(f"{CUSTOM_SEPARATOR}create"):
+                new_name = (
+                    action.parameters.get("new_profile_name") or ""
+                ).strip()
+                if validation_result := self._validate_parameters(
+                    field_name="Create New DNS Profile",
+                    field_value=new_name,
+                    field_type=str,
+                    parameter_type="action",
+                    is_source_field_allowed=False,
+                ):
+                    return validation_result
+                if validation_result := self.netskope_helper._validate_max_length(
+                    field_name="Create New DNS Profile",
+                    field_value=new_name,
+                    max_length=MAX_DNS_PROFILE_NAME_LENGTH,
+                ):
+                    return validation_result
+                if validation_result := self.netskope_helper._validate_forbidden_chars(
+                    field_name="Create New DNS Profile",
+                    field_value=new_name,
+                    forbidden_chars=DNS_PROFILE_FORBIDDEN_CHARS,
+                ):
+                    return validation_result
+            new_description = (
+                action.parameters.get("new_profile_description") or ""
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Profile Description",
+                field_value=new_description,
+                field_type=str,
+                parameter_type="action",
+                is_required=False,
+                is_source_field_allowed=False,
+            ):
+                return validation_result
+            if validation_result := self.netskope_helper._validate_max_length(
+                field_name="Profile Description",
+                field_value=new_description,
+                max_length=MAX_DNS_PROFILE_DESC_LENGTH,
+            ):
+                return validation_result
+            if validation_result := self.netskope_helper._validate_forbidden_chars(
+                field_name="Profile Description",
+                field_value=new_description,
+                forbidden_chars=DNS_PROFILE_FORBIDDEN_CHARS,
+            ):
+                return validation_result
+            categories = action.parameters.get(
+                "dns_security_categories", []
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Categories",
+                field_value=categories,
+                field_type=list,
+                parameter_type="action",
+                is_required=False,
+                is_source_field_allowed=False,
+                custom_validation_func=lambda cats: (
+                    isinstance(cats, list)
+                    and all(
+                        cat in security_categories for cat in cats
+                    )
+                ),
+            ):
+                return validation_result
+            category_bases = {}
+            for category in categories:
+                base = category.rsplit(" (", 1)[0]
+                category_bases.setdefault(base, set()).add(category)
+            for base, variants in category_bases.items():
+                if len(variants) > 1:
+                    err_msg = (
+                        f"Category '{base}' cannot be selected"
+                        " with both '(Block)' and '(Sinkhole)'"
+                        " actions."
+                    )
+                    self.logger.error(
+                        message=f"{self.log_prefix}: {err_msg}",
+                        resolution=(
+                            f"Select either the '(Block)' or"
+                            f" '(Sinkhole)' variant of '{base}',"
+                            " not both."
+                        ),
+                    )
+                    return ValidationResult(
+                        success=False, message=err_msg
+                    )
+            has_sinkhole = any(
+                category.endswith("(Sinkhole)") for category in categories
+            )
+            sinkhole_ip = (
+                action.parameters.get("sinkhole_ip") or ""
+            ).strip()
+            if has_sinkhole:
+                if validation_result := self._validate_parameters(
+                    field_name="Sinkhole IP",
+                    field_value=sinkhole_ip,
+                    field_type=str,
+                    parameter_type="action",
+                    is_source_field_allowed=False,
+                    custom_validation_func=self.netskope_helper._validate_ip_address,
+                ):
+                    return validation_result
+            record_type_values = action.parameters.get(
+                "dns_record_types", []
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Record Types",
+                field_value=record_type_values,
+                field_type=list,
+                parameter_type="action",
+                is_required=True,
+                is_source_field_allowed=False,
+                custom_validation_func=lambda rts: all(
+                    rt in record_types for rt in rts
+                ),
+            ):
+                return validation_result
+            if (
+                "All Record Types" in record_type_values
+                and len(record_type_values) > 1
+            ):
+                err_msg = (
+                    "'All Record Types' cannot be combined"
+                    " with other record types."
+                )
+                self.logger.error(
+                    message=f"{self.log_prefix}: {err_msg}",
+                    resolution=(
+                        "Either select 'All Record Types' on its"
+                        " own or select specific record types"
+                        " without 'All Record Types'."
+                    ),
+                )
+                return ValidationResult(
+                    success=False, message=err_msg
+                )
+            if validation_result := self._validate_parameters(
+                field_name="Block all except Allow list",
+                field_value=action.parameters.get(
+                    "block_all_except_allow_list", ""
+                ),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(
+                    BLOCK_ALL_EXCEPT_ALLOW_LIST_OPTIONS.keys()
+                ),
+            ):
+                return validation_result
+            # Multiple mapped Source/Static fields arrive as a list, so
+            # collapse them to the comma-separated form the checks below
+            # already expect.
+            domain_names = self.netskope_helper._join_multi_source_value(
+                action.parameters.get("domain_names") or ""
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Domain Names",
+                field_value=domain_names,
+                field_type=str,
+                parameter_type="action",
+                check_dollar=True,
+            ):
+                return validation_result
+            return ValidationResult(
+                success=True, message="Validation successful."
+            )
+        elif action.value == "service_profile":
+            try:
+                existing_profiles = self._get_service_profiles(
+                    custom_only=True
+                )
+            except Exception as e:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        f"fetching service profiles for action "
+                        f"parameter validation. Error: {e}"
+                    ),
+                    details=re.sub(
+                        r"token=([0-9a-zA-Z]*)",
+                        "token=********&",
+                        traceback.format_exc(),
+                    ),
+                )
+                return ValidationResult(success=False, message=str(e))
+            if validation_result := self._validate_parameters(
+                field_name="Operation",
+                field_value=action.parameters.get("operation", ""),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(
+                    SERVICE_PROFILE_OPERATION_OPTIONS.keys()
+                ),
+            ):
+                return validation_result
+            icmp = action.parameters.get("icmp", False)
+            if icmp not in [True, False]:
+                return ValidationResult(
+                    success=False,
+                    message=(
+                        "Invalid value provided for the choice"
+                        " parameter 'ICMP'."
+                    ),
+                )
+            profile_name = action.parameters.get(
+                "service_profile_name", ""
+            )
+            valid_profiles = list(existing_profiles.keys())
+            valid_profiles.append("create")
+            if validation_result := self._validate_parameters(
+                field_name="Service Profile",
+                field_value=profile_name,
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=valid_profiles,
+            ):
+                return validation_result
+            if profile_name == "create":
+                new_name = (
+                    action.parameters.get("new_profile_name") or ""
+                ).strip()
+                if validation_result := self._validate_parameters(
+                    field_name="Service Profile Name",
+                    field_value=new_name,
+                    field_type=str,
+                    parameter_type="action",
+                    is_source_field_allowed=False,
+                ):
+                    return validation_result
+                if validation_result := self.netskope_helper._validate_max_length(
+                    field_name="Service Profile Name",
+                    field_value=new_name,
+                    max_length=MAX_SERVICE_PROFILE_NAME_LENGTH,
+                ):
+                    return validation_result
+            new_description = (
+                action.parameters.get("new_profile_description") or ""
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Description",
+                field_value=new_description,
+                field_type=str,
+                parameter_type="action",
+                is_required=False,
+                is_source_field_allowed=False,
+            ):
+                return validation_result
+            if validation_result := self.netskope_helper._validate_max_length(
+                field_name="Description",
+                field_value=new_description,
+                max_length=MAX_SERVICE_PROFILE_DESC_LENGTH,
+            ):
+                return validation_result
+            port_fields = {
+                "tcp_ports": "TCP Ports",
+                "udp_ports": "UDP Ports",
+                "tcp_udp_ports": "TCP/UDP Ports",
+            }
+            has_any_ports = False
+            for key, label in port_fields.items():
+                # Multiple mapped Source/Static fields arrive as a list, so
+                # collapse them to the comma-separated form the checks
+                # below already expect.
+                raw_value = self.netskope_helper._join_multi_source_value(
+                    action.parameters.get(key) or ""
+                )
+                if validation_result := self._validate_parameters(
+                    field_name=label,
+                    field_value=raw_value,
+                    field_type=str,
+                    parameter_type="action",
+                    is_required=False,
+                    check_dollar=True,
+                    custom_validation_func=lambda v: all(
+                        self.netskope_helper._validate_port(p)
+                        for p in [
+                            p.strip()
+                            for p in v.split(",")
+                            if p.strip()
+                        ]
+                    ),
+                ):
+                    return validation_result
+                if raw_value.strip():
+                    has_any_ports = True
+            if not has_any_ports and not icmp:
+                err_msg = (
+                    "At least one of TCP Ports, UDP Ports,"
+                    " TCP/UDP Ports, or ICMP is required."
+                )
+                self.logger.error(
+                    message=f"{self.log_prefix}: {err_msg}",
+                    resolution=(
+                        "Provide at least one port value or enable"
+                        " ICMP in the action configuration."
+                    ),
+                )
+                return ValidationResult(
+                    success=False, message=err_msg
+                )
+            return ValidationResult(
+                success=True, message="Validation successful."
+            )
+        elif action.value == "device_classification":
+            try:
+                existing_classifications = (
+                    self._get_device_classifications()
+                )
+                existing_rules = self._get_device_classification_rules()
+            except Exception as e:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Error occurred while "
+                        "fetching device classification metadata for "
+                        f"action parameter validation. Error: {e}"
+                    ),
+                    details=traceback.format_exc(),
+                )
+                return ValidationResult(success=False, message=str(e))
+            if validation_result := self._validate_parameters(
+                field_name="Operation",
+                field_value=action.parameters.get("operation", ""),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(OPERATION_OPTIONS.keys()),
+            ):
+                return validation_result
+            classification_value = action.parameters.get(
+                "device_classification", ""
+            )
+            valid_classifications = list(
+                existing_classifications.keys()
+            )
+            valid_classifications.append("create")
+            if validation_result := self._validate_parameters(
+                field_name="Device Classification",
+                field_value=classification_value,
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=valid_classifications,
+            ):
+                return validation_result
+            if classification_value == "create":
+                new_name = (
+                    action.parameters.get("new_classification_name")
+                    or ""
+                ).strip()
+                if validation_result := self._validate_parameters(
+                    field_name="Device Classification Name",
+                    field_value=new_name,
+                    field_type=str,
+                    parameter_type="action",
+                    is_source_field_allowed=False,
+                ):
+                    return validation_result
+                if validation_result := self.netskope_helper._validate_max_length(
+                    field_name="Device Classification Name",
+                    field_value=new_name,
+                    max_length=MAX_DEVICE_CLASSIFICATION_NAME_LENGTH,
+                ):
+                    return validation_result
+            rule_value = action.parameters.get(
+                "device_classification_rule", ""
+            )
+            valid_rules = [
+                f"{rule.get('name', '')}"
+                f"{CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION}"
+                f"{rule.get('id')}"
+                for rule in existing_rules
+                if rule.get("name") and rule.get("id") is not None
+            ]
+            valid_rules.append(
+                f"Create new Device Classification Rule"
+                f"{CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION}create"
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Device Classification Rule",
+                field_value=rule_value,
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=valid_rules,
+            ):
+                return validation_result
+            if rule_value.endswith(
+                f"{CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION}create"
+            ):
+                new_rule = (
+                    action.parameters.get("new_rule_name") or ""
+                ).strip()
+                if validation_result := self._validate_parameters(
+                    field_name="Device Classification Rule Name",
+                    field_value=new_rule,
+                    field_type=str,
+                    parameter_type="action",
+                    is_source_field_allowed=False,
+                ):
+                    return validation_result
+                if validation_result := self.netskope_helper._validate_max_length(
+                    field_name="Device Classification Rule Name",
+                    field_value=new_rule,
+                    max_length=MAX_DEVICE_CLASSIFICATION_NAME_LENGTH,
+                ):
+                    return validation_result
+                if CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION in new_rule:
+                    err_msg = (
+                        "'Device Classification Rule Name' should"
+                        " not contain"
+                        f" '{CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION}'."
+                    )
+                    self.logger.error(
+                        message=f"{self.log_prefix}: {err_msg}",
+                        resolution=(
+                            "Remove"
+                            f" '{CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION}'"
+                            " from the 'Device Classification Rule"
+                            " Name'."
+                        ),
+                    )
+                    return ValidationResult(
+                        success=False, message=err_msg
+                    )
+            if validation_result := self._validate_parameters(
+                field_name="Operating System",
+                field_value=action.parameters.get("os", ""),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(
+                    DEVICE_CLASSIFICATION_OS_OPTIONS.keys()
+                ),
+            ):
+                return validation_result
+            if validation_result := self._validate_parameters(
+                field_name="Match Type",
+                field_value=action.parameters.get(
+                    "logical_operator", ""
+                ),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(
+                    DEVICE_CLASSIFICATION_OPERATOR_OPTIONS.keys()
+                ),
+            ):
+                return validation_result
+            if validation_result := self._validate_parameters(
+                field_name="Group Match Type",
+                field_value=action.parameters.get(
+                    "group_operator", ""
+                ),
+                field_type=str,
+                parameter_type="action",
+                is_source_field_allowed=False,
+                allowed_values=list(
+                    DEVICE_CLASSIFICATION_OPERATOR_OPTIONS.keys()
+                ),
+            ):
+                return validation_result
+            # Tags are required. Static tags are validated to exist on
+            # the Netskope Tenant at save; Source fields ("$") are
+            # resolved and validated at execution time instead. Multiple
+            # mapped fields arrive as a list, so collapse them to the
+            # comma-separated form the checks below already expect.
+            raw_tags = self.netskope_helper._join_multi_source_value(
+                action.parameters.get("classification_tags") or ""
+            )
+            if validation_result := self._validate_parameters(
+                field_name="Tags",
+                field_value=raw_tags,
+                field_type=str,
+                parameter_type="action",
+                check_dollar=True,
+            ):
+                return validation_result
+            if "$" not in raw_tags:
+                raw_segments = raw_tags.split(",")
+                tag_list = [
+                    tag.strip()
+                    for tag in raw_segments
+                    if tag.strip()
+                ]
+                if any(not tag.strip() for tag in raw_segments):
+                    err_msg = (
+                        "'Tags' should not contain empty values"
+                        " between commas."
+                    )
+                    self.logger.error(
+                        message=f"{self.log_prefix}: {err_msg}",
+                        resolution=(
+                            "Provide a non-empty tag name between"
+                            " each comma in the 'Tags' field."
+                        ),
+                    )
+                    return ValidationResult(
+                        success=False, message=err_msg
+                    )
+                # Short-circuit: any tag that violates Netskope's
+                # tag-creation constraints can never exist on the
+                # tenant, so fail immediately without making an API
+                # call to _fetch_all_tags.
+                invalid_chars = [
+                    tag for tag in tag_list
+                    if not re.match(REGEX_TAG, tag)
+                ]
+                if invalid_chars:
+                    err_msg = (
+                        "One or more Tags contain invalid characters"
+                        " and cannot exist on the Netskope Tenant."
+                        " Tag names must contain only alphanumeric"
+                        " characters, hyphens, and spaces."
+                    )
+                    self.logger.error(
+                        message=f"{self.log_prefix}: {err_msg}",
+                        resolution=(
+                            "Provide tag names that contain only"
+                            " alphanumeric characters, hyphens, and"
+                            " spaces."
+                        ),
+                    )
+                    return ValidationResult(
+                        success=False, message=err_msg
+                    )
+                for tag in tag_list:
+                    if validation_result := self.netskope_helper._validate_max_length(
+                        field_name=f"Tag '{tag}'",
+                        field_value=tag,
+                        max_length=TAG_DEVICE_TAG_LENGTH,
+                    ):
+                        return validation_result
+                try:
+                    tag_cache = self._fetch_all_tags()
+                except Exception as e:
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Error occurred while "
+                            "fetching device tags for action parameter "
+                            f"validation. Error: {e}"
+                        ),
+                        details=traceback.format_exc(),
+                    )
+                    return ValidationResult(
+                        success=False, message=str(e)
+                    )
+                missing = [
+                    tag
+                    for tag in tag_list
+                    if tag.lower() not in tag_cache
+                ]
+                if missing:
+                    err_msg = (
+                        "Some of the provided Tags do not exist on"
+                        " the Netskope Tenant. Provide existing"
+                        " device tags."
+                    )
+                    self.logger.error(
+                        message=f"{self.log_prefix}: {err_msg}",
+                        details=(
+                            "Tags not found on the Netskope Tenant: "
+                            f"{', '.join(missing)}."
+                        ),
+                        resolution=(
+                            "Ensure all provided tag names exist on"
+                            " the Netskope Tenant before saving."
+                        ),
+                    )
+                    return ValidationResult(
+                        success=False, message=err_msg
+                    )
+            return ValidationResult(
+                success=True, message="Validation successful."
+            )
         return ValidationResult(
             success=False, message="Invalid action provided."
         )
@@ -2351,7 +9330,11 @@ class NetskopePlugin(PluginBase):
                     f"{self.log_prefix}: {error_message} "
                     f"Error: {err}"
                 ),
-                details=str(traceback.format_exc()),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
             )
             raise NetskopeException(error_message)
         self.logger.debug(
@@ -2384,7 +9367,19 @@ class NetskopePlugin(PluginBase):
         url = (
             f"{tenant_name}{URLS.get('V2_PRIVATE_APP')}"
         )
-        params = {"fields": "app_id,app_name,host"}  # we need only 3 fields
+        # tags / protocols / publishers / use_publisher_dns are needed only
+        # when resolving a group for a push (get_hosts_of set): the Append
+        # path unions the new tags with the app's existing tags, and the
+        # metadata-refresh path compares these fields against the action
+        # params to skip no-op update calls. The dropdown/validate calls do
+        # not need them.
+        fields = "app_id,app_name,host"
+        if get_hosts_of:
+            fields += (
+                ",tags,protocols,service_publisher_assignments,"
+                "use_publisher_dns"
+            )
+        params = {"fields": fields}
         logger_msg = "fetching private apps on the Netskope Tenant"
         self.logger.debug(
             f"{self.log_prefix}: {logger_msg.capitalize()}."
@@ -2408,8 +9403,20 @@ class NetskopePlugin(PluginBase):
                 dict_of_private_apps[x["app_name"]] = {
                     "id": x["app_id"],
                     "host_count": len(x["host"].split(",")),
+                    "tags": self.netskope_helper._extract_private_app_tag_names(
+                        x.get("tags", [])
+                    ),
                 } | (
-                    {"hosts": x["host"].split(",")}
+                    {
+                        "hosts": x["host"].split(","),
+                        "protocols": x.get("protocols", []),
+                        "publishers": x.get(
+                            "service_publisher_assignments", []
+                        ),
+                        "use_publisher_dns": x.get(
+                            "use_publisher_dns", False
+                        ),
+                    }
                     if get_hosts_of
                     and x["app_name"].startswith(
                         get_hosts_of.removesuffix("]")
@@ -2425,7 +9432,11 @@ class NetskopePlugin(PluginBase):
                     f"{self.log_prefix}: {error_message} "
                     f"Error: {err}"
                 ),
-                details=str(traceback.format_exc()),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
             )
             raise NetskopeException(error_message)
         self.logger.debug(
@@ -2433,74 +9444,6 @@ class NetskopePlugin(PluginBase):
             f"{len(dict_of_private_apps)} private app(s)."
         )
         return dict_of_private_apps
-
-    def _get_private_app(
-        self,
-        prefix: str,
-        has_host: Optional[str] = None,
-    ) -> Union[dict, tuple]:
-        """Check private app present in Netskope and \
-            create a new one if not found.
-
-        Args:
-            prefix (str): Private app name.
-            has_host (str): Private app name.
-
-        Returns:
-            Dict: Dictionary of private apps.
-        """
-        tenant_name = (
-            self.tenant.parameters.get('tenantName', '').strip()
-        )
-        headers = {
-            "Netskope-API-Token": resolve_secret(
-                self.tenant.parameters.get("v2token", "")
-            )
-        }
-        url = (
-            f"{tenant_name}{URLS.get('V2_PRIVATE_APP')}"
-        )
-        params = {"fields": "app_id,app_name,host"}  # we need only 3 fields
-        logger_msg = "fetching private apps on the Netskope Tenant"
-        self.logger.debug(
-            f"{self.log_prefix}: {logger_msg.capitalize()}."
-        )
-        try:
-            response = self.netskope_helper._api_call_helper(
-                url=url,
-                method="get",
-                error_codes=["CRE_1040", "CRE_1041"],
-                headers=headers,
-                params=params,
-                proxies=self.proxy,
-                message=f"Error occurred while {logger_msg}",
-                logger_msg=logger_msg,
-            )
-
-            existing_private_apps = response.get("data", {}).get(
-                "private_apps", []
-            )
-            # Private app from netskope.
-            for app in existing_private_apps:
-                split_hosts = app.get("host", "").split(",")
-                if not app["app_name"].startswith(prefix.removesuffix("]")):
-                    continue
-                if has_host not in split_hosts:
-                    continue
-                return app
-        except NetskopeException:
-            raise
-        except Exception as err:
-            error_message = f"Error occurred while {logger_msg}."
-            self.logger.error(
-                message=(
-                    f"{self.log_prefix}: {error_message} "
-                    f"Error: {err}"
-                ),
-                details=str(traceback.format_exc()),
-            )
-            raise NetskopeException(error_message)
-        return None
 
     def get_action_params(self, action: Action) -> list:
         """Get fields required for an action.
@@ -2659,15 +9602,38 @@ class NetskopePlugin(PluginBase):
             existing_publishers = self._get_publishers()
             return [
                 {
+                    "label": "Skip Excess Hosts",
+                    "key": "skip_excess_hosts",
+                    "type": "choice",
+                    "choices": [
+                        {"key": "No", "value": False},
+                        {"key": "Yes", "value": True},
+                    ],
+                    "default": False,
+                    "mandatory": True,
+                    "description": (
+                        "A private app holds at most "
+                        f"{MAX_HOSTS_PER_PRIVATE_APP} hosts. Select 'No' to "
+                        "create roll-over sibling private apps until all "
+                        "hosts are accommodated or the tenant's private app "
+                        "limit is reached (the rest are skipped). Select "
+                        "'Yes' to not create roll-over siblings and skip "
+                        "any hosts beyond the existing capacity. Select "
+                        "from the Static field dropdown only."
+                    ),
+                },
+                {
                     "label": "Host",
                     "key": "host",
                     "type": "text",
                     "default": "",
                     "placeholder": "i.e. 127.0.0.1",
                     "mandatory": True,
+                    "allowMultipleSource": True,
                     "description": (
                         "Host address to append to the private app. "
-                        "Multiple comma-separated values are supported. "
+                        "One or more Source fields can be selected, and "
+                        "multiple comma-separated values are supported. "
                         "Example: host-1, host-2"
                     ),
                 },
@@ -2678,11 +9644,13 @@ class NetskopePlugin(PluginBase):
                     "default": "",
                     "placeholder": "i.e. tag-1, tag-2",
                     "mandatory": False,
+                    "allowMultipleSource": True,
                     "description": (
                         "Tags to set for the private app. "
                         "These tags will overwrite existing "
                         "tags available on your tenant. "
-                        "Multiple comma-separated values are supported. "
+                        "One or more Source fields can be selected, and "
+                        "multiple comma-separated values are supported. "
                         "Example: tag-1, tag-2"
                     ),
                 },
@@ -2833,9 +9801,10 @@ class NetskopePlugin(PluginBase):
                     "default": "",
                     "placeholder": "i.e. tag-1, tag-2",
                     "mandatory": True,
+                    "allowMultipleSource": True,
                     "description": (
-                        "Select field for the tags or provide Static comma "
-                        "separated tag values."
+                        "Select one or more fields for the tags or provide "
+                        "Static comma separated tag values."
                     ),
                 },
                 {
@@ -2901,11 +9870,12 @@ class NetskopePlugin(PluginBase):
                     "default": "",
                     "placeholder": "e.g. tag-1, tag-2",
                     "mandatory": False,
+                    "allowMultipleSource": True,
                     "description": (
-                        "Select a source field for the tags or provide static "
-                        "comma-separated tag values. Note: For Replace "
-                        "action, if tags are not provided or empty, all tags "
-                        "will be removed from the device."
+                        "Select one or more source fields for the tags or "
+                        "provide static comma-separated tag values. Note: "
+                        "For Replace action, if tags are not provided or "
+                        "empty, all tags will be removed from the device."
                     ),
                 },
                 {
@@ -2933,6 +9903,19 @@ class NetskopePlugin(PluginBase):
                         " device on which the tag action should be "
                         "performed. Select a source field or "
                         "provide a static value."
+                    ),
+                },
+                {
+                    "label": "Hostname",
+                    "key": "hostname",
+                    "type": "text",
+                    "default": "",
+                    "placeholder": "e.g. device-hostname",
+                    "mandatory": True,
+                    "description": (
+                        "The hostname of the device on which the tag "
+                        "action should be performed. Select a source "
+                        "field or provide a static value."
                     ),
                 },
             ]
@@ -2987,6 +9970,144 @@ class NetskopePlugin(PluginBase):
                     "description": "Select Tag from Static field dropdown.",
                 },
             ]
+        elif action.value == "destination_profile":
+            existing_profiles = self._get_destination_profiles()
+            params = copy.deepcopy(DESTINATION_PROFILE_ACTION_PARAMS)
+            profile_choices = [
+                {"key": key, "value": key}
+                for key in sorted(existing_profiles.keys())
+            ] + [
+                {"key": "Create new profile", "value": "create"}
+            ]
+            for param in params:
+                if param["key"] == "destination_profile_name":
+                    param["choices"] = profile_choices
+            return params
+        elif action.value == "network_profile":
+            existing_profiles = self._get_network_profiles()
+            params = copy.deepcopy(NETWORK_PROFILE_ACTION_PARAMS)
+            profile_choices = [
+                {"key": key, "value": key}
+                for key in sorted(existing_profiles.keys())
+            ] + [
+                {"key": "Create new profile", "value": "create"}
+            ]
+            for param in params:
+                if param["key"] == "network_profile_name":
+                    param["choices"] = profile_choices
+            return params
+        elif action.value == "dns_profile":
+            existing_profiles = self._get_dns_profiles()
+            security_categories = self._get_security_categories()
+            record_types = self._get_record_types()
+            profile_choices = [
+                {
+                    "key": name,
+                    "value": f"{name}{CUSTOM_SEPARATOR}{profile_id}",
+                }
+                for name, profile_id in sorted(
+                    existing_profiles.items(),
+                    key=lambda item: item[0].lower(),
+                )
+            ] + [
+                {
+                    "key": "Create new DNS Profile",
+                    "value": (
+                        f"Create new DNS Profile"
+                        f"{CUSTOM_SEPARATOR}create"
+                    ),
+                }
+            ]
+            params = copy.deepcopy(DNS_PROFILE_ACTION_PARAMS)
+            for param in params:
+                key = param["key"]
+                if key == "dns_profile_name":
+                    param["choices"] = profile_choices
+                    param["default"] = (
+                        profile_choices[0]["value"]
+                        if profile_choices
+                        else ""
+                    )
+                elif key == "dns_security_categories":
+                    param["choices"] = [
+                        {"key": category, "value": category}
+                        for category in security_categories
+                    ]
+                elif key == "dns_record_types":
+                    param["choices"] = [
+                        {"key": record_type, "value": record_type}
+                        for record_type in record_types
+                    ]
+                    param["default"] = (
+                        [record_types[0]] if record_types else []
+                    )
+            return params
+        elif action.value == "service_profile":
+            existing_profiles = self._get_service_profiles(
+                custom_only=True
+            )
+            params = copy.deepcopy(SERVICE_PROFILE_ACTION_PARAMS)
+            profile_choices = [
+                {"key": key, "value": key}
+                for key in sorted(existing_profiles.keys())
+            ] + [
+                {
+                    "key": "Create new service profile",
+                    "value": "create",
+                }
+            ]
+            for param in params:
+                if param["key"] == "service_profile_name":
+                    param["choices"] = profile_choices
+            return params
+        elif action.value == "device_classification":
+            existing_classifications = (
+                self._get_device_classifications()
+            )
+            existing_rules = self._get_device_classification_rules()
+            classification_choices = [
+                {"key": name, "value": name}
+                for name in sorted(
+                    existing_classifications.keys(),
+                    key=lambda n: n.lower(),
+                )
+            ] + [
+                {
+                    "key": "Create new Device Classification",
+                    "value": "create",
+                }
+            ]
+            rule_choices = [
+                {
+                    "key": rule.get("name", ""),
+                    "value": (
+                        f"{rule.get('name', '')}"
+                        f"{CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION}"
+                        f"{rule.get('id')}"
+                    ),
+                }
+                for rule in sorted(
+                    existing_rules,
+                    key=lambda r: str(r.get("name", "")).lower(),
+                )
+                if rule.get("name") and rule.get("id") is not None
+            ] + [
+                {
+                    "key": "Create new Device Classification Rule",
+                    "value": (
+                        f"Create new Device Classification Rule"
+                        f"{CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION}create"
+                    ),
+                }
+            ]
+            params = copy.deepcopy(DEVICE_CLASSIFICATION_ACTION_PARAMS)
+            for param in params:
+                key = param["key"]
+                if key == "device_classification":
+                    param["choices"] = classification_choices
+                elif key == "device_classification_rule":
+                    param["choices"] = rule_choices
+            return params
         return []
 
     def _push_private_app(
@@ -3001,204 +10122,167 @@ class NetskopePlugin(PluginBase):
         use_publisher_dns: bool,
         default_url: str,
         tags: list[str] = [],
+        skip_excess_hosts: bool = False,
+        host_to_tags: Optional[dict] = None,
+        compact: bool = False,
     ):
-        """Push a private app to Netskope with the provided indicators, \
-            app names, protocols, and publishers.
+        """Append host(s) to a private app group.
+
+        Resolves the logical private app (the base app ``[X]`` plus any
+        numbered roll-over siblings ``[X 2]`` ...), runs the shared setup
+        (protocols, publishers, host/tag validation, group enumeration),
+        then appends the hosts via ``_append_private_app_hosts`` (honouring
+        the per-app host cap ``MAX_HOSTS_PER_PRIVATE_APP`` and
+        ``skip_excess_hosts``). When ``compact`` is set (bulk sync only) the
+        group is consolidated after the append to reclaim apps left
+        partially filled by earlier reverts.
 
         Args:
-            host (Union[str, list[str]]): The host to be pushed.
-            existing_private_app_name (str): The name of an \
-                existing private app.
-            new_private_app_name (str): The name of a new private app.
+            host (Union[str, list[str]]): The host(s) to be shared.
+            existing_private_app_name (str): Selected app name, or
+                ``create``.
+            new_private_app_name (str): Name for a newly created app.
             protocol_type (List[str]): The list of protocol types.
             tcp_ports (List[int]): The list of TCP ports.
             udp_ports (List[int]): The list of UDP ports.
             publishers (List[str]): The list of publishers.
-            use_publisher_dns (bool): A boolean indicating whether \
-                to use the publisher DNS.
+            use_publisher_dns (bool): Whether to use the publisher DNS.
             default_url (str): The default host.
             tags (List[str], optional): The list of tags. Defaults to [].
+            skip_excess_hosts (bool, optional): When True, do not create \
+                new roll-over sibling apps for hosts beyond the existing \
+                capacity - the excess hosts are skipped. When False, new \
+                siblings are created until all hosts fit or the tenant's \
+                private app limit is reached. Defaults to False.
+            host_to_tags (Optional[dict], optional): Pre-built and \
+                pre-validated ``{host -> set(tag_name)}`` map used to scope \
+                each app's tags to the records whose hosts land in it \
+                (bulk path). When None (single/fallback), it is built from \
+                ``tags`` and applied uniformly to all hosts. Defaults None.
+            compact (bool, optional): When True (set by the bulk sync), \
+                consolidate the app group after the append so apps left \
+                partially filled by earlier reverts are re-packed and any \
+                emptied trailing apps removed. Best-effort. Defaults False.
+
+        Returns:
+            tuple[set[str], dict[str, int]]: ``(not_placed, added_counts)``
+                where ``not_placed`` is the set of host values that were
+                NOT placed (invalid plus capacity-skipped), used by
+                ``execute_actions`` to attribute failed action ids per
+                record, and ``added_counts`` maps each private app name to
+                the number of hosts added to it.
         """
         tenant_name = (
             self.tenant.parameters.get('tenantName', '').strip()
         )
-        headers = {
-            "Netskope-API-Token": resolve_secret(
-                self.tenant.parameters.get("v2token", "")
-            )
-        }
-
         try:
             if existing_private_app_name == "create":
-                private_app_name = f"[{new_private_app_name}]"
+                base_name = new_private_app_name
             else:
-                private_app_name = existing_private_app_name
+                base_name = existing_private_app_name.removeprefix(
+                    "["
+                ).removesuffix("]")
+            private_app_name = f"[{base_name}]"
+            # Validate/filter the hosts first (no API calls): if nothing is
+            # valid we can short-circuit before the fetch-apps /
+            # fetch-publishers calls below, which would otherwise be wasted.
+            if host and isinstance(host, str):
+                host = list(map(lambda x: x.strip(), host.split(",")))
+            elif host:
+                # Host accepts multiple mapped fields: one entry per field,
+                # nested one level deeper wherever a mapped Source field's
+                # record value is itself a list. Flatten to the same shape
+                # the Static branch above produces.
+                host = self.netskope_helper._normalize_csv_values(host)
+            if host_to_tags is None:
+                # Single-record / fallback: validate the uniform tags and
+                # map every valid host to the same tag-name set.
+                valid_hosts, valid_tags, invalid_hosts = (
+                    self._filter_private_app_hosts_tags(
+                        host if host else [], tags, private_app_name
+                    )
+                )
+                tag_names = {tag["tag_name"] for tag in valid_tags}
+                host_to_tags = {
+                    valid_host: set(tag_names) for valid_host in valid_hosts
+                }
+            else:
+                # Bulk: tags were validated + attached per record upstream;
+                # only the hosts need validating here.
+                valid_hosts, _, invalid_hosts = (
+                    self._filter_private_app_hosts_tags(
+                        host if host else [], [], private_app_name
+                    )
+                )
+            # De-duplicate while keeping a deterministic order.
+            unique_hosts = list(dict.fromkeys(valid_hosts))
+            if not unique_hosts:
+                # Append has nothing to add - skip without the fetch-apps /
+                # fetch-publishers calls below. Every record in this group
+                # contributed only invalid/empty hosts, so returning them as
+                # not-placed fails all those records.
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: No valid host to add to "
+                        f"private app '{private_app_name}'; hence"
+                        " skipping the action."
+                    ),
+                    resolution=(
+                        "Provide at least one valid host (IPv4 "
+                        "address, IPv4 CIDR block, hostname, or "
+                        "domain)."
+                    ),
+                )
+                return set(invalid_hosts), {}
             existing_private_apps = self._get_private_apps(
                 get_hosts_of=private_app_name
             )
-            final_name = private_app_name
-            counter = 2
-            while True:
-                if final_name not in existing_private_apps:
-                    existing_private_app_name = final_name.removeprefix(
-                        "["
-                    ).removesuffix("]")
-                    break
-                if (
-                    existing_private_apps[final_name].get("host_count", 0)
-                    < MAX_HOSTS_PER_PRIVATE_APP
-                ):
-                    break
-                final_name = f"[{private_app_name.removeprefix('[').removesuffix(']')} {counter}]"
-                counter += 1
-            private_app_name = final_name
-            existing_publishers = self._get_publishers()
-            protocols_list = []
-            for protocol in protocol_type:
-                if protocol == "TCP":
-                    protocols_list.append(
-                        {"type": "tcp", "ports": ",".join(tcp_ports)}
-                    )
-                if protocol == "UDP":
-                    protocols_list.append(
-                        {"type": "udp", "ports": ",".join(udp_ports)}
-                    )
-
-            publishers_list = []
-            skipped_publishers = []
-            for publisher in publishers:
-                if publisher in existing_publishers:
-                    publishers_list.append(
-                        {
-                            "publisher_id": existing_publishers[publisher],
-                            "publisher_name": publisher,
-                        }
-                    )
-                else:
-                    skipped_publishers.append(publisher)
-
-            if not publishers_list and skipped_publishers:
-                self.logger.error(
-                    f"{self.log_prefix}: Unable to find the "
-                    f"provided publishers [{','.join(skipped_publishers)}]."
-                )
-                raise NetskopeException(
-                    f"{self.log_prefix}: Could not create new private app "
-                    "to share host."
-                )
-
-            if skipped_publishers:
-                self.logger.error(
-                    f"{self.log_prefix}: Unable to find the following "
-                    f"publishers [{','.join(skipped_publishers)}]."
-                    " Hence ignoring them while creating "
-                    f"the private app '{private_app_name}'."
-                )
-            # Check if the private app already exists
-            if private_app_name not in existing_private_apps:
-                # Creating URL List
-                self.logger.debug(
-                    f"{self.log_prefix}: Private app '{private_app_name}' "
-                    "does not exist. Creating a new private app."
-                )
-
-                if existing_private_app_name == "create":
-                    app_name_to_create = new_private_app_name
-                else:
-                    app_name_to_create = existing_private_app_name
-
-                data = {
-                    "app_name": app_name_to_create,
-                    "host": default_url,
-                    "publishers": publishers_list,
-                    "use_publisher_dns": use_publisher_dns,
-                }
-                if protocols_list:
-                    data["protocols"] = protocols_list
-                logger_msg = "creating private app on the Netskope Tenant"
-                url = (
-                    f"{tenant_name}{URLS.get('V2_PRIVATE_APP')}"
-                )
-                response = self.netskope_helper._api_call_helper(
-                    url=url,
-                    method="post",
-                    error_codes=["CRE_1043", "CRE_1044"],
-                    headers=headers,
-                    json=data,
-                    proxies=self.proxy,
-                    message=f"Error occurred while {logger_msg}",
-                    logger_msg=logger_msg,
-                    is_handle_error_required=False
-                )
-
-                if response.status_code not in [
-                    200,
-                    201,
-                ]:
-                    err_msg = (
-                        f"Error occurred while {logger_msg}. "
-                    )
-                    self.logger.error(
-                        message=err_msg,
-                        details=str(response.text),
-                    )
-                    raise NetskopeException(
-                        "Could not create new private app to share host.",
-                    )
-                create_private_app_json = handle_status_code(
-                    response,
-                    error_code="CRE_1044",
-                    custom_message=f"Error occurred while {logger_msg}.",
-                    plugin=self.log_prefix,
-                    notify=False,
-                    log=True,
-                )
-
-                if create_private_app_json.get("status", "") != "success":
-                    self.logger.error(
-                        message=(
-                            f"{self.log_prefix}: Error occurred while "
-                            "creating private app. "
-                            f"Received exit code {response.status_code}."
-                        ),
-                        details=repr(create_private_app_json),
-                    )
-                    raise NetskopeException(
-                        "Could not create new private app to share the host."
-                    )
-
-                existing_private_apps[
-                    create_private_app_json["data"]["app_name"]
-                ] = {
-                    "id": create_private_app_json["data"]["app_id"],
-                    "host_count": 0,
-                    "hosts": [],
-                }
-
-            if host and isinstance(host, str):
-                host = list(map(lambda x: x.strip(), host.split(",")))
-            data = {
-                "host": ",".join(
-                    list(
-                        set(
-                            existing_private_apps[private_app_name].get(
-                                "hosts", []
-                            )
-                        ).union(host)
-                    )
-                ),
-                "tags": (
-                    list(map(lambda t: {"tag_name": t}, tags)) if tags else []
-                ),
-                "publishers": publishers_list,
+            protocols_list = self.netskope_helper._build_private_app_protocols(
+                protocol_type, tcp_ports, udp_ports
+            )
+            publishers_list = self._resolve_private_app_publishers(
+                publishers, private_app_name
+            )
+            members = self.netskope_helper._ordered_private_app_group(
+                existing_private_apps, base_name
+            )
+            shared = {
+                "tenant_name": tenant_name,
+                "base_name": base_name,
+                "private_app_name": private_app_name,
+                "members": members,
+                "host_to_tags": host_to_tags,
+                "publishers_list": publishers_list,
                 "use_publisher_dns": use_publisher_dns,
+                "protocols_list": protocols_list,
+                "default_url": default_url,
+                "skip_excess_hosts": skip_excess_hosts,
             }
-            if protocols_list:
-                data["protocols"] = protocols_list
-            return self._patch_private_app(
-                tenant_name,
-                existing_private_apps[private_app_name].get("id", ""),
-                data,
+            capacity_skipped, added_counts = (
+                self._append_private_app_hosts(unique_hosts, **shared)
+            )
+            # After the append, consolidate the group (bulk sync only): an
+            # earlier revert may have left apps partially filled, so re-pack
+            # the group to free up trailing apps. Best-effort - a compaction
+            # failure is logged but never fails the action.
+            if compact:
+                self._compact_private_app_group(
+                    tenant_name,
+                    base_name,
+                    private_app_name,
+                    host_to_tags,
+                    publishers_list,
+                    use_publisher_dns,
+                    protocols_list,
+                    default_url,
+                )
+            # Hosts that were not placed: invalid (validation-filtered) plus
+            # capacity-skipped (Skip Excess / tenant limit). The caller uses
+            # this to attribute failed action ids per record, and
+            # added_counts (app name -> hosts added) for the final summary.
+            return (
+                set(invalid_hosts) | set(capacity_skipped or []),
+                added_counts,
             )
         except NetskopeException:
             raise
@@ -3219,6 +10303,820 @@ class NetskopePlugin(PluginBase):
                 error_code="CRE_1021",
             )
             raise NetskopeException(error_message)
+
+    def _resolve_private_app_publishers(self, publishers, private_app_name):
+        """Resolve publisher names to private app publisher entries.
+
+        Unknown publishers are skipped and logged; if every provided
+        publisher is unknown a NetskopeException is raised.
+
+        Args:
+            publishers (list[str]): Publisher names selected for the app.
+            private_app_name (str): Target app name (used in logs).
+
+        Returns:
+            list[dict]: ``{publisher_id, publisher_name}`` entries.
+        """
+        existing_publishers = self._get_publishers()
+        publishers_list = []
+        skipped_publishers = []
+        for publisher in publishers:
+            if publisher in existing_publishers:
+                publishers_list.append(
+                    {
+                        "publisher_id": existing_publishers[publisher],
+                        "publisher_name": publisher,
+                    }
+                )
+            else:
+                skipped_publishers.append(publisher)
+        if not publishers_list and skipped_publishers:
+            self.logger.error(
+                f"{self.log_prefix}: Unable to find the "
+                f"provided publishers [{','.join(skipped_publishers)}]."
+            )
+            raise NetskopeException(
+                f"{self.log_prefix}: Could not create new private app "
+                "to share host."
+            )
+        if skipped_publishers:
+            self.logger.error(
+                f"{self.log_prefix}: Unable to find the following "
+                f"publishers [{','.join(skipped_publishers)}]."
+                " Hence ignoring them while creating "
+                f"the private app '{private_app_name}'."
+            )
+        return publishers_list
+
+    def _filter_private_app_hosts_tags(self, host, tags, private_app_name):
+        """Validate and sanitize hosts and tags before sharing.
+
+        Invalid hosts (empty or not a valid IPv4 address, IPv4 CIDR
+        block, hostname, or domain) and invalid tags (empty or over the
+        maximum length) are skipped and logged. Static values are
+        already validated at save time; this mainly covers Source-field
+        values resolved per record at execution.
+
+        Args:
+            host (list[str]): Hosts to validate.
+            tags (list[str]): Tags to validate.
+            private_app_name (str): Target app name (used in logs).
+
+        Returns:
+            tuple[list[str], list[dict], list[str]]: (valid_hosts,
+                valid_tags, skipped_hosts) where ``skipped_hosts`` are the
+                invalid (not-placed) host values, used for per-record
+                failed-action-id attribution.
+        """
+        valid_hosts, skipped_hosts, skip_host_count = (
+            self.netskope_helper.validate_hosts_for_private_app(
+                hosts_to_push=host if host else [],
+                private_app_name=private_app_name,
+            )
+        )
+        if skip_host_count > 0:
+            self.logger.info(
+                message=(
+                    f"{self.log_prefix}: Skipped adding "
+                    f"{skip_host_count} host(s) to private app "
+                    f"'{private_app_name}' as they were empty or were "
+                    "not a valid IPv4 address, IPv4 CIDR block, "
+                    "hostname, or domain."
+                ),
+                details=f"Skipped Host(s): {', '.join(skipped_hosts)}",
+            )
+        valid_tags, skipped_tags, skip_tag_count = (
+            self.netskope_helper.validate_tags_for_private_app(
+                tags_to_push=tags,
+                private_app_name=private_app_name,
+            )
+        )
+        if skip_tag_count > 0:
+            self.logger.info(
+                message=(
+                    f"{self.log_prefix}: Skipped adding "
+                    f"{skip_tag_count} tag(s) to private app "
+                    f"'{private_app_name}' as they were empty or "
+                    "exceeded the maximum allowed character limit of "
+                    f"{PRIVATE_APP_TAG_MAX_LENGTH}."
+                ),
+                details=f"Skipped Tags: {', '.join(skipped_tags)}",
+            )
+        return valid_hosts, valid_tags, skipped_hosts
+
+    def _create_private_app(
+        self,
+        app_name_to_create,
+        default_url,
+        publishers_list,
+        use_publisher_dns,
+        protocols_list,
+    ):
+        """Create a private app seeded with the default host.
+
+        Args:
+            app_name_to_create (str): Name to create the app with.
+            default_url (str): Seed host for the new app.
+            publishers_list (list[dict]): Resolved publisher entries.
+            use_publisher_dns (bool): Whether to use the publisher DNS.
+            protocols_list (list[dict]): Protocol entries for the app.
+
+        Returns:
+            tuple[str, str]: (app_id, app_name) of the created app.
+
+        Raises:
+            NetskopeException: If the app could not be created.
+        """
+        tenant_name = (
+            self.tenant.parameters.get('tenantName', '').strip()
+        )
+        headers = {
+            "Netskope-API-Token": resolve_secret(
+                self.tenant.parameters.get("v2token", "")
+            )
+        }
+        data = {
+            "app_name": app_name_to_create,
+            "host": default_url,
+            "publishers": publishers_list,
+            "use_publisher_dns": use_publisher_dns,
+        }
+        if protocols_list:
+            data["protocols"] = protocols_list
+        logger_msg = (
+            f"creating private app '{app_name_to_create}' on the "
+            "Netskope Tenant"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)}."
+        )
+        url = f"{tenant_name}{URLS.get('V2_PRIVATE_APP')}"
+        response = self.netskope_helper._api_call_helper(
+            url=url,
+            method="post",
+            error_codes=["CRE_1043", "CRE_1044"],
+            headers=headers,
+            json=data,
+            proxies=self.proxy,
+            message=f"Error occurred while {logger_msg}",
+            logger_msg=logger_msg,
+            is_handle_error_required=False,
+        )
+        if response.status_code not in [200, 201]:
+            err_msg = f"Error occurred while {logger_msg}. "
+            self.logger.error(
+                message=err_msg,
+                details=str(response.text),
+            )
+            raise NetskopeException(
+                "Could not create new private app to share host.",
+            )
+        create_private_app_json = handle_status_code(
+            response,
+            error_code="CRE_1044",
+            custom_message=f"Error occurred while {logger_msg}.",
+            plugin=self.log_prefix,
+            notify=False,
+            log=True,
+        )
+        if create_private_app_json.get("status", "") != "success":
+            response_message = create_private_app_json.get("message", "")
+            # The tenant's max private app count returns HTTP 200 with a
+            # status=error body; treat it as a non-fatal stop signal so the
+            # roll-over can skip the remaining hosts instead of failing.
+            if "maximum number" in response_message.lower():
+                raise PrivateAppLimitReachedError(response_message)
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Error occurred while "
+                    "creating private app. "
+                    f"Received exit code {response.status_code}."
+                ),
+                details=repr(create_private_app_json),
+            )
+            raise NetskopeException(
+                "Could not create new private app to share the host."
+            )
+        return (
+            create_private_app_json["data"]["app_id"],
+            create_private_app_json["data"]["app_name"],
+        )
+
+    def _delete_private_app(self, tenant_name, app_id, app_name):
+        """Delete a private app by id.
+
+        Args:
+            tenant_name (str): Tenant base URL.
+            app_id (str): Id of the app to delete.
+            app_name (str): Name of the app (used in logs).
+
+        Returns:
+            bool: True if the app was deleted, False otherwise.
+        """
+        logger_msg = f"deleting the surplus private app '{app_name}'"
+        url = (
+            f"{tenant_name}"
+            f"{URLS.get('V2_PRIVATE_APP_PATCH').format(app_id)}"
+        )
+        headers = {
+            "Netskope-API-Token": resolve_secret(
+                self.tenant.parameters.get("v2token", "")
+            )
+        }
+        try:
+            response = self.netskope_helper._api_call_helper(
+                url=url,
+                method="delete",
+                error_codes=["CRE_1069", "CRE_1070"],
+                headers=headers,
+                proxies=self.proxy,
+                message=f"Error occurred while {logger_msg}",
+                logger_msg=logger_msg,
+                is_handle_error_required=False,
+            )
+            if response.status_code in [200, 201, 204]:
+                self.logger.info(
+                    f"{self.log_prefix}: Successfully deleted the surplus "
+                    f"private app '{app_name}'."
+                )
+                return True
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Unable to delete the surplus "
+                    f"private app '{app_name}'. Received exit code "
+                    f"{response.status_code}."
+                ),
+                details=str(response.text),
+            )
+            return False
+        except Exception as err:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Error occurred while "
+                    f"{logger_msg}. Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            return False
+
+    def _remove_surplus_private_app(
+        self,
+        tenant_name,
+        member,
+        publishers_list,
+        use_publisher_dns,
+        protocols_list,
+        default_url,
+    ):
+        """Remove a private app left empty after a Replace re-pack.
+
+        Tries to delete the app; if the tenant rejects the delete (for
+        example because the app is still referenced by a policy) the app
+        is reset to the default host instead so it no longer holds stale
+        data (a private app must keep at least one host, so the default
+        host placeholder is used rather than an empty host list).
+
+        Args:
+            tenant_name (str): Tenant base URL.
+            member (dict): ``{name, id, number}`` of the surplus app.
+            publishers_list (list[dict]): Resolved publisher entries.
+            use_publisher_dns (bool): Whether to use the publisher DNS.
+            protocols_list (list[dict]): Protocol entries for the app.
+            default_url (str): Default host placeholder to reset the app to.
+
+        Returns:
+            bool: True if the app was deleted or reset.
+        """
+        if self._delete_private_app(
+            tenant_name, member["id"], member["name"]
+        ):
+            return True
+        self.logger.info(
+            f"{self.log_prefix}: Could not delete the surplus private app "
+            f"'{member['name']}'. Resetting it to the default host instead."
+        )
+        data = {
+            "host": default_url,
+            "publishers": publishers_list,
+            "use_publisher_dns": use_publisher_dns,
+        }
+        if protocols_list:
+            data["protocols"] = protocols_list
+        try:
+            self._patch_private_app(
+                tenant_name, member["id"], data, member["name"]
+            )
+            return True
+        except Exception as err:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Unable to reset the surplus "
+                    f"private app '{member['name']}'. It may still hold "
+                    f"stale hosts. Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            return False
+
+    def _create_overflow_siblings(
+        self,
+        tenant_name,
+        base_name,
+        members,
+        overflow_hosts,
+        skip_excess_hosts,
+        default_url,
+        host_to_tags,
+        publishers_list,
+        use_publisher_dns,
+        protocols_list,
+    ):
+        """Place overflow hosts into newly created roll-over sibling apps.
+
+        Used by both Append and Replace for the hosts that do not fit in
+        the existing group apps. New siblings are numbered past the highest
+        existing member (or named ``[base]`` when the group is empty),
+        ``MAX_HOSTS_PER_PRIVATE_APP`` hosts each.
+
+        Returns:
+            tuple[list[str], dict[str, int]]: ``(not_placed, added_counts)``
+                where ``not_placed`` is the list of hosts that could NOT be
+                placed - the hosts beyond the base app when
+                ``skip_excess_hosts`` is set (the base app is the primary
+                app, not a roll-over sibling, so it is still created), or
+                the remainder once the tenant's private app limit is
+                reached - and ``added_counts`` maps each newly created app
+                name to the number of hosts added to it.
+        """
+        if not overflow_hosts:
+            return [], {}
+        added_counts = {}
+        chunks = [
+            overflow_hosts[index: index + MAX_HOSTS_PER_PRIVATE_APP]
+            for index in range(
+                0, len(overflow_hosts), MAX_HOSTS_PER_PRIVATE_APP
+            )
+        ]
+        next_number = (
+            max(member["number"] for member in members) + 1
+            if members
+            else 2
+        )
+        # When the group is empty the first app created is the base app
+        # (the primary app, not a roll-over sibling); it is created even
+        # when skip_excess_hosts is set. Only additional siblings are
+        # gated by skip_excess_hosts.
+        base_needed = not members
+        for index, chunk in enumerate(chunks):
+            is_base = base_needed and index == 0
+            if skip_excess_hosts and not is_base:
+                remaining = [
+                    host for batch in chunks[index:] for host in batch
+                ]
+                self.logger.info(
+                    f"{self.log_prefix}: 'Skip Excess Hosts' is enabled; "
+                    f"skipping {len(remaining)} excess host(s) that "
+                    f"exceed the capacity of the existing private app(s) "
+                    f"for '[{base_name}]'."
+                )
+                return remaining, added_counts
+            if is_base:
+                sibling_name = base_name
+                self.logger.info(
+                    f"{self.log_prefix}: Creating private app "
+                    f"'[{sibling_name}]' with {len(chunk)} host(s) on the "
+                    "Netskope Tenant."
+                )
+            else:
+                sibling_name = f"{base_name} {next_number}"
+                next_number += 1
+                self.logger.info(
+                    f"{self.log_prefix}: Creating new private app "
+                    f"'[{sibling_name}]' to accommodate {len(chunk)} excess "
+                    "host(s) that exceed the capacity of the existing "
+                    f"private app(s) for '[{base_name}]'."
+                )
+            try:
+                created_app_id, created_app_name = self._create_private_app(
+                    sibling_name,
+                    default_url,
+                    publishers_list,
+                    use_publisher_dns,
+                    protocols_list,
+                )
+            except PrivateAppLimitReachedError as err:
+                remaining = [
+                    host for batch in chunks[index:] for host in batch
+                ]
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: Reached the tenant's maximum "
+                        "private app limit while creating roll-over "
+                        f"siblings for '[{base_name}]'. Skipping "
+                        f"{len(remaining)} host(s) that could not be "
+                        "accommodated."
+                    ),
+                    details=str(err),
+                )
+                return remaining, added_counts
+            self._patch_private_app(
+                tenant_name,
+                created_app_id,
+                self.netskope_helper._private_app_body(
+                    chunk,
+                    host_to_tags,
+                    publishers_list,
+                    use_publisher_dns,
+                    protocols_list,
+                ),
+                created_app_name,
+            )
+            added_counts[created_app_name] = (
+                added_counts.get(created_app_name, 0) + len(chunk)
+            )
+        return [], added_counts
+
+    def _append_private_app_hosts(
+        self,
+        unique_hosts,
+        tenant_name,
+        base_name,
+        private_app_name,
+        members,
+        host_to_tags,
+        publishers_list,
+        use_publisher_dns,
+        protocols_list,
+        default_url,
+        skip_excess_hosts,
+    ):
+        """Union new hosts into a logical private app, rolling over by 500.
+
+        New hosts (those not already present in any group member) fill the
+        existing siblings' remaining room in order; the rest roll over into
+        new sibling apps (unless ``skip_excess_hosts`` skips them, or the
+        tenant's private app limit is reached). Existing hosts are never
+        moved or removed. When filling an existing app the new batch's tags
+        are unioned with that app's current tags (so prior tags are kept).
+        """
+        existing_set = set()
+        for member in members:
+            existing_set.update(member["hosts"])
+        new_to_add = [
+            host for host in unique_hosts if host not in existing_set
+        ]
+        if not new_to_add:
+            # Nothing new to add. Refresh every group member's metadata
+            # (publishers, protocols); keep each app's existing tags via
+            # base_tags (no new hosts means no new batch tags to add). Skip
+            # the API call entirely for members whose metadata already
+            # matches the action params - it would be a no-op PATCH.
+            if members:
+                self.logger.info(
+                    f"{self.log_prefix}: All {len(unique_hosts)} provided "
+                    f"host(s) are already present in private app "
+                    f"'{private_app_name}'; no new hosts to add. Refreshing "
+                    "its publishers, protocols, tags, and use-publisher-DNS "
+                    "values."
+                )
+                for member in members:
+                    # Every host here is already in the app (that's why
+                    # there's nothing new to add), but the records can still
+                    # carry tags - and a tag may be new even when the host
+                    # isn't. So the tag set this app would end up with is its
+                    # existing tags plus any the records attached to its
+                    # hosts; comparing that to its current tags tells us
+                    # whether the update is needed.
+                    target_tag_names = set(member["tags"])
+                    for host in member["hosts"]:
+                        target_tag_names |= host_to_tags.get(host, set())
+                    if not self.netskope_helper._private_app_metadata_changed(
+                        member,
+                        publishers_list,
+                        use_publisher_dns,
+                        protocols_list,
+                        target_tag_names,
+                    ):
+                        self.logger.debug(
+                            f"{self.log_prefix}: No metadata changes for "
+                            f"private app '{member['name']}'; skipping the "
+                            "update API call."
+                        )
+                        continue
+                    self._patch_private_app(
+                        tenant_name,
+                        member["id"],
+                        self.netskope_helper._private_app_body(
+                            member["hosts"],
+                            host_to_tags,
+                            publishers_list,
+                            use_publisher_dns,
+                            protocols_list,
+                            base_tags=member["tags"],
+                        ),
+                        member["name"],
+                    )
+            else:
+                self.logger.error(
+                    message=(
+                        f"{self.log_prefix}: No private app with the name "
+                        f"'{private_app_name}' was found on the Netskope "
+                        "Tenant; skipping the action execution."
+                    ),
+                    resolution=(
+                        "Verify the private app still exists on the "
+                        "Netskope Tenant, or provide at least one valid "
+                        "host so a new private app can be created."
+                    ),
+                )
+            # Nothing was capacity-skipped or added on this path. When the
+            # app does not exist, every record here contributed only
+            # invalid/empty hosts (a valid host would have created the app),
+            # so they are already attributed as failed via the invalid-host
+            # set in _push_private_app.
+            return [], {}
+        # Some of the provided hosts are already in the group and are not
+        # re-added; report how many so it is clear what happened to them.
+        already_present = len(unique_hosts) - len(new_to_add)
+        if already_present:
+            self.logger.info(
+                f"{self.log_prefix}: {already_present} of the "
+                f"{len(unique_hosts)} provided host(s) were not added to "
+                f"private app '{private_app_name}' as they are already "
+                "present in it."
+            )
+        # When Skip Excess Hosts is enabled no new sibling apps are
+        # created, so the only capacity is the room left in the existing
+        # group members. If they are already full there is nowhere to put
+        # any new host - report skipping all of them directly instead of
+        # going through the roll-over path and reporting a "0 appended"
+        # success below.
+        if skip_excess_hosts and members:
+            available_room = sum(
+                max(0, MAX_HOSTS_PER_PRIVATE_APP - len(member["hosts"]))
+                for member in members
+            )
+            if available_room <= 0:
+                self.logger.info(
+                    f"{self.log_prefix}: Private app '{private_app_name}' "
+                    f"is already at its maximum capacity of "
+                    f"{MAX_HOSTS_PER_PRIVATE_APP} host(s) per app and "
+                    "'Skip Excess Hosts' is enabled; hence skipping all "
+                    f"{len(unique_hosts)} unique host(s)."
+                )
+                return new_to_add, {}
+        # Track how many new hosts were added to each private app.
+        added_counts = {}
+        # The Default Host is only a placeholder (seeded at creation, or left
+        # behind by a revert that reset an emptied app); once real hosts are
+        # added to an app it is dropped so it does not linger alongside them.
+        default_host = (default_url or "").strip()
+        # Fill the existing siblings' remaining room first.
+        pointer = 0
+        for member in members:
+            if pointer >= len(new_to_add):
+                break
+            current_hosts = list(member["hosts"])
+            if default_host:
+                current_hosts = [
+                    host for host in current_hosts if host != default_host
+                ]
+            room = MAX_HOSTS_PER_PRIVATE_APP - len(current_hosts)
+            if room <= 0:
+                self.logger.info(
+                    f"{self.log_prefix}: Private app '{member['name']}' is "
+                    f"already full ({MAX_HOSTS_PER_PRIVATE_APP} host(s)); "
+                    "adding the remaining host(s) to the next app."
+                )
+                continue
+            take = new_to_add[pointer: pointer + room]
+            # Union this batch's tags with the existing app's tags so the
+            # filled app keeps its prior tags and gains the new ones. The
+            # Default Host placeholder (if any) is dropped from current_hosts
+            # above since at least one real host is being added here.
+            self._patch_private_app(
+                tenant_name,
+                member["id"],
+                self.netskope_helper._private_app_body(
+                    current_hosts + take,
+                    host_to_tags,
+                    publishers_list,
+                    use_publisher_dns,
+                    protocols_list,
+                    base_tags=member["tags"],
+                ),
+                member["name"],
+            )
+            added_counts[member["name"]] = len(take)
+            pointer += len(take)
+        # Any remaining new hosts roll over into new sibling apps.
+        skipped, overflow_counts = self._create_overflow_siblings(
+            tenant_name,
+            base_name,
+            members,
+            new_to_add[pointer:],
+            skip_excess_hosts,
+            default_url,
+            host_to_tags,
+            publishers_list,
+            use_publisher_dns,
+            protocols_list,
+        )
+        added_counts.update(overflow_counts)
+        placed = len(new_to_add) - len(skipped)
+        skip_note = (
+            f" {len(skipped)} excess host(s) were skipped."
+            if skipped
+            else ""
+        )
+        self.logger.info(
+            f"{self.log_prefix}: Successfully appended {placed} new "
+            f"host(s) to private app '{private_app_name}'.{skip_note}"
+        )
+        # The capacity-skipped hosts (Skip Excess / tenant limit) are
+        # returned so the caller can attribute failed action ids, along
+        # with the per-app added-host counts for the final summary.
+        return skipped, added_counts
+
+    def _compact_private_app_group(
+        self,
+        tenant_name,
+        base_name,
+        private_app_name,
+        host_to_tags,
+        publishers_list,
+        use_publisher_dns,
+        protocols_list,
+        default_url,
+    ):
+        """Consolidate a private app group after an append (bulk sync only).
+
+        A revert removes hosts in place, which can leave a group with
+        partially filled apps (for example ``[X]``=500, ``[X 2]``=260,
+        ``[X 3]``=200) or with the base app reset to the Default Host
+        placeholder while a sibling still holds real hosts. This re-packs the
+        group's real hosts into the fewest apps (``MAX_HOSTS_PER_PRIVATE_APP``
+        each), **filling the existing slots in order from the base first** and
+        deleting the trailing slots left unused. No real host is dropped -
+        only redistributed - and the group is only ever shrunk, so this never
+        creates a new app. Compaction runs only when it would free a slot (a
+        surplus or a placeholder slot), to avoid needless churn.
+
+        The base (and any lower-numbered slot still needed to hold the
+        re-packed hosts) is **reused** even when it currently holds only the
+        Default Host placeholder - the real hosts overwrite the placeholder.
+        Only the **trailing surplus** slots are removed: a slot that held real
+        hosts (now moved up) is reset to the Default Host if its delete is
+        rejected (so it keeps no stale duplicates), while a trailing slot
+        holding only the placeholder is just deleted (on a delete failure it
+        is left as-is). The Default Host placeholder value is never merged into
+        another app. A lone group app is left untouched.
+
+        It is a best-effort cleanup: any error is logged but never raised,
+        so a compaction failure does not fail the action.
+
+        Tags and metadata follow the hosts: each rewritten slot is given the
+        publishers / protocols / use-publisher-DNS from the current action,
+        and its tags are the union of the tags of the source app(s) of the
+        hosts that land in it (so a moved host's tags are carried into its new
+        app) plus the current sync's tags (``host_to_tags``).
+
+        Args:
+            tenant_name (str): Tenant base URL.
+            base_name (str): Logical app name without brackets.
+            private_app_name (str): The base app name ``[base]`` (for logs).
+            host_to_tags (dict[str, set[str]]): host -> contributing tag
+                names from the current sync.
+            publishers_list (list[dict]): Resolved publisher entries.
+            use_publisher_dns (bool): Whether to use the publisher DNS.
+            protocols_list (list[dict]): Protocol entries for the apps.
+            default_url (str): Default Host placeholder.
+        """
+        try:
+            # Re-fetch the group fresh - the append just mutated it.
+            existing_private_apps = self._get_private_apps(
+                get_hosts_of=private_app_name
+            )
+            members = self.netskope_helper._ordered_private_app_group(
+                existing_private_apps, base_name
+            )
+            if len(members) <= 1:
+                # A single app (or none) cannot be consolidated, and a lone
+                # placeholder app is left as the group's anchor.
+                return
+            default_host = (default_url or "").strip()
+            # Collect every real host across the group in member order
+            # (base-first), de-duplicated, while remembering the tags carried
+            # by each host's source app so they follow the host when it moves.
+            # The Default Host placeholder value is never collected, so it is
+            # never merged into another app.
+            all_hosts = []
+            seen = set()
+            host_to_source_tags = {}
+            for member in members:
+                for host in member["hosts"]:
+                    if not host or host == default_host:
+                        continue
+                    host_to_source_tags.setdefault(host, set()).update(
+                        member["tags"]
+                    )
+                    if host not in seen:
+                        seen.add(host)
+                        all_hosts.append(host)
+            if not all_hosts:
+                # The group holds only placeholder host(s); there is nothing
+                # real to consolidate, so the apps (and the anchor) are left
+                # as-is.
+                return
+            target_count = (
+                len(all_hosts) + MAX_HOSTS_PER_PRIVATE_APP - 1
+            ) // MAX_HOSTS_PER_PRIVATE_APP
+            if len(members) <= target_count:
+                # The group already uses the minimum number of apps; there is
+                # no surplus or placeholder slot to reclaim, so skip to avoid
+                # churn. (A placeholder slot holds no real host, so when one
+                # exists len(members) always exceeds target_count.)
+                return
+            chunks = [
+                all_hosts[index: index + MAX_HOSTS_PER_PRIVATE_APP]
+                for index in range(
+                    0, len(all_hosts), MAX_HOSTS_PER_PRIVATE_APP
+                )
+            ]
+            self.logger.info(
+                f"{self.log_prefix}: Compacting private app group "
+                f"'{private_app_name}' from {len(members)} app(s) to "
+                f"{len(chunks)} app(s)."
+            )
+            # Re-pack the hosts into the existing app slots in order, filling
+            # the base (and lower-numbered siblings) first - reusing a slot
+            # even when it currently holds only the Default Host placeholder.
+            # Each rewritten slot carries the tags of the source app(s) of the
+            # hosts that land in it (base_tags) plus the current sync's tags
+            # (host_to_tags), so tags follow the hosts as they move.
+            for index, chunk in enumerate(chunks):
+                member = members[index]
+                if chunk == member["hosts"]:
+                    # Slot already holds exactly these hosts (so the same
+                    # source tags); skip the redundant PATCH.
+                    continue
+                chunk_source_tags = set()
+                for host in chunk:
+                    chunk_source_tags |= host_to_source_tags.get(host, set())
+                self._patch_private_app(
+                    tenant_name,
+                    member["id"],
+                    self.netskope_helper._private_app_body(
+                        chunk,
+                        host_to_tags,
+                        publishers_list,
+                        use_publisher_dns,
+                        protocols_list,
+                        base_tags=chunk_source_tags,
+                    ),
+                    member["name"],
+                )
+            # Remove the trailing surplus slots left unused after the re-pack.
+            # A slot that held real hosts (now moved up) is reset to the
+            # Default Host if its delete is rejected, so it keeps no stale
+            # duplicate hosts; a slot holding only the placeholder is just
+            # deleted (on a delete failure it is left as-is).
+            for member in members[len(chunks):]:
+                if default_host and member["hosts"] == [default_host]:
+                    self._delete_private_app(
+                        tenant_name, member["id"], member["name"]
+                    )
+                else:
+                    self._remove_surplus_private_app(
+                        tenant_name,
+                        member,
+                        publishers_list,
+                        use_publisher_dns,
+                        protocols_list,
+                        default_url,
+                    )
+        except Exception as err:
+            self.logger.error(
+                message=(
+                    f"{self.log_prefix}: Error occurred while consolidating "
+                    f"private app group '{private_app_name}'. The hosts were "
+                    "added successfully; only the cleanup of partially "
+                    f"filled apps was skipped. Error: {err}"
+                ),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
 
     def _tag_application(
         self,
@@ -3256,7 +11154,7 @@ class NetskopePlugin(PluginBase):
                 )
             try:
                 self.logger.debug(
-                    f"{self.log_prefix}: {log_message.capitalize()}."
+                    f"{self.log_prefix}: {_capitalize_first(log_message)}."
                 )
                 data = (
                     {"tag": tag}
@@ -3461,27 +11359,27 @@ class NetskopePlugin(PluginBase):
                 self.tenant.parameters.get("v2token", "")
             )
         }
-        
+
         tag_cache = {}
         offset = 0
         total_fetched = 0
-        
+
         try:
             self.logger.info(
                 f"{self.log_prefix}: Fetching all tags from Netskope."
             )
-            
+
             while True:
                 log_message = f"fetching tags (offset: {offset}, limit: {TAG_CACHE_PAGE_SIZE})"
                 self.logger.debug(f"{self.log_prefix}: {log_message.capitalize()}.")
-                
+
                 url = f"{tenant_name}{URLS.get('V2_DEVICE_GET_TAGS')}"
                 payload = {
                     "devices": [],
                     "offset": offset,
                     "limit": TAG_CACHE_PAGE_SIZE
                 }
-                
+
                 response = self.netskope_helper._api_call_helper(
                     url=url,
                     method="post",
@@ -3492,7 +11390,7 @@ class NetskopePlugin(PluginBase):
                     message=f"Error occurred while {log_message}",
                     logger_msg=log_message,
                 )
-                
+
                 if not response.get("success"):
                     err_msg = (
                         "Error occurred while fetching all tags "
@@ -3500,15 +11398,15 @@ class NetskopePlugin(PluginBase):
                     )
                     self.logger.error(
                         message=(
-                            f"{self.log_prefix}: {err_msg}."
+                            f"{self.log_prefix}: {err_msg}"
                         ),
                         details=str(response.get("error", {}))
                     )
                     raise NetskopeException(err_msg)
-                
+
                 data = response.get("data", {})
                 tags = data.get("data", []) if data and isinstance(data, dict) else []
-                
+
                 for tag_info in tags:
                     if isinstance(tag_info, dict):
                         # as the Netskope API is case insensitive ,
@@ -3517,26 +11415,26 @@ class NetskopePlugin(PluginBase):
                         tag_id = tag_info.get("id")
                         if tag_name and tag_id:
                             tag_cache[tag_name] = tag_id
-                
+
                 total_fetched += len(tags)
-                
+
                 total_count = data.get("total_count", 0)
                 self.logger.debug(
                     f"{self.log_prefix}: Fetched {len(tags)} tag(s) in current page. "
                     f"Total fetched: {total_fetched}/{total_count}."
                 )
-                
+
                 if total_fetched >= total_count or len(tags) < TAG_CACHE_PAGE_SIZE:
                     break
-                
+
                 offset += TAG_CACHE_PAGE_SIZE
-            
+
             self.logger.info(
                 f"{self.log_prefix}: Successfully fetched {len(tag_cache)} tag(s)"
                 " from Netskope tenant"
             )
             return tag_cache
-            
+
         except Exception as e:
             err_msg = (
                 "An Unexpected error occurred while "
@@ -3590,9 +11488,9 @@ class NetskopePlugin(PluginBase):
                 err_msg = (
                     f"Invalid tag '{tag}' provided. Tag name must contain "
                     "only alphanumeric characters, hyphens, and spaces. This"
-                    f"tag will be skipped for {str(action)} action"
+                    f" tag will be skipped for {str(action)} action"
                 )
-                self.logger.info(f"{self.log_prefix}: {err_msg}")
+                self.logger.info(f"{self.log_prefix}: {err_msg}.")
                 failed_tags.append(tag)
                 continue
 
@@ -3602,7 +11500,7 @@ class NetskopePlugin(PluginBase):
                     f"exceed {TAG_DEVICE_TAG_LENGTH} characters. This"
                     f"tag will be skipped for {str(action)} action"
                 )
-                self.logger.info(f"{self.log_prefix}: {err_msg}")
+                self.logger.info(f"{self.log_prefix}: {err_msg}.")
                 failed_tags.append(tag)
                 continue
 
@@ -3615,7 +11513,9 @@ class NetskopePlugin(PluginBase):
                 )
             elif action in ["append", "replace"]:
                 log_message = f"creating tag '{tag}'"
-                self.logger.debug(f"{self.log_prefix}: {log_message.capitalize()}.")
+                self.logger.debug(
+                    f"{self.log_prefix}: {_capitalize_first(log_message)}."
+                )
 
                 try:
                     url = f"{tenant_name}{URLS.get('V2_DEVICE_TAG')}"
@@ -3636,7 +11536,7 @@ class NetskopePlugin(PluginBase):
                             f"tag will be skipped for {str(action)} action"
                         )
                         self.logger.error(
-                            message=f"{self.log_prefix}: {err_msg}",
+                            message=f"{self.log_prefix}: {err_msg}.",
                             details=json.dumps(create_response.get("error", {}))
                         )
                         failed_tags.append(tag)
@@ -3749,7 +11649,7 @@ class NetskopePlugin(PluginBase):
         else:  # remove
             log_message = "removing tags from devices"
             url = f"{tenant_name}{URLS.get('V2_DEVICE_BULK_REMOVE_TAGS')}"
-        
+
         data = {"tags": tag_ids, "devices": devices}
 
         self.logger.debug(f"{self.log_prefix}: {log_message.capitalize()}.")
@@ -3772,7 +11672,7 @@ class NetskopePlugin(PluginBase):
             raise NetskopeException(err_msg)
 
         log_msg = (
-            f"Successfully {'added' if cci_tag_action == 'append' else 'removed'} "
+            f"Successfully {'added' if cci_tag_action == 'append' else 'removed'} "     # noqa
             f"tags for {len(devices)} device record(s) on the Netskope Tenant."
         )
         self.logger.debug(
@@ -4208,8 +12108,11 @@ class NetskopePlugin(PluginBase):
             Returns:
                 list[str]: List of values.
             """
-            if isinstance(value, list):
-                return value
+            if isinstance(value, (list, tuple, set)):
+                # A parameter with multiple mapped fields arrives as one
+                # entry per field, nested one level deeper wherever a
+                # mapped Source field's record value is itself a list.
+                return self.netskope_helper._normalize_csv_values(value)
             if isinstance(value, str):
                 return list(
                     filter(
@@ -4220,7 +12123,11 @@ class NetskopePlugin(PluginBase):
             return []
 
         tags = params.get("tags") or ""
-        skip_tag_validation = isinstance(tags, str) and tags.startswith("$")
+        # Tags accepts multiple mapped fields, so a Source field anywhere in
+        # the value defers validation to action execution.
+        skip_tag_validation = self.netskope_helper._has_source_field_value(
+            tags
+        )
         tags = convert_to_list(tags)
         apps = params.get("apps") or ""
         skip_apps_validation = isinstance(apps, str) and apps.startswith("$")
@@ -4358,7 +12265,8 @@ class NetskopePlugin(PluginBase):
             static_input_len_validation: bool = False,
             field_name: str = "",
             is_validation: bool = False,
-            action_name: str = ""
+            action_name: str = "",
+            action_label: str = ""
         ) -> list[str]:
             """Convert to list.
 
@@ -4369,24 +12277,35 @@ class NetskopePlugin(PluginBase):
                 list[str]: List of values.
             """
             list_values = []
-            if isinstance(value, list):
-                list_values = value
+            if isinstance(value, (list, tuple, set)):
+                # A parameter with multiple mapped fields arrives as one
+                # entry per field, nested one level deeper wherever a
+                # mapped Source field's record value is itself a list.
+                list_values = self.netskope_helper._normalize_csv_values(
+                    value
+                )
             if isinstance(value, str):
                 list_values = [v.strip() for v in value.split(",")]
                 if (
                     is_validation and any(not v for v in list_values)
                 ):
                     log_and_raise = False
-                    if action_name == "replace" and len(list_values) > 1:
-                        log_and_raise = True
-                    elif action_name != "replace":
+                    if (
+                        action_name == "replace" and len(list_values) > 1
+                    ) or action_name != "replace":
                         log_and_raise = True
 
                     if log_and_raise:
-                        err_msg = (
-                            f"Static field '{field_name}' "
-                            "can not have empty comma separated values."
-                        )
+                        if (len(list_values) == 1) and (not list_values[0]):
+                            err_msg = (
+                                f"Invalid value for tags provided. Tags cannot be empty for "
+                                f"'{action_label}' action."
+                            )
+                        else:
+                            err_msg = (
+                                f"Static field '{field_name}' "
+                                "can not have empty comma separated values."
+                            )
                         raise NetskopeException(err_msg)
                 if is_validation and static_input_len_validation and len(list_values) > 1:
                     err_msg = (
@@ -4398,13 +12317,18 @@ class NetskopePlugin(PluginBase):
 
         tags = params.get("tags") or ""
         tag_action = params.get("tag_device_action") or "append"
-
-        skip_tag_validation = isinstance(tags, str) and tags.startswith("$")
+        tag_action_label = TAG_ACTION_LABEL_MAP.get(tag_action, "Replace")
+        # Tags accepts multiple mapped fields, so a Source field anywhere in
+        # the value defers validation to action execution.
+        skip_tag_validation = self.netskope_helper._has_source_field_value(
+            tags
+        )
         tags = convert_to_list(
             action_name=tag_action,
             value=tags,
             field_name="Tags",
-            is_validation=is_validation
+            is_validation=is_validation,
+            action_label=tag_action_label
         )
 
         device_id = params.get("device_id") or ""
@@ -4421,6 +12345,15 @@ class NetskopePlugin(PluginBase):
         device_user_key = convert_to_list(
             value=device_user_key,
             field_name="User Key",
+            is_validation=is_validation
+        )
+
+        hostname = params.get("hostname") or ""
+        skip_hostname_validation = isinstance(hostname, str) and hostname.startswith("$")   # noqa
+        convert_to_list(
+            value=hostname,
+            field_name="Hostname",
+            static_input_len_validation=True,
             is_validation=is_validation
         )
 
@@ -4441,7 +12374,7 @@ class NetskopePlugin(PluginBase):
         if not tags and not skip_tag_validation and tag_action in ["append", "remove"]:
             err_msg = (
                 f"Invalid value for tags provided. Tags cannot be empty for "
-                f"'{tag_action}' action."
+                f"'{tag_action_label}' action."
             )
             self.logger.error(f"{self.log_prefix}: {err_msg}")
             raise NetskopeException(err_msg)
@@ -4464,86 +12397,529 @@ class NetskopePlugin(PluginBase):
                     self.logger.error(f"{self.log_prefix}: {err_msg}")
                     raise NetskopeException(err_msg)
 
-        if (not device_id and not device_user_key) and not (
-            skip_device_id_validation or skip_device_user_key_validation
-        ):
+        if not device_id and not skip_device_id_validation:
             err_msg = (
-                "Invalid value for Netskope Device UID/User Key provided. "
-                "Provide either Netskope Device UID or User Key."
+                "Netskope Device UID is a required parameter "
+                f"for {tag_action_label} action."
+            )
+            self.logger.error(f"{self.log_prefix}: {err_msg}")
+            raise NetskopeException(err_msg)
+        if not device_user_key and not skip_device_user_key_validation:
+            err_msg = (
+                "User Key is a required parameter "
+                f"for {tag_action_label} action."
+            )
+            self.logger.error(f"{self.log_prefix}: {err_msg}")
+            raise NetskopeException(err_msg)
+        if not hostname and not skip_hostname_validation:
+            err_msg = (
+                "Hostname is a required parameter "
+                f"for {tag_action_label} action."
             )
             self.logger.error(f"{self.log_prefix}: {err_msg}")
             raise NetskopeException(err_msg)
 
-        return tags, device_id, device_user_key, tag_action
+        return tags, device_id, device_user_key, hostname, tag_action
 
-    def revert_action(self, action: Action):
-        """Revert the action.
+    def _revert_network_profile(self, action: Action) -> None:
+        """Remove one record's IP values from its network profile group.
+
+        Called once per record that no longer matches the business rule.
+        The values are removed with ``op: remove`` rather than by
+        rewriting the profile, so values another still-matching record
+        contributed are never overwritten, and there is no payload size
+        problem. ``op: remove`` deletes every matching entry, so a value
+        an earlier run added twice is fully cleaned up in one call.
+
+        A member left holding nothing is disposed of: a roll-over sibling
+        is deleted (emptied when the tenant refuses because a policy
+        references it), while the base is only ever emptied - the action
+        parameters name the base, so deleting it would make the next sync
+        fail with "profile could not be found".
+
+        Known behaviour, matching the private app revert: a value that a
+        still-matching record also contributed is removed anyway.
 
         Args:
-            action (Action): Action to be reverted.
+            action (Action): Action to be reverted, carrying the record's
+                resolved parameters.
         """
-        helper = AlertsHelper()
-        self.tenant = helper.get_tenant_crev2(self.name)
-        action.parameters = get_latest_values(
-            action.parameters, exclude_keys=["tags", "protocol", "publishers"]
+        tenant_name, headers = self._get_tenant_and_headers()
+        params = action.parameters
+        existing_profile_name = params.get("network_profile_name", "")
+        base_name = (
+            params.get("new_profile_name", "")
+            if existing_profile_name == "create"
+            else existing_profile_name
         )
-        if action.value == "private_app":
-            action_dict = action.parameters
-            existing_private_app_name = action_dict.get("private_app_name", "")
-            new_private_app_name = action_dict.get("name", "")
-            host = action_dict.get("host", "")
-            if existing_private_app_name == "create":
-                private_app_name = f"[{new_private_app_name}]"
-            else:
-                private_app_name = existing_private_app_name
-            if not host:
+        apply_pending_changes = params.get("apply_pending_changes", "No")
+        default_value = (
+            params.get("default_value", "")
+            or NETWORK_PROFILE_EMPTY_PLACEHOLDER
+        )
+        if not base_name:
+            self.logger.info(
+                f"{self.log_prefix}: No network profile found in the "
+                "reverted record; hence skipping the revert action."
+            )
+            return
+        # A value that fails the same format check the action applies
+        # could never have been added, so it is dropped here without any
+        # API call - the same short-circuit the private app revert uses.
+        raw_values = self.netskope_helper._normalize_csv_values(
+            params.get("network_values")
+        )
+        values_to_remove = []
+        for value in raw_values:
+            formatted = (
+                self.netskope_helper._format_network_profile_value(value)
+            )
+            if formatted is not None:
+                values_to_remove.append(formatted)
+        if not values_to_remove:
+            self.logger.info(
+                f"{self.log_prefix}: No valid IP value found in the "
+                f"reverted record for network profile group "
+                f"'{base_name}'; hence skipping the revert action for "
+                "this record."
+            )
+            return
+        target = set(values_to_remove)
+        try:
+            existing_profiles = self._get_network_profiles(
+                is_values_required=True
+            )
+            members = (
+                self.netskope_helper._ordered_network_profile_group(
+                    existing_profiles, base_name, default_value
+                )
+            )
+            if not members:
                 self.logger.info(
-                    f"{self.log_prefix}: Host value not found in the "
-                    f"record for private app {private_app_name}. "
-                    "Hence, skipped execution of revert action."
+                    f"{self.log_prefix}: No network profile with the "
+                    f"name '{base_name}' was found on the Netskope "
+                    "Tenant; hence skipping the revert action."
                 )
                 return
             self.logger.info(
-                f"{self.log_prefix}: Attempting to remove the host {host} "
-                f"from private app {private_app_name}."
+                f"{self.log_prefix}: Attempting to remove "
+                f"{len(values_to_remove)} IP value(s) of the reverted "
+                f"record from the network profile group '{base_name}'."
             )
-            app = self._get_private_app(
-                prefix=private_app_name, has_host=action_dict.get("host", "")
-            )
-            if not app:
+            removed_total = 0
+            removed_from = []
+            attempted = 0
+            for member in members:
+                if (
+                    member["status"]
+                    == NETWORK_PROFILE_STATUS_PENDING_DELETE
+                ):
+                    self.logger.info(
+                        f"{self.log_prefix}: Skipping network profile "
+                        f"'{member['name']}' as it is staged for "
+                        "deletion on the Netskope Tenant."
+                    )
+                    continue
+                present = [
+                    value
+                    for value in member["real_values"]
+                    if value in target
+                ]
+                if not present:
+                    continue
+                attempted += len(present)
+                failed_idx = self._remove_network_value_batches(
+                    tenant_name=tenant_name,
+                    headers=headers,
+                    profile_id=member["id"],
+                    profile_name=member["name"],
+                    values=present,
+                    apply_pending_changes=apply_pending_changes,
+                )
+                removed = [
+                    value
+                    for index, value in enumerate(present)
+                    if index not in failed_idx
+                ]
+                if not removed:
+                    continue
+                removed_total += len(removed)
+                removed_from.append(member["name"])
+                # Dispose of a member the revert just emptied so it does
+                # not linger as an empty profile: a sibling frees a slot
+                # out of MAX_NETWORK_PROFILES, the base is only emptied.
+                # A member left holding an operator's comment is NOT
+                # empty - the comment is a real value, so the member is
+                # kept and its slot stays in use.
+                still_held = [
+                    value
+                    for value in member["real_values"]
+                    if value not in set(removed)
+                ]
+                if not still_held:
+                    self._remove_surplus_network_profile(
+                        tenant_name=tenant_name,
+                        headers=headers,
+                        member=member,
+                        is_base=member["number"] == 1,
+                        default_value=default_value,
+                        apply_pending_changes=apply_pending_changes,
+                        reason=(
+                            "as the revert left it holding no IP values"
+                        ),
+                    )
+            if not removed_total:
+                if attempted:
+                    # The values were there; every removal call was
+                    # skipped or failed, so they are still on the group.
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Could not remove "
+                            f"{attempted} IP value(s) of the reverted "
+                            f"record from the network profile group "
+                            f"'{base_name}'. The value(s) are still on "
+                            "the profile(s)."
+                        ),
+                        resolution=(
+                            "Check the earlier error(s) for this profile "
+                            "group, then remove the value(s) manually on "
+                            "the Netskope Tenant."
+                        ),
+                    )
+                    return
                 self.logger.info(
-                    f"{self.log_prefix}: Host {host} not found "
-                    f"in {private_app_name}. "
-                    "Hence, skipped execution of revert action."
+                    f"{self.log_prefix}: None of the reverted record's "
+                    f"IP value(s) were present on the network profile "
+                    f"group '{base_name}'; nothing was removed."
                 )
                 return
-            data = {
-                "host": ",".join(
-                    list(filter(
-                        lambda x: x != host, app.get("host", "").split(",")
-                    ))
-                )
-            }
-            return self._patch_private_app(
-                self.tenant.parameters.get('tenantName').strip(),
-                app.get("app_id", ""),
-                data,
+            self.logger.info(
+                message=(
+                    f"{self.log_prefix}: Successfully removed "
+                    f"{removed_total} IP value(s) of the reverted record "
+                    f"from {len(removed_from)} network profile(s) in the "
+                    f"group '{base_name}'."
+                ),
+                details=(
+                    f"Network profile(s): {', '.join(removed_from)}"
+                ),
             )
-        raise NotImplementedError()
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = (
+                "Error occurred while removing the reverted record's IP "
+                f"value(s) from the network profile group '{base_name}'."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {error_message} Error: {err}",
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
 
-    def _patch_private_app(self, tenant: str, app_id: str, data: dict):
+    def revert_action(self, action: Action):
+        """Revert an action for a single excluded record.
+
+        The framework calls this once per record that no longer matches the
+        business rule. For the 'Add host to Private App' action this removes
+        that record's host(s) from the private app group in place: the
+        host(s) are dropped from whichever group member(s) contain them, and
+        the record's tags are stripped from those member(s) too.
+
+        Removal is in place - hosts are never moved between apps here (the
+        bulk sync's compaction pass reclaims any apps a revert leaves
+        partially filled). A member left with no hosts is deleted when it is
+        a roll-over sibling, or reset to the Default Host when it is the base
+        app (a private app must keep at least one host); when no Default Host
+        is configured the emptied base app is deleted instead.
+
+        For the 'Add to Network Profile' action the record's IP values are
+        removed from the profile group; see ``_revert_network_profile``.
+
+        Args:
+            action (Action): Action to be reverted (carries the record's
+                resolved parameters).
+
+        Raises:
+            NotImplementedError: For action types that do not support a
+                per-record revert.
+            NetskopeException: On an unrecoverable error while removing the
+                host(s).
+        """
+        helper = AlertsHelper()
+        self.tenant = helper.get_tenant_crev2(self.name)
+        # Mirror execute_action: keep the multi-value fields intact so the
+        # full set of the record's hosts (and its tags) is available rather
+        # than collapsed to a single latest value.
+        action.parameters = get_latest_values(
+            action.parameters,
+            exclude_keys=[
+                "host",
+                "tags",
+                "protocol",
+                "publishers",
+                "network_values",
+            ],
+        )
+        if action.value == "network_profile":
+            self._revert_network_profile(action)
+            return
+        if action.value != "private_app":
+            raise NotImplementedError(
+                f"Revert action is not supported for '{action.value}' "
+                "action in Netskope Risk Exchange plugin."
+            )
+        tenant_name = self.tenant.parameters.get("tenantName", "").strip()
+        existing_private_app_name = action.parameters.get(
+            "private_app_name", ""
+        )
+        new_private_app_name = action.parameters.get("name", "")
+        if existing_private_app_name == "create":
+            base_name = new_private_app_name
+        else:
+            base_name = existing_private_app_name.removeprefix(
+                "["
+            ).removesuffix("]")
+        private_app_name = f"[{base_name}]"
+        try:
+            # Normalise the record's host(s) to remove - a Source field (a
+            # list) or a Static field (a comma-separated string) - via the
+            # shared _normalize_csv_values helper (trims, drops empties,
+            # de-duplicates), as execute_actions and the profile actions do.
+            hosts_to_remove = set(
+                self.netskope_helper._normalize_csv_values(
+                    action.parameters.get("host")
+                )
+            )
+            if not hosts_to_remove:
+                self.logger.info(
+                    f"{self.log_prefix}: No host found in the record for "
+                    f"private app '{private_app_name}'; hence skipping the "
+                    "revert action."
+                )
+                return
+            # Short-circuit: a host that fails the same validation used by the
+            # add-host action could never have been added to the app, so
+            # fetching the app to remove it would be a wasted API call. Keep
+            # only the valid hosts; if none are valid, skip before the
+            # fetch-apps call below.
+            valid_hosts, _, _ = (
+                self.netskope_helper.validate_hosts_for_private_app(
+                    hosts_to_push=list(hosts_to_remove),
+                    private_app_name=private_app_name,
+                )
+            )
+            if not valid_hosts:
+                self.logger.info(
+                    f"{self.log_prefix}: No valid host found in the reverted "
+                    f"record for private app '{private_app_name}'; hence "
+                    "skipping the revert action for this record."
+                )
+                return
+            hosts_to_remove = set(valid_hosts)
+            # Resolve the record's tags so they can be stripped from the
+            # member(s) the host(s) are removed from.
+            raw_tags = action.parameters.get("tags") or []
+            if isinstance(raw_tags, str):
+                raw_tags = [
+                    tag.strip()
+                    for tag in raw_tags.split(",")
+                    if tag.strip()
+                ]
+            else:
+                # Tags accepts multiple mapped fields: one entry per field,
+                # nested one level deeper wherever a mapped Source field's
+                # record value is itself a list.
+                raw_tags = self.netskope_helper._normalize_csv_values(
+                    raw_tags
+                )
+            record_valid_tags, _, _ = (
+                self.netskope_helper.validate_tags_for_private_app(
+                    raw_tags, private_app_name
+                )
+            )
+            record_tag_names = {
+                tag["tag_name"] for tag in record_valid_tags
+            }
+            self.logger.info(
+                f"{self.log_prefix}: Attempting to remove "
+                f"{len(hosts_to_remove)} host(s) of the reverted record from "
+                f"private app '{private_app_name}'."
+            )
+            existing_private_apps = self._get_private_apps(
+                get_hosts_of=private_app_name
+            )
+            members = self.netskope_helper._ordered_private_app_group(
+                existing_private_apps, base_name
+            )
+            if not members:
+                self.logger.info(
+                    f"{self.log_prefix}: No private app with the name "
+                    f"'{private_app_name}' was found on the Netskope Tenant; "
+                    "hence skipping the revert action."
+                )
+                return
+            # Resolve the metadata once so the host-removal PATCH keeps the
+            # app's ports/publishers/DNS aligned (and does not wipe them).
+            tcp_port = action.parameters.get("tcp_ports", "") or ""
+            udp_port = action.parameters.get("udp_ports", "") or ""
+            protocols_list = (
+                self.netskope_helper._build_private_app_protocols(
+                    action.parameters.get("protocol", []),
+                    [p.strip() for p in tcp_port.split(",") if p.strip()],
+                    [p.strip() for p in udp_port.split(",") if p.strip()],
+                )
+            )
+            publishers_list = self._resolve_private_app_publishers(
+                action.parameters.get("publishers", []), private_app_name
+            )
+            use_publisher_dns = action.parameters.get(
+                "use_publisher_dns", False
+            )
+            default_url = action.parameters.get("default_url", "").strip()
+            removed_hosts = set()
+            for member in members:
+                remaining = [
+                    host
+                    for host in member["hosts"]
+                    if host not in hosts_to_remove
+                ]
+                if len(remaining) == len(member["hosts"]):
+                    # This member held none of the reverted host(s).
+                    continue
+                removed_hosts.update(
+                    host
+                    for host in member["hosts"]
+                    if host in hosts_to_remove
+                )
+                # Strip the reverted record's tags from this member (a tag
+                # also contributed by a still-active record may be removed -
+                # documented known behavior).
+                new_tag_names = [
+                    tag
+                    for tag in member["tags"]
+                    if tag not in record_tag_names
+                ]
+                if remaining:
+                    data = {
+                        "host": ",".join(remaining),
+                        "tags": [
+                            {"tag_name": name}
+                            for name in sorted(new_tag_names)
+                        ],
+                        "publishers": publishers_list,
+                        "use_publisher_dns": use_publisher_dns,
+                    }
+                    if protocols_list:
+                        data["protocols"] = protocols_list
+                    self._patch_private_app(
+                        tenant_name, member["id"], data, member["name"]
+                    )
+                elif member["number"] != 1:
+                    # Emptied roll-over sibling: delete it (reset to the
+                    # Default Host if the delete is rejected).
+                    self._remove_surplus_private_app(
+                        tenant_name,
+                        member,
+                        publishers_list,
+                        use_publisher_dns,
+                        protocols_list,
+                        default_url,
+                    )
+                elif default_url:
+                    # Emptied base app: a private app must keep at least one
+                    # host, so reset it to the Default Host placeholder.
+                    self.logger.info(
+                        f"{self.log_prefix}: Removing the last host(s) from "
+                        f"the base private app '{member['name']}'; resetting "
+                        f"it to the Default Host '{default_url}'."
+                    )
+                    reset_body = {
+                        "host": default_url,
+                        "tags": [
+                            {"tag_name": name}
+                            for name in sorted(new_tag_names)
+                        ],
+                        "publishers": publishers_list,
+                        "use_publisher_dns": use_publisher_dns,
+                    }
+                    if protocols_list:
+                        reset_body["protocols"] = protocols_list
+                    self._patch_private_app(
+                        tenant_name,
+                        member["id"],
+                        reset_body,
+                        member["name"],
+                    )
+                else:
+                    # Base app emptied and no Default Host configured - it
+                    # cannot be reset to an empty host list, so delete it.
+                    self.logger.info(
+                        f"{self.log_prefix}: Removing the last host(s) from "
+                        f"the base private app '{member['name']}' with no "
+                        "Default Host configured; hence deleting the app."
+                    )
+                    self._delete_private_app(
+                        tenant_name, member["id"], member["name"]
+                    )
+            if not removed_hosts:
+                self.logger.info(
+                    f"{self.log_prefix}: None of the reverted record's "
+                    f"host(s) were found in private app '{private_app_name}'; "
+                    "hence nothing was removed."
+                )
+                return
+            self.logger.info(
+                f"{self.log_prefix}: Successfully removed "
+                f"{len(removed_hosts)} host(s) of the reverted record from "
+                f"private app '{private_app_name}'."
+            )
+        except NetskopeException:
+            raise
+        except Exception as err:
+            error_message = (
+                "Error occurred while removing the reverted record's "
+                f"host(s) from private app '{private_app_name}'."
+            )
+            self.logger.error(
+                message=f"{self.log_prefix}: {error_message} Error: {err}",
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
+            )
+            raise NetskopeException(error_message)
+
+    def _patch_private_app(
+        self, tenant: str, app_id: str, data: dict, app_name: str = ""
+    ):
         """Patch an existing private app.
 
         Args:
             tenant (str): Tenant base URL.
             app_id (str): Existing app id.
             data (dict): Request body.
+            app_name (str, optional): Name of the private app being \
+                patched, included in log messages for context. Defaults \
+                to "".
 
         Raises:
             NetskopeException: Error in the response.
             NetskopeException: Non-2xx status code.
         """
-        logger_msg = "adding host to private app"
+        logger_msg = (
+            f"adding host to private app '{app_name}'"
+            if app_name
+            else "adding host to private app"
+        )
+        self.logger.debug(
+            f"{self.log_prefix}: {_capitalize_first(logger_msg)}."
+        )
         url = (
             f"{tenant}{URLS.get('V2_PRIVATE_APP_PATCH').format(app_id)}"
         )
@@ -4600,8 +12976,8 @@ class NetskopePlugin(PluginBase):
                 )
 
             self.logger.info(
-                f"{self.log_prefix}: Successfully updated the private app for "
-                f"configuration {self.plugin_name}."
+                f"{self.log_prefix}: Successfully updated the private app"
+                f" {app_name}."
             )
         except NetskopeException:
             raise
@@ -4612,16 +12988,36 @@ class NetskopePlugin(PluginBase):
                     f"{self.log_prefix}: {error_message} "
                     f"Error: {err}"
                 ),
-                details=str(traceback.format_exc()),
+                details=re.sub(
+                    r"token=([0-9a-zA-Z]*)",
+                    "token=********&",
+                    traceback.format_exc(),
+                ),
             )
             raise NetskopeException(error_message)
         return
 
-    def _execute_private_app_action(self, action_dict: dict):
+    def _execute_private_app_action(
+        self,
+        action_dict: dict,
+        host_to_tags: Optional[dict] = None,
+        compact: bool = False,
+    ):
         """Execute action on the given parameters.
 
         Args:
             action_dict (dict): Action parameters.
+            host_to_tags (Optional[dict]): Pre-built ``{host -> set(tag
+                name)}`` map for per-batch tag scoping (bulk path). When
+                None, tags are taken uniformly from ``action_dict``.
+            compact (bool): When True (bulk sync), consolidate the app group
+                after the append to reclaim apps left partially filled by
+                earlier reverts. Defaults to False.
+
+        Returns:
+            tuple[set[str], dict[str, int]]: ``(not_placed, added_counts)``
+                forwarded from ``_push_private_app`` - the not-placed host
+                set and the per-app added-host counts.
         """
         protocols = action_dict.get("protocol", [])
         tcp_port = action_dict.get("tcp_ports", "") or ""
@@ -4648,23 +13044,17 @@ class NetskopePlugin(PluginBase):
             raise NetskopeException(err_msg)
         tags = action_dict.get("tags", [])
         if tags and isinstance(tags, str):
-            tags = list(map(lambda x: x.strip(), tags.split(",")))
-            for tag in tags:
-                if len(tag) > 30:
-                    err_msg = (
-                        "Found tag length greater than 30 characters. "
-                        "Tag length should be less than or "
-                        "equal to 30 characters."
-                    )
-                    self.logger.error(
-                        message=err_msg,
-                        details=str(tag),
-                        resolution=(
-                            "Make sure tag length is less than or "
-                            "equal to 30 characters."
-                        )
-                    )
-                    raise NetskopeException(err_msg)
+            tags = [tag.strip() for tag in tags.split(",")]
+        elif tags:
+            # Tags accepts multiple mapped fields: one entry per field,
+            # nested one level deeper wherever a mapped Source field's
+            # record value is itself a list. Flatten to the same shape the
+            # Static branch above produces.
+            tags = self.netskope_helper._normalize_csv_values(tags)
+        # Tag length/format validation happens inside _push_private_app via
+        # validate_tags_for_private_app: invalid tags (empty or exceeding the
+        # maximum length) are skipped and the remaining valid tags are still
+        # pushed. Static tags are already validated at save time.
 
         return self._push_private_app(
             action_dict.get("host", ""),
@@ -4677,6 +13067,9 @@ class NetskopePlugin(PluginBase):
             use_publisher_dns=use_publisher_dns,
             default_url=action_dict.get("default_url", "").strip(),
             tags=tags,
+            skip_excess_hosts=action_dict.get("skip_excess_hosts", False),
+            host_to_tags=host_to_tags,
+            compact=compact,
         )
 
     def revert_uci_update_impact(self, anomaly_id: str):
@@ -4718,7 +13111,9 @@ class NetskopePlugin(PluginBase):
             )
             raise NetskopeException(error_message)
 
-    def _bulk_add_remove_tag_device(self, actions: List[Action], action_label: str) -> List[str]:
+    def _bulk_add_remove_tag_device(
+            self, actions: List[Action], action_label: str
+    ) -> List[str]:
         """Tag devices in bulk.
 
         Args:
@@ -4733,7 +13128,11 @@ class NetskopePlugin(PluginBase):
             failed_action_ids = []
             tag_groups = {}
             tag_cache = self._fetch_all_tags()
-            action_value = None
+            action_value = (
+                actions[0].get("params").parameters.get("tag_device_action")
+            )
+            action_value = "Add" if action_value == "append" else "Remove"
+            device_bulk_call_count = 0
             for action_dict in actions:
                 action_id, action = action_dict.get("id"), action_dict.get("params")
                 try:
@@ -4741,6 +13140,7 @@ class NetskopePlugin(PluginBase):
                         tags,
                         device_id,
                         device_user_key,
+                        hostname,
                         cci_tag_action,
                     ) = self._process_params_for_tag_device_action(
                         action.parameters, True
@@ -4758,12 +13158,16 @@ class NetskopePlugin(PluginBase):
                         if uk:
                             unique_user_keys.add(uk)
 
-                    if not unique_user_keys or not device_id:
+                    if not unique_user_keys or not device_id or not hostname:
                         failed_action_ids.append(action_id)
                         continue
 
                     for user_key in unique_user_keys:
-                        device = {"nsdeviceuid": device_id, "userkey": user_key}
+                        device = {
+                            "nsdeviceuid": device_id,
+                            "userkey": user_key,
+                            "hostname": hostname
+                        }
 
                         for tag in tags:
                             tag_key = (tag, cci_tag_action)
@@ -4787,8 +13191,8 @@ class NetskopePlugin(PluginBase):
                 except Exception as e:
                     self.logger.error(
                         f"{self.log_prefix}: Error occurred while processing "
-                        f"action '{action_label}' for record with ID '{action_id}'. "
-                        f"Error: {e}."
+                        f"action '{action_label}' for record with ID '{action_id}'. "   # noqa
+                        f"Error: {e}"
                     )
                     failed_action_ids.append(action_id)
             log_msg = ""
@@ -4797,42 +13201,43 @@ class NetskopePlugin(PluginBase):
                 log_msg = (
                     f" {skipped_records} record(s) will be skipped "
                     "either due to being invalid or missing "
-                    "'Netskope Device UID' or 'User Key' field values."
+                    "'Netskope Device UID', 'User Key' or"
+                    " 'Hostname' field values."
                 )
             self.logger.info(
                 f"{self.log_prefix}: Performing '{action_value}' Tag(s)"
                 f" action on {len(actions)-skipped_records} "
                 f"record(s).{log_msg if log_msg else ''}"
             )
-            for (tag, cci_tag_action), group_data in tag_groups.items():
+            for (tag, cci_tag_action), group_data in tag_groups.items():  # noqa
                 devices = group_data['devices']
                 action_id_to_devices = group_data['action_id_to_devices']
 
                 try:
-                    tag_ids, tag_cache = self._query_and_create_tags_with_cache(
+                    tag_ids, tag_cache = self._query_and_create_tags_with_cache(  # noqa
                         [tag], action=cci_tag_action, tag_cache=tag_cache
                     )
 
                     unique_devices = []
                     seen_devices = set()
                     for device in devices:
-                        device_key = (device.get("nsdeviceuid"), device.get("userkey"))
+                        device_key = (device.get("nsdeviceuid"), device.get("userkey"))  # noqa
                         if device_key not in seen_devices:
                             unique_devices.append(device)
                             seen_devices.add(device_key)
 
-                    total_batches = (len(unique_devices) + TAG_DEVICE_BATCH_SIZE - 1) // TAG_DEVICE_BATCH_SIZE
+                    total_batches = (len(unique_devices) + TAG_DEVICE_BATCH_SIZE - 1) // TAG_DEVICE_BATCH_SIZE    # noqa  
                     for batch_num in range(total_batches):
                         start_idx = batch_num * TAG_DEVICE_BATCH_SIZE
-                        end_idx = min(start_idx + TAG_DEVICE_BATCH_SIZE, len(unique_devices))
+                        end_idx = min(start_idx + TAG_DEVICE_BATCH_SIZE, len(unique_devices))   # noqa
                         device_batch = unique_devices[start_idx:end_idx]
-                        
+
                         batch_action_ids = []
                         batch_device_keys = set(
-                            (d.get("nsdeviceuid"), d.get("userkey"))
+                            (d.get("nsdeviceuid"), d.get("userkey"))  # noqa
                             for d in device_batch
                         )
-                        for action_id, action_devices in action_id_to_devices.items():
+                        for action_id, action_devices in action_id_to_devices.items():   # noqa
                             for action_device in action_devices:
                                 action_device_key = (
                                     action_device.get("nsdeviceuid"),
@@ -4841,31 +13246,40 @@ class NetskopePlugin(PluginBase):
                                 if action_device_key in batch_device_keys:
                                     batch_action_ids.append(action_id)
                                     break
-                        
+
                         try:
                             self.logger.info(
-                                f"{self.log_prefix}: Processing batch {batch_num + 1}/{total_batches} "
+                                f"{self.log_prefix}: Processing batch {batch_num + 1}/{total_batches} "     # noqa
                                 f"of {len(device_batch)} device record(s) for tag '{tag}'."
                             )
-                            self._tag_devices(tag_ids, device_batch, cci_tag_action)
-                            
+                            if device_bulk_call_count > 0:
+                                self.logger.debug(
+                                    f"{self.log_prefix}: Sleeping "
+                                    f"{DEVICE_BULK_TAG_INTER_BATCH_SLEEP}s before next "
+                                    "device bulk tag API call to respect rate limit."
+                                )
+                                time.sleep(DEVICE_BULK_TAG_INTER_BATCH_SLEEP)
+                            device_bulk_call_count += 1
+                            self._tag_devices(tag_ids, device_batch, cci_tag_action)    # noqa
+
                             self.logger.info(
-                                f"{self.log_prefix}: Successfully {'tagged' if cci_tag_action == 'append' else 'untagged'} "
-                                f"batch {batch_num + 1}/{total_batches} ({len(device_batch)} device record(s)) with tag '{tag}'."
+                                f"{self.log_prefix}: Successfully {'tagged' if cci_tag_action == 'append' else 'untagged'} "    # noqa
+                                f"batch {batch_num + 1}/{total_batches} ({len(device_batch)} device record(s)) with tag '{tag}'."   # noqa
                             )
-                        
+
                         except Exception as batch_e:
+                            device_bulk_call_count += 1
                             self.logger.error(
-                                f"{self.log_prefix}: Failed to {'tag' if cci_tag_action == 'append' else 'untag'} "
-                                f"batch {batch_num + 1}/{total_batches} ({len(device_batch)} device record(s)) with tag '{tag}'. "
+                                f"{self.log_prefix}: Failed to {'tag' if cci_tag_action == 'append' else 'untag'} "     # noqa
+                                f"batch {batch_num + 1}/{total_batches} ({len(device_batch)} device record(s)) with tag '{tag}'. "      # noqa
                                 f"Error: {batch_e}"
                             )
                             failed_action_ids.extend(batch_action_ids)
 
                 except Exception as group_e:
                     self.logger.error(
-                        f"{self.log_prefix}: Failed to execute action '{action_label}' for tag '{tag}'. "
-                        f"Error: {group_e}"
+                        f"{self.log_prefix}: Failed to execute action "
+                        f"'{action_label}' for tag '{tag}'. Error: {group_e}"
                     )
                     failed_action_ids.extend(list(action_id_to_devices.keys()))
         except Exception as group_e:
@@ -4903,6 +13317,7 @@ class NetskopePlugin(PluginBase):
         failed_action_ids = []
         device_to_tags = {}
         tag_cache = self._fetch_all_tags()
+        device_bulk_call_count = 0
         for action_dict in actions:
             action_id = action_dict.get("id")
             action = action_dict.get("params")
@@ -4911,6 +13326,7 @@ class NetskopePlugin(PluginBase):
                     tags,
                     device_id,
                     device_user_key,
+                    hostname,
                     _,
                 ) = self._process_params_for_tag_device_action(
                     action.parameters, True
@@ -4927,12 +13343,12 @@ class NetskopePlugin(PluginBase):
                     if uk:
                         unique_user_keys.add(uk)
 
-                if not unique_user_keys or not device_id:
+                if not unique_user_keys or not device_id or not hostname:
                     failed_action_ids.append(action_id)
                     continue
 
                 for user_key in unique_user_keys:
-                    device_key = (device_id, user_key)
+                    device_key = (device_id, user_key, hostname)
                     if device_key not in device_to_tags:
                         device_to_tags[device_key] = {
                             'tags': set(),
@@ -4945,7 +13361,7 @@ class NetskopePlugin(PluginBase):
                 self.logger.error(
                     f"{self.log_prefix}: Error occurred while processing "
                     f"action '{action_label}' for record with ID '{action_id}'. "
-                    f"Error: {e}."
+                    f"Error: {e}"
                 )
                 failed_action_ids.append(action_id)
         log_msg = ""
@@ -4954,7 +13370,8 @@ class NetskopePlugin(PluginBase):
             log_msg = (
                 f" {skipped_records} record(s) will be skipped "
                 "either due to being invalid or missing "
-                "'Netskope Device UID' or 'User Key' field values."
+                "'Netskope Device UID', 'User Key' or "
+                "'Hostname' field values."
             )
         self.logger.info(
             f"{self.log_prefix}: Performing 'Replace' Tag(s) "
@@ -4964,7 +13381,7 @@ class NetskopePlugin(PluginBase):
 
         tag_set_groups = {}
 
-        for (device_id, user_key), group_data in device_to_tags.items():
+        for (device_id, user_key, hostname), group_data in device_to_tags.items():
             tags = sorted(list(group_data['tags']))  # Sort for consistent grouping
             action_ids = group_data['action_ids']
 
@@ -4974,7 +13391,7 @@ class NetskopePlugin(PluginBase):
                 tags = tags[:MAX_TAGS_PER_DEVICE]
                 self.logger.info(
                     f"{self.log_prefix}: Device '{device_id}' (userkey: "
-                    f"'{user_key}') has more than {MAX_TAGS_PER_DEVICE} tags. "
+                    f"'{user_key}', Hostname: '{hostname}') has more than {MAX_TAGS_PER_DEVICE} tags. "
                     f"Only the first {MAX_TAGS_PER_DEVICE} sorted tags will be "
                     f"applied: {tags}. Skipped tags: {skipped_tags}"
                 )
@@ -4986,13 +13403,17 @@ class NetskopePlugin(PluginBase):
                     'action_ids': set()
                 }
 
-            device = {"nsdeviceuid": device_id, "userkey": user_key}
+            device = {
+                "nsdeviceuid": device_id,
+                "userkey": user_key,
+                "hostname": hostname
+            }
             tag_set_groups[tag_set_key]['devices'].append(device)
             tag_set_groups[tag_set_key]['action_ids'].update(action_ids)
 
         self.logger.debug(
-            f"{self.log_prefix}: Grouped {len(device_to_tags)} device record(s) into "
-            f"{len(tag_set_groups)} tag set group(s)."
+            f"{self.log_prefix}: Grouped {len(device_to_tags)} device "
+            f"record(s) into {len(tag_set_groups)} tag set group(s)."
         )
 
         for tags_tuple, group_data in tag_set_groups.items():
@@ -5012,7 +13433,8 @@ class NetskopePlugin(PluginBase):
 
                 self.logger.info(
                     f"{self.log_prefix}: Replacing tags {tags} on "
-                    f"{len(devices)} device record(s) in {total_batches} batch(es)."
+                    f"{len(devices)} device record(s) in "
+                    f"{total_batches} batch(es)."
                 )
 
                 for batch_num in range(total_batches):
@@ -5028,7 +13450,14 @@ class NetskopePlugin(PluginBase):
                             f"{batch_num + 1}/{total_batches} with "
                             f"{len(device_batch)} device records(s) for tags {tags}."
                         )
-
+                        if device_bulk_call_count > 0:
+                            self.logger.debug(
+                                f"{self.log_prefix}: Sleeping "
+                                f"{DEVICE_BULK_TAG_INTER_BATCH_SLEEP}s before next "
+                                "device bulk tag API call to respect rate limit."
+                            )
+                            time.sleep(DEVICE_BULK_TAG_INTER_BATCH_SLEEP)
+                        device_bulk_call_count += 1
                         self._replace_device_tags(tag_ids, device_batch)
 
                         self.logger.info(
@@ -5038,6 +13467,7 @@ class NetskopePlugin(PluginBase):
                         )
 
                     except Exception as batch_e:
+                        device_bulk_call_count += 1
                         self.logger.error(
                             message=(
                                 f"{self.log_prefix}: Failed to replace tags on "
@@ -5065,7 +13495,7 @@ class NetskopePlugin(PluginBase):
 
         return failed_action_ids
 
-    def execute_action(self, action: Action):
+    def execute_action(self, action: Action, revert: bool = False):
         """Execute action on the user.
 
         Args:
@@ -5073,13 +13503,45 @@ class NetskopePlugin(PluginBase):
         """
         helper = AlertsHelper()
         self.tenant = helper.get_tenant_crev2(self.name)
+        # The 'Add host to Private App' action consumes the full set of
+        # values from its Source/Static fields, so its multi-value
+        # parameters must NOT be collapsed to a single latest value here.
         action.parameters = get_latest_values(
             action.parameters,
-            exclude_keys=["host", "tags", "protocol", "publishers"],
+            exclude_keys=[
+                "host",
+                "tags",
+                "protocol",
+                "publishers",
+            ],
         )
         self.logger.info(
-            f"{self.log_prefix}: Executing '{action.label}' action."
+            f"{self.log_prefix}: Executing '{action.label}' "
+            f"{'revert action.' if revert else 'action'}."
         )
+        if revert:
+            if action.value == "impact":
+                anomaly_id = action.parameters.get("anomaly_id", "")
+                if not anomaly_id:
+                    err_msg = (
+                        "Unable to find the Anomaly ID, hence "
+                        "Revert UCI Impact action will be skipped."
+                    )
+                    self.logger.error(f"{self.log_prefix}: {err_msg}")
+                    raise NetskopeException(err_msg)
+                self.revert_uci_update_impact(anomaly_id)
+                self.logger.info(
+                    f"{self.log_prefix}: Successfully executed revert action"
+                    f" for '{action.label}' and marked Anomaly ID "
+                    f"'{anomaly_id}' as allowed."
+                )
+                return
+
+            raise NotImplementedError(
+                f"Revert action is not supported for "
+                f"'{action.value}' action in Netskope Risk Exchange plugin."
+            )
+
         if action.value == "generate":
             self.logger.info(
                 f"{self.log_prefix}: Successfully executed '{action.label}' "
@@ -5088,22 +13550,6 @@ class NetskopePlugin(PluginBase):
             )
             return
         elif action.value == "impact":
-            if 'performRevert' in Action.model_fields and action.performRevert:
-                anomaly_id = action.parameters.get("anomaly_id", "")
-                if not anomaly_id:
-                    err_msg = (
-                        "Unable to find the Anomaly ID, hence "
-                        "Revert UCI Impact Action will be skipped."
-                    )
-                    self.logger.error(f"{self.log_prefix}: {err_msg}")
-                    raise NetskopeException(err_msg)
-                self.revert_uci_update_impact(anomaly_id)
-                self.logger.info(
-                    f"{self.log_prefix}: Successfully marked anomaly ID "
-                    f"{anomaly_id} as allowed."
-                )
-                return
-
             user, score, source, reason = (
                 self._process_params_for_impact_action(action.parameters)
             )
@@ -5240,8 +13686,13 @@ class NetskopePlugin(PluginBase):
                 f"{self.log_prefix}: Created/updated app instance "
                 f"{instance_name} successfully."
             )
+        # The Add to Destination/DNS/Service Profile and Create Device
+        # Classification actions are handled exclusively through
+        # ``execute_actions`` (bulk). The plugin requires CE 6.1.0+, where
+        # bulk execution is always used, so no single-record branch is
+        # implemented for them here.
 
-    def execute_actions(self, actions):
+    def execute_actions(self, actions, revert: bool = False):
         """Execute actions in bulk.
 
         Args:
@@ -5251,56 +13702,154 @@ class NetskopePlugin(PluginBase):
         self.tenant = helper.get_tenant_crev2(self.name)
         first_action = actions[0].get("params")
         action_label = first_action.label
-        self.logger.info(
-            f"{self.log_prefix}: Executing '{action_label}' action "
-            f"for {len(actions)} records."
-        )
+        if revert:
+            err_msg = ""
+            if first_action.value != "impact":
+                err_msg = (
+                    f"Batch revert action for '{action_label}' is not "
+                    f"supported in the Netskope Risk Exchange plugin."
+                )
+                self.logger.error(f"{self.log_prefix}: {err_msg}")
+            raise NotImplementedError(err_msg)
+        if first_action.value != "impact":
+            self.logger.info(
+                f"{self.log_prefix}: Executing '{action_label}' action "
+                f"for {len(actions)} record(s)."
+            )
         failed_action_ids = []
         if first_action.value == "private_app":
+            # Group records by target app name, keeping (action_id, params)
+            # so each host can be mapped back to the contributing records.
             private_apps = {}
-            action_id_to_app_mapping = {}
             for action_dict in actions:
                 id, action = action_dict.get("id"), action_dict.get("params")
+                selected = action.parameters.get("private_app_name", "")
                 app_name = (
-                    action.parameters.get("private_app_name", "")
-                    if action.parameters.get("private_app_name", "") != "create"
+                    selected
+                    if selected != "create"
                     else action.parameters.get("name", "")
                 )
-                private_apps.setdefault(app_name, []).append(action.parameters)
-                action_id_to_app_mapping[id] = app_name
+                private_apps.setdefault(app_name, []).append(
+                    (id, action.parameters)
+                )
+            # Tracks how many hosts were added to each private app across
+            # all groups; surfaced in the final summary log's details.
+            hosts_per_app = {}
             for app_name, batched_actions in private_apps.items():
-                batch_action_ids = [
-                    action_id for action_id, mapped_app_name in action_id_to_app_mapping.items()
-                    if mapped_app_name == app_name
-                ]
+                batch_action_ids = [aid for aid, _ in batched_actions]
                 try:
-                    first_action = batched_actions[0]
-                    params = first_action.copy()
-                    params["host"] = [
-                        host_item
-                        for action in batched_actions
-                        for host_item in (
-                            action["host"] if isinstance(action["host"], list)
-                            else [action["host"]]
+                    params = batched_actions[0][1].copy()
+                    # One pass over the group's records builds: the unioned
+                    # host list; the per-batch tag map (host -> contributing
+                    # tag names) for tag scoping; and the per-record host
+                    # sets for failed-action-id attribution.
+                    union_hosts = []
+                    host_to_tags = {}
+                    record_to_hosts = {}
+                    for aid, record_params in batched_actions:
+                        # Use ``or []`` (not just a get default) so a tags
+                        # value of None - not only a missing key - is
+                        # normalised to an empty list before iterating.
+                        raw_tags = record_params.get("tags") or []
+                        if isinstance(raw_tags, str):
+                            raw_tags = [
+                                tag.strip()
+                                for tag in raw_tags.split(",")
+                                if tag.strip()
+                            ]
+                        else:
+                            # Tags accepts multiple mapped fields: one entry
+                            # per field, nested one level deeper wherever a
+                            # mapped Source field's record value is itself
+                            # a list.
+                            raw_tags = (
+                                self.netskope_helper._normalize_csv_values(
+                                    raw_tags
+                                )
+                            )
+                        record_valid_tags, _, _ = (
+                            self.netskope_helper.validate_tags_for_private_app(
+                                raw_tags, app_name
+                            )
                         )
-                        if host_item
-                    ]
+                        record_tag_names = {
+                            tag["tag_name"] for tag in record_valid_tags
+                        }
+                        # Host accepts a Source field (a list) or a Static
+                        # field (a comma-separated string); the shared
+                        # _normalize_csv_values helper handles both - trimming,
+                        # dropping empties, and de-duplicating - so each host
+                        # is processed individually (as the profile actions).
+                        record_hosts = (
+                            self.netskope_helper._normalize_csv_values(
+                                record_params.get("host")
+                            )
+                        )
+                        host_set = set()
+                        for host_value in record_hosts:
+                            union_hosts.append(host_value)
+                            host_set.add(host_value)
+                            host_to_tags.setdefault(
+                                host_value, set()
+                            ).update(record_tag_names)
+                        record_to_hosts[aid] = host_set
+                    params["host"] = union_hosts
                     params = get_latest_values(
                         params,
                         exclude_keys=["host", "tags", "protocol", "publishers"],
                     )
-                    self._execute_private_app_action(params)
+                    # compact=True: after appending this group's hosts,
+                    # consolidate the app group so apps left partially filled
+                    # by earlier reverts are re-packed once per sync.
+                    not_placed, added_counts = (
+                        self._execute_private_app_action(
+                            params, host_to_tags, compact=True
+                        )
+                    )
+                    not_placed = not_placed or set()
+                    # Accumulate the per-app added-host counts for the final
+                    # summary log.
+                    for name, count in (added_counts or {}).items():
+                        hosts_per_app[name] = (
+                            hosts_per_app.get(name, 0) + count
+                        )
+                    # A record fails only when EVERY host it contributed was
+                    # not placed (invalid or capacity-skipped). A 0-host
+                    # record is a vacuous subset -> it fails too.
+                    for aid, host_set in record_to_hosts.items():
+                        if host_set.issubset(not_placed):
+                            failed_action_ids.append(aid)
                 except Exception as e:
                     failed_action_ids.extend(batch_action_ids)
                     self.logger.error(
-                        f"{self.log_prefix}: Error occurred while adding "
-                        f"hosts to private apps. Error: {str(e)}"
+                        message=(
+                            f"{self.log_prefix}: Error occurred while adding "
+                            f"hosts to private apps. Error: {str(e)}"
+                        ),
+                        details=re.sub(
+                            r"token=([0-9a-zA-Z]*)",
+                            "token=********&",
+                            traceback.format_exc(),
+                        ),
                     )
 
+            total_hosts_added = sum(hosts_per_app.values())
+            self.logger.info(
+                message=(
+                    f"{self.log_prefix}: Completed the '{action_label}' "
+                    f"action: added {total_hosts_added} host(s) across "
+                    f"{len(hosts_per_app)} private app(s). Expand log to"
+                    " view hosts added per Private App."
+                ),
+                details=(
+                    "Hosts added per private app: "
+                    f"{hosts_per_app}"
+                ),
+            )
             return ActionResult(
                 success=True,
                 message="Successfully added hosts to private apps.",
-                failed_action_ids=failed_action_ids
+                failed_action_ids=list(dict.fromkeys(failed_action_ids)),
             )
         elif first_action.value in ["add", "remove"]:
             skip_count = 0
@@ -5380,7 +13929,7 @@ class NetskopePlugin(PluginBase):
                                 f"{self.log_prefix}: Failed to add "
                                 f"{len(batch_users)} user(s) to the group "
                                 f"with ID '{group_id}' for batch {batch}. "
-                                f"Error: {e}. Continuing with next batch."
+                                f"Error: {e} Continuing with next batch."
                             )
                             batch += 1
 
@@ -5459,7 +14008,7 @@ class NetskopePlugin(PluginBase):
                                 f"{self.log_prefix}: Failed to remove "
                                 f"{len(batch_users)} user(s) from the group "
                                 f"with ID '{group_id}' for batch {batch}. "
-                                f"Error: {e}. Continuing with next batch."
+                                f"Error: {e} Continuing with next batch."
                             )
                             batch += 1
 
@@ -5519,7 +14068,7 @@ class NetskopePlugin(PluginBase):
                     self.logger.error(
                         f"{self.log_prefix}: Error occurred while processing "
                         f"action '{action_label}' for record with ID '{id}'. "
-                        f"Error: {e}."
+                        f"Error: {e}"
                     )
                     failed_action_ids.append(id)
 
@@ -5731,6 +14280,479 @@ class NetskopePlugin(PluginBase):
                 success=True,
                 message="Successfully reset UCI score for users.",
                 failed_action_ids=failed_action_ids
+            )
+        elif first_action.value == "destination_profile":
+            profile_groups = {}
+            invalid_values = []
+            for action_dict in actions:
+                id, action = (
+                    action_dict.get("id"),
+                    action_dict.get("params"),
+                )
+                params = action.parameters
+                selected_profile = params.get(
+                    "destination_profile_name", ""
+                )
+                # new_profile_name only matters when creating a profile; for
+                # an existing profile it is left at its (possibly per-record
+                # source) default, so excluding it from the key keeps all
+                # records targeting the same existing profile in one group.
+                group_key = (
+                    selected_profile,
+                    params.get("new_profile_name", "")
+                    if selected_profile == "create"
+                    else "",
+                )
+                group = profile_groups.setdefault(
+                    group_key,
+                    {
+                        "params": params,
+                        "values": [],
+                        "ids": [],
+                        "value_to_ids": {},
+                    },
+                )
+                group["ids"].append(id)
+                normalized = self.netskope_helper._normalize_csv_values(
+                    params.get("destination_values", "")
+                )
+                # A regex profile's values are patterns, not addresses,
+                # so the IPv6 rejection and the CIDR/range prefix only
+                # apply to exact-match (sensitive/insensitive) profiles.
+                # Netskope's destination profile does not support IPv6
+                # in any form; such a value is dropped here and the
+                # record that supplied it is marked failed.
+                if params.get("profile_match_type", "") != "regex":
+                    filtered_values = []
+                    for value in normalized:
+                        formatted = (
+                            self.netskope_helper
+                            ._format_destination_profile_value(value)
+                        )
+                        if formatted is None:
+                            invalid_values.append(value)
+                            failed_action_ids.append(id)
+                            continue
+                        filtered_values.append(formatted)
+                    normalized = filtered_values
+                group["values"].extend(normalized)
+                # Track which action id(s) each value came from so that a
+                # value that fails or is skipped can be attributed back
+                # to the originating action(s) as a failed action id.
+                for value in normalized:
+                    group["value_to_ids"].setdefault(value, set()).add(id)
+            if invalid_values:
+                self.logger.info(
+                    message=(
+                        f"{self.log_prefix}: Skipping "
+                        f"{len(invalid_values)} value(s) as they are "
+                        "not valid for the destination profile."
+                    )
+                )
+            for group in profile_groups.values():
+                params = group["params"]
+                batch_ids = group["ids"]
+                value_to_ids = group["value_to_ids"]
+                values = self.netskope_helper._normalize_csv_values(group["values"])
+                # Optional per-action override for the tenant-wide
+                # exact-match value limit; empty/invalid falls back to
+                # the default constant inside the capacity helper.
+                raw_limit = params.get("exact_match_total_limit", "")
+                try:
+                    exact_total_limit = (
+                        int(raw_limit)
+                        if str(raw_limit).strip() != ""
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    exact_total_limit = None
+                try:
+                    shared, not_applied = (
+                        self._push_destination_profile(
+                            destination_values=values,
+                            existing_profile_name=params.get(
+                                "destination_profile_name", ""
+                            ),
+                            new_profile_name=params.get(
+                                "new_profile_name", ""
+                            ),
+                            new_profile_description=params.get(
+                                "new_profile_description", ""
+                            ),
+                            match_type=params.get(
+                                "profile_match_type", ""
+                            ),
+                            apply_pending_changes=params.get(
+                                "apply_pending_changes", "No"
+                            ),
+                            operation=params.get("operation", "append"),
+                            exact_total_limit=exact_total_limit,
+                        )
+                    )
+                    self.netskope_helper._attribute_failed_ids(
+                        not_applied, value_to_ids, failed_action_ids
+                    )
+                    if params.get("operation", "append") == "replace":
+                        summary = (
+                            f"Successfully replaced the destination "
+                            f"profile's values with {shared} network "
+                            "target(s)."
+                        )
+                    else:
+                        summary = (
+                            f"Successfully added {shared} network "
+                            "target(s) to the destination profile."
+                        )
+                    self.logger.info(f"{self.log_prefix}: {summary}")
+                except Exception as e:
+                    failed_action_ids.extend(batch_ids)
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Error occurred while "
+                            "adding network targets to the "
+                            f"destination profile. Error: {e}"
+                        ),
+                        details=re.sub(
+                            r"token=([0-9a-zA-Z]*)",
+                            "token=********&",
+                            traceback.format_exc(),
+                        ),
+                    )
+            return ActionResult(
+                success=True,
+                message=(
+                    "Successfully added network targets to "
+                    "destination profiles."
+                ),
+                failed_action_ids=list(set(failed_action_ids)),
+            )
+        elif first_action.value == "network_profile":
+            return self._execute_network_profile_actions(
+                actions, failed_action_ids
+            )
+        elif first_action.value == "dns_profile":
+            profile_groups = {}
+            for action_dict in actions:
+                id, action = (
+                    action_dict.get("id"),
+                    action_dict.get("params"),
+                )
+                params = action.parameters
+                profile_value = params.get("dns_profile_name", "")
+                # new_profile_name only matters when creating a profile (the
+                # packed dropdown id is "create"); for an existing profile it
+                # keeps a per-record source default, so exclude it from the
+                # key to keep same-profile records in one group.
+                is_create = (
+                    profile_value.partition(CUSTOM_SEPARATOR)[2] == "create"
+                )
+                group_key = (
+                    profile_value,
+                    params.get("new_profile_name", "") if is_create else "",
+                )
+                group = profile_groups.setdefault(
+                    group_key,
+                    {
+                        "params": params,
+                        "domains": [],
+                        "ids": [],
+                        "value_to_ids": {},
+                    },
+                )
+                group["ids"].append(id)
+                normalized = self.netskope_helper._normalize_csv_values(
+                    params.get("domain_names", "")
+                )
+                group["domains"].extend(normalized)
+                # Track which action id(s) each domain came from so that a
+                # domain that fails or is skipped (invalid/over-length or
+                # dropped under the payload budget) can be attributed back
+                # to the originating action(s) as a failed action id.
+                for value in normalized:
+                    group["value_to_ids"].setdefault(value, set()).add(id)
+            for group in profile_groups.values():
+                params = group["params"]
+                batch_ids = group["ids"]
+                value_to_ids = group["value_to_ids"]
+                domains = self.netskope_helper._normalize_csv_values(group["domains"])
+                profile_value = params.get("dns_profile_name", "")
+                # Safe to split on the first separator: a DNS profile
+                # name cannot contain "(" or ")" (rejected by both the
+                # Netskope DNS profile API and the plugin's save-time
+                # validation), so the "()" separator never collides with
+                # the name.
+                profile_name, _, profile_id = profile_value.partition(
+                    CUSTOM_SEPARATOR
+                )
+                existing_profile_name = (
+                    "create" if profile_id == "create" else profile_name
+                )
+                try:
+                    shared, not_applied = self._push_dns_profile(
+                        domains=domains,
+                        existing_profile_name=existing_profile_name,
+                        new_profile_name=params.get(
+                            "new_profile_name", ""
+                        ),
+                        action_type=params.get(
+                            "dns_profile_action_type", ""
+                        ),
+                        action_params=params,
+                        operation=params.get("operation", "append"),
+                    )
+                    self.netskope_helper._attribute_failed_ids(
+                        not_applied, value_to_ids, failed_action_ids
+                    )
+                    if params.get("operation", "append") == "replace":
+                        summary = (
+                            f"Successfully replaced the DNS profile's "
+                            f"domains for the selected record type(s) "
+                            f"with {shared} domain(s)."
+                        )
+                    else:
+                        summary = (
+                            f"Successfully added {shared} domain(s) to "
+                            "the DNS profile."
+                        )
+                    self.logger.info(f"{self.log_prefix}: {summary}")
+                except Exception as e:
+                    failed_action_ids.extend(batch_ids)
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Error occurred while "
+                            "adding domains to the DNS profile. "
+                            f"Error: {e}"
+                        ),
+                        details=re.sub(
+                            r"token=([0-9a-zA-Z]*)",
+                            "token=********&",
+                            traceback.format_exc(),
+                        ),
+                    )
+            return ActionResult(
+                success=True,
+                message="Successfully added domains to DNS profiles.",
+                failed_action_ids=list(set(failed_action_ids)),
+            )
+        elif first_action.value == "service_profile":
+            profile_groups = {}
+            for action_dict in actions:
+                id, action = (
+                    action_dict.get("id"),
+                    action_dict.get("params"),
+                )
+                params = action.parameters
+                selected_profile = params.get("service_profile_name", "")
+                # new_profile_name only matters when creating a profile; for
+                # an existing profile it keeps a per-record source default,
+                # so exclude it to keep same-profile records in one group.
+                group_key = (
+                    selected_profile,
+                    params.get("new_profile_name", "")
+                    if selected_profile == "create"
+                    else "",
+                )
+                group = profile_groups.setdefault(
+                    group_key,
+                    {
+                        "params": params,
+                        "tcp": [],
+                        "udp": [],
+                        "tcp_udp": [],
+                        "ids": [],
+                        "value_to_ids": {},
+                    },
+                )
+                group["ids"].append(id)
+                # Track which action id(s) each port came from so that a
+                # port that fails or is skipped can be attributed back to
+                # the originating action(s) as a failed action id.
+                for proto_key in ("tcp_ports", "udp_ports", "tcp_udp_ports"):
+                    normalized = self.netskope_helper._normalize_csv_values(
+                        params.get(proto_key, "")
+                    )
+                    group[proto_key.replace("_ports", "")].extend(
+                        normalized
+                    )
+                    for value in normalized:
+                        group["value_to_ids"].setdefault(
+                            value, set()
+                        ).add(id)
+            for group in profile_groups.values():
+                params = group["params"]
+                batch_ids = group["ids"]
+                value_to_ids = group["value_to_ids"]
+                profile_name = params.get("service_profile_name", "")
+                if profile_name == "create":
+                    profile_name = params.get("new_profile_name", "")
+                try:
+                    _, not_applied = self._push_service_profile(
+                        operation=params.get("operation", "append"),
+                        profile_name=profile_name,
+                        description=params.get(
+                            "new_profile_description", ""
+                        ),
+                        tcp=self.netskope_helper._normalize_csv_values(group["tcp"]),
+                        udp=self.netskope_helper._normalize_csv_values(group["udp"]),
+                        tcp_udp=self.netskope_helper._normalize_csv_values(
+                            group["tcp_udp"]
+                        ),
+                        icmp=bool(params.get("icmp", False)),
+                    )
+                    self.netskope_helper._attribute_failed_ids(
+                        not_applied, value_to_ids, failed_action_ids
+                    )
+                    if params.get("operation", "append") == "replace":
+                        summary = (
+                            f"Successfully replaced the ports on the "
+                            f"service profile '{profile_name}'."
+                        )
+                    else:
+                        summary = (
+                            f"Successfully added ports to the service "
+                            f"profile '{profile_name}'."
+                        )
+                    self.logger.info(f"{self.log_prefix}: {summary}")
+                except Exception as e:
+                    failed_action_ids.extend(batch_ids)
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Error occurred while "
+                            "adding ports to the service profile "
+                            f"'{profile_name}'. Error: {e}"
+                        ),
+                        details=re.sub(
+                            r"token=([0-9a-zA-Z]*)",
+                            "token=********&",
+                            traceback.format_exc(),
+                        ),
+                    )
+            return ActionResult(
+                success=True,
+                message="Successfully added ports to service profiles.",
+                failed_action_ids=list(set(failed_action_ids)),
+            )
+        elif first_action.value == "device_classification":
+            rule_groups = {}
+            for action_dict in actions:
+                id, action = (
+                    action_dict.get("id"),
+                    action_dict.get("params"),
+                )
+                params = action.parameters
+                classification_value = params.get(
+                    "device_classification", ""
+                )
+                rule_value = params.get("device_classification_rule", "")
+                # The create-name fields only matter when their dropdown is
+                # set to "create"; otherwise they keep a per-record source
+                # default, so exclude them from the key.
+                creating_classification = classification_value == "create"
+                creating_rule = (
+                    rule_value.rpartition(
+                        CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION
+                    )[2] == "create"
+                )
+                group_key = (
+                    params.get("operation", ""),
+                    classification_value,
+                    params.get("new_classification_name", "")
+                    if creating_classification
+                    else "",
+                    rule_value,
+                    params.get("new_rule_name", "")
+                    if creating_rule
+                    else "",
+                    params.get("os", ""),
+                    params.get("logical_operator", ""),
+                    params.get("group_operator", ""),
+                )
+                group = rule_groups.setdefault(
+                    group_key,
+                    {
+                        "params": params,
+                        "tags": [],
+                        "ids": [],
+                        "value_to_ids": {},
+                    },
+                )
+                group["ids"].append(id)
+                normalized = self.netskope_helper._normalize_csv_values(
+                    params.get("classification_tags", "")
+                )
+                group["tags"].extend(normalized)
+                # Track which action id(s) each device tag came from so a
+                # tag that is skipped (no matching tag on the tenant) can
+                # be attributed back to the originating action(s).
+                for value in normalized:
+                    group["value_to_ids"].setdefault(
+                        value, set()
+                    ).add(id)
+            rule_action_statuses = set()
+            for group in rule_groups.values():
+                params = group["params"]
+                batch_ids = group["ids"]
+                value_to_ids = group["value_to_ids"]
+                tags = self.netskope_helper._normalize_csv_values(group["tags"])
+                try:
+                    _, not_applied, action_status = (
+                        self._push_device_classification(
+                            operation=params.get("operation", "append"),
+                            classification_value=params.get(
+                                "device_classification", ""
+                            ),
+                            new_classification_name=params.get(
+                                "new_classification_name", ""
+                            ),
+                            rule_value=params.get(
+                                "device_classification_rule", ""
+                            ),
+                            new_rule_name=params.get("new_rule_name", ""),
+                            os=params.get("os", ""),
+                            operator=params.get(
+                                "logical_operator", "and"
+                            ),
+                            group_operator=params.get(
+                                "group_operator", "and"
+                            ),
+                            tags=tags,
+                        )
+                    )
+                    rule_action_statuses.add(action_status)
+                    self.netskope_helper._attribute_failed_ids(
+                        not_applied, value_to_ids, failed_action_ids
+                    )
+                    self.logger.info(
+                        f"{self.log_prefix}: Successfully {action_status} "
+                        "the device classification rule."
+                    )
+                except Exception as e:
+                    failed_action_ids.extend(batch_ids)
+                    self.logger.error(
+                        message=(
+                            f"{self.log_prefix}: Error occurred while "
+                            "creating or updating the device "
+                            f"classification rule. Error: {e}"
+                        ),
+                        details=str(traceback.format_exc()),
+                    )
+            # Build the aggregate verb from what actually happened across
+            # the groups: only-created, only-updated, or a mix of both.
+            if rule_action_statuses == {"created"}:
+                status_verb = "created"
+            elif rule_action_statuses == {"updated"}:
+                status_verb = "updated"
+            elif rule_action_statuses:
+                status_verb = "created and updated"
+            else:
+                status_verb = "created or updated"
+            return ActionResult(
+                success=True,
+                message=(
+                    f"Successfully {status_verb} device classification "
+                    "rule(s)."
+                ),
+                failed_action_ids=list(set(failed_action_ids)),
             )
         elif first_action.value == "generate":
             self.logger.info(
@@ -6158,5 +15180,3 @@ class NetskopePlugin(PluginBase):
                 "tagged": tagged_count
             }
         return tags_apps_info, batch_failed_action_ids
-
-    # TODO: Implement cleanup method to delete client status iterator

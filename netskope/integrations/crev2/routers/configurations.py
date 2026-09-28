@@ -109,12 +109,17 @@ async def list_actions(
     plugin = PluginClass(
         None,
         SecretDict(configuration.parameters),
-        {},
+        configuration.storage or {},
         None,
         logger,
     )
     try:
-        return plugin.get_actions()
+        actions = plugin.get_actions()
+        connector.collection(Collections.CREV2_CONFIGURATIONS).update_one(
+            {"name": name},
+            {"$set": {"storage": plugin.storage}},
+        )
+        return actions
     except Exception as ex:
         logger.error(
             "Error occurred while getting action list.",
@@ -144,12 +149,17 @@ async def get_action_fields(
     plugin = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        {},
+        configuration.storage or {},
         None,
         logger,
     )
     try:
-        return plugin.get_action_params(action)
+        params = plugin.get_action_params(action)
+        connector.collection(Collections.CREV2_CONFIGURATIONS).update_one(
+            {"name": name},
+            {"$set": {"storage": plugin.storage}},
+        )
+        return params
     except Exception as ex:
         logger.error(
             "Error occurred while getting list of actions.",
@@ -321,7 +331,7 @@ async def update_configuration(
             plugin = PluginClass(
                 configuration.name,
                 SecretDict(configuration.parameters),
-                configuration.storage,
+                configuration._existing_configuration.storage or {},
                 None,
                 logger,
             )
@@ -362,7 +372,7 @@ async def delete_configuration(
         plugin = PluginClass(
             configuration.name,
             SecretDict(configuration.parameters),
-            configuration.storage,
+            configuration.storage or {},
             None,
             logger,
         )

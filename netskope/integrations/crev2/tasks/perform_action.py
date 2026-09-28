@@ -379,3 +379,11 @@ def perform_action():
                                 "performedAt": datetime.now(),
                             }
                         )
+
+        # Persist the plugin's storage object once per configuration, after all
+        # actions for this configuration (both batch and individual-fallback
+        # paths) have been executed on this plugin instance.
+        connector.collection(Collections.CREV2_CONFIGURATIONS).update_one(
+            {"name": configuration},
+            {"$set": {"storage": plugin.storage or {}}},
+        )

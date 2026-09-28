@@ -33,8 +33,16 @@ Netskope CRE plugin Constants."""
 
 MAX_RETRY_COUNT = 4
 DEFAULT_WAIT_TIME = 60
+DEVICE_BULK_TAG_INTER_BATCH_SLEEP = 12
 PAGE_SIZE = 100
 MAX_HOSTS_PER_PRIVATE_APP = 500
+# Private app host IPv4 CIDR blocks wider than /8 (prefix < 8) are rejected;
+# 0.0.0.0/0 is wider than /8 and is therefore rejected by the same check.
+PRIVATE_APP_MIN_CIDR_PREFIX = 8
+# A single hostname label: 1-63 chars of letters/digits/hyphen/underscore,
+# not starting or ending with a hyphen. Used to validate private app
+# host/domain labels.
+REGEX_HOSTNAME_LABEL = r"^(?!-)[a-zA-Z0-9_-]{1,63}(?<!-)$"
 USERS_BATCH_SIZE = 512
 APPLICATIONS_BATCH_SIZE = 100
 REGEX_HOST = (
@@ -43,9 +51,17 @@ REGEX_HOST = (
 )
 REGEX_EMAIL = r"[^@]+@[^@]+\.[^@]+"
 REGEX_TAG = r"^[a-zA-Z0-9- ]*$"
+# Anchored with ``\Z`` (not ``$``): in Python ``$`` also matches just
+# before a trailing newline, so a value like "example.com\n" would
+# otherwise be accepted as a valid domain. ``\Z`` matches only the very
+# end of the string.
+REGEX_FOR_DOMAIN = (
+    r"^(?!.{254})(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+    r"(?:[a-zA-Z]{2,63})\Z"
+)
 MODULE_NAME = "CRE"
 PLUGIN = "Netskope Risk Exchange"
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.9.0"
 URLS = {
     "V2_PRIVATE_APP": "/api/v2/steering/apps/private",
     "V2_PRIVATE_APP_PATCH": "/api/v2/steering/apps/private/{}",
@@ -66,7 +82,26 @@ URLS = {
     "V2_CCI_TAGS": "/api/v2/services/cci/tags",
     "V2_UCI_IMPACT": "/api/v2/incidents/user/uciimpact",
     "V2_GET_UCI": "/api/v2/incidents/uba/getuci",
-    "V2_REVERT_UCI_IMPACT": "/api/v2/incidents/anomalies/{}/allow"
+    "V2_REVERT_UCI_IMPACT": "/api/v2/incidents/anomalies/{}/allow",
+    "V2_DESTINATION_PROFILE": "/api/v2/profiles/destinations",
+    "V2_DESTINATION_PROFILE_BY_ID": "/api/v2/profiles/destinations/{}",
+    "V2_DESTINATION_PROFILE_VALUES": (
+        "/api/v2/profiles/destinations/{}/values"
+    ),
+    "V2_DESTINATION_PROFILE_DEPLOY": "/api/v2/profiles/destinations/deploy",
+    "V2_DNS_PROFILE": "/api/v2/profiles/dns",
+    "V2_DNS_PROFILE_BY_ID": "/api/v2/profiles/dns/{}",
+    "V2_DNS_DOMAIN_CATEGORIES": "/api/v2/profiles/dns/domaincategories",
+    "V2_DNS_RECORD_TYPES": "/api/v2/profiles/dns/recordtypes",
+    "V2_DEVICE_CLASSIFICATION_TAGS": "/api/v2/deviceclassification/tags",
+    "V2_DEVICE_CLASSIFICATION_RULES": "/api/v2/deviceclassification/rules",
+    "V2_DEVICE_CLASSIFICATION_RULE_BY_ID": (
+        "/api/v2/deviceclassification/rules/{}"
+    ),
+    "V2_NETWORK_PROFILE": "/api/v2/profiles/networks",
+    "V2_NETWORK_PROFILE_BY_ID": "/api/v2/profiles/networks/{}",
+    "V2_NETWORK_PROFILE_VALUES": "/api/v2/profiles/networks/{}/values",
+    "V2_NETWORK_PROFILE_DEPLOY": "/api/v2/profiles/networks/deploy",
 }
 ERROR_TAG_EXISTS = (
     "Tag provided is already present. Hence use PATCH method to add "
@@ -82,7 +117,8 @@ APP_INSTANCE_BATCH_SIZE = 500
 TAG_APP_BATCH_SIZE = 100
 TAG_APP_TAG_LENGTH = 75
 TAG_DEVICE_TAG_LENGTH = 80
-TAG_DEVICE_BATCH_SIZE = 100
+PRIVATE_APP_TAG_MAX_LENGTH = 30
+TAG_DEVICE_BATCH_SIZE = 1000
 MAX_TAGS_PER_DEVICE = 5
 TAG_CACHE_PAGE_SIZE = 10
 DEVICE_FIELD_MAPPING = {
@@ -126,3 +162,917 @@ USER_FIELD_MAPPING = {
     "userIP": {"key": "userip"},
     "policyID": {"key": "policy_id"}
 }
+
+TAG_ACTION_LABEL_MAP = {
+    "append": "Add",
+    "remove": "Remove"
+}
+
+# ---------------------------------------------------------------------------
+# Add to Destination Profile action constants
+# ---------------------------------------------------------------------------
+# Capacity limits enforced by Netskope for destination profiles.
+DESTINATION_PROFILE_EXACT_TOTAL_LIMIT = 300000
+DESTINATION_PROFILE_EXACT_PER_PROFILE_LIMIT = 100000
+DESTINATION_PROFILE_REGEX_TOTAL_LIMIT = 1000
+# Destination profile by-id PATCH request body byte budget with a safety
+# buffer. The by-id PATCH carries the match type/description and the full
+# value list, and a body larger than this is rejected, so a value set
+# that does not fit is split across a first by-id PATCH and one or more
+# appends on the values endpoint. NOTE: this size budget applies ONLY to
+# the by-id PATCH (and the create POST). The values-endpoint append is
+# bounded by a value COUNT, not by payload size (see
+# DESTINATION_PROFILE_VALUES_PER_APPEND).
+# IMPORTANT: the real enforced limit is 9 MB, not the documented 10 MB --
+# a 10 MB body is rejected by the API. Do NOT raise this to 10 * 1024 *
+# 1024.
+DESTINATION_PROFILE_PAYLOAD_LIMIT = 9 * 1024 * 1024
+DESTINATION_PROFILE_PAYLOAD_SAFETY_BUFFER = 1024
+# The destination profile values endpoint (PATCH with op "append")
+# accepts at most this many values per call, so overflow values are
+# appended in batches of this size.
+DESTINATION_PROFILE_VALUES_PER_APPEND = 10
+# Destination profile name/description length limits.
+MAX_DESTINATION_PROFILE_NAME_LENGTH = 100
+MAX_DESTINATION_PROFILE_DESC_LENGTH = 200
+# Characters not allowed in a destination profile name.
+DESTINATION_PROFILE_NAME_FORBIDDEN_CHARS = ['"', ";"]
+# Allowed match types for a destination profile.
+MATCH_TYPE_OPTIONS = {
+    "insensitive": "Case Insensitive",
+    "sensitive": "Case Sensitive",
+    "regex": "Regex",
+}
+# Substring returned by the API when a profile has undeployed changes.
+PENDING_CHANGES_DETECTED = (
+    "non-interactive operation on pending profile is not allowed"
+)
+
+# ---------------------------------------------------------------------------
+# Add to DNS Profile action constants
+# ---------------------------------------------------------------------------
+# DNS profile name/description length limits.
+MAX_DNS_PROFILE_NAME_LENGTH = 255
+MAX_DNS_PROFILE_DESC_LENGTH = 255
+# Characters not allowed in a DNS profile name or description.
+DNS_PROFILE_FORBIDDEN_CHARS = ["(", ")", '"']
+# DNS profile payload byte budget (16 MiB) with a safety buffer.
+DNS_PROFILE_PAYLOAD_LIMIT = 16 * 1024 * 1024
+DNS_PROFILE_PAYLOAD_SAFETY_BUFFER = 1024
+# Allowed action types when adding domains to a DNS profile.
+DNS_PROFILE_ACTION_TYPE_OPTIONS = {
+    "add_to_allow_list": "Add to Domain Allowlist",
+    "add_to_block_list": "Add to Domain Blocklist",
+}
+# Allowed values for the "Block all except Allow list" choice.
+BLOCK_ALL_EXCEPT_ALLOW_LIST_OPTIONS = {
+    "True": "Yes",
+    "False": "No",
+}
+# Separator used to pack DNS profile name and id into a choice value
+# (DNS profile names cannot contain these characters).
+CUSTOM_SEPARATOR = "()"
+# Page size used when paginating DNS profile listings/categories.
+DNS_PROFILE_PAGE_SIZE = 150
+
+# ---------------------------------------------------------------------------
+# Add to Service Profile action constants
+# ---------------------------------------------------------------------------
+# API endpoint paths (URL is built as f"{tenant}{path}").
+V2_SERVICE_PROFILE = "/api/v2/profiles/serviceobjects"
+V2_SERVICE_PROFILE_BY_ID = "/api/v2/profiles/serviceobjects/{}"
+# Allowed operations when adding data to a profile (append keeps the
+# existing data and adds to it, replace overwrites it with the new
+# data). Shared by the destination, DNS and service profile actions.
+OPERATION_OPTIONS = {
+    "replace": "Replace",
+    "append": "Append",
+}
+# Alias retained for the service profile action.
+SERVICE_PROFILE_OPERATION_OPTIONS = OPERATION_OPTIONS
+# Service profile name/description length limits.
+MAX_SERVICE_PROFILE_NAME_LENGTH = 255
+MAX_SERVICE_PROFILE_DESC_LENGTH = 512
+# Only CUSTOM service profiles are editable (PREDEFINED are read-only).
+SERVICE_PROFILE_TYPE_CUSTOM = "CUSTOM"
+# Page size used when paginating service profile listings.
+SERVICE_PROFILE_PAGE_SIZE = 150
+
+# ---------------------------------------------------------------------------
+# Create Device Classification action constants
+# ---------------------------------------------------------------------------
+# Page size used when paginating device classification tag/rule listings.
+DEVICE_CLASSIFICATION_PAGE_SIZE = 1000
+# Name length limit for a device classification and its rule.
+MAX_DEVICE_CLASSIFICATION_NAME_LENGTH = 80
+# Separator used to pack "name<sep>id" in the device classification rule
+# dropdown. A dedicated separator (not the shared CUSTOM_SEPARATOR "()") is
+# used because device classification and rule names are allowed to contain
+# "()", so it cannot serve as a delimiter here.
+CUSTOM_SEPARATOR_DEVICE_CLASSIFICATION = "@#!<>"
+# Default description used when creating a device classification.
+DEVICE_CLASSIFICATION_DEFAULT_DESCRIPTION = "Created from Netskope CE."
+# Maximum number of device tags allowed in a single condition group of a
+# device classification rule. When a rule references more device tags than
+# this, the tags are split across multiple groups joined by the selected
+# logical operator.
+DEVICE_CLASSIFICATION_TAGS_PER_GROUP = 5
+# Maximum number of device tags an action may apply to a rule (the rule total).
+# Tags beyond this count (by position, after de-duplication) are ignored: they
+# are not validated, not resolved, and not sent. For an Append, the new tags
+# only fill the rule up to this total; a rule already holding this many tags
+# skips the append entirely.
+MAX_DEVICE_CLASSIFICATION_TAGS = 5
+# Allowed operating systems for a device classification rule (the key is
+# the value sent to the API, the value is the display label).
+DEVICE_CLASSIFICATION_OS_OPTIONS = {
+    "windows": "Windows",
+    "winserver": "Windows Server",
+    "mac": "macOS",
+    "android": "Android",
+    "ios": "iOS",
+    "chromeos": "ChromeOS",
+    "linux": "Linux",
+}
+# Allowed logical operators for combining device tags in a rule. The key is
+# the value stored on the action; it is mapped to the API's "$and"/"$or"
+# condition operator at build time (stored without the "$" so it is not
+# mistaken for a Source field reference during validation).
+DEVICE_CLASSIFICATION_OPERATOR_OPTIONS = {
+    "and": "All",
+    "or": "Any",
+}
+
+# ---------------------------------------------------------------------------
+# Add to Network Profile action constants
+# ---------------------------------------------------------------------------
+# Capacity limits enforced by Netskope for network profiles. Unlike
+# destination profiles, network profiles have no match type, so there is a
+# single flat capacity bucket (not split exact/regex).
+# The tenant-wide total is a fixed platform limit that cannot be raised, so
+# it is always enforced from this constant and is never overridable from the
+# action. The per-profile limit below is only the default -- Netskope can
+# raise it on a tenant, which is why the action exposes it as an override.
+NETWORK_PROFILE_TENANT_TOTAL_LIMIT = 300000
+NETWORK_PROFILE_PER_PROFILE_LIMIT = 20000
+# Maximum number of network profiles a tenant can hold. Roll-over stops
+# creating numbered siblings once the tenant is at this count.
+MAX_NETWORK_PROFILES = 512
+# Text markers that identify a "some tenant limit was exceeded" rejection of a
+# network profile create. The API reuses 403 for "licensed feature not enabled"
+# as well, so the status alone is not enough to tell the two apart. Matched
+# case-insensitively against the response body.
+#
+# These are deliberately broad: any limit rejection should stop roll-over
+# gracefully (skip the remaining values and report) rather than fail the whole
+# action. They do NOT establish WHICH limit was hit -- use
+# NETWORK_PROFILE_COUNT_ERROR_PATTERNS for that.
+NETWORK_PROFILE_LIMIT_ERROR_MARKERS = [
+    "maximum number",
+    "profile limit",
+    "limit exceeded",
+    "limit has been reached",
+]
+# Identifies a profile-COUNT rejection specifically, so the operator-facing
+# message can name the right cause and the right resolution. The tenant reuses
+# the same "resource limit exceeded" phrasing for value limits, which a marker
+# above cannot tell apart. Observed body:
+#
+#   {"err_code": "60307", "message": "resource limit exceeded: cannot have
+#    more than 512 profiles in a tenant", ...}
+#
+# The count varies by tenant, so it is matched as ``\d+`` and never against
+# MAX_NETWORK_PROFILES. ``err_code`` is deliberately not used: it is not
+# verified constant across tenants. Matched case-insensitively with re.search.
+# Each pattern requires PROFILES (plural) to be the resource being counted, so
+# a per-profile VALUE limit ("...more than 300000 values in a profile", "the
+# per-profile limit") can never match. Note that the bare marker "profile
+# limit" above is intentionally absent here: it also occurs in per-profile
+# value-limit wording, which is the very confusion this list exists to remove.
+NETWORK_PROFILE_COUNT_ERROR_PATTERNS = [
+    r"more than\s+\d+\s+(?:\w+\s+)?profiles\b",
+    r"\bprofiles\s+in\s+a\s+tenant\b",
+    r"\bnumber\s+of\s+(?:\w+\s+)?profiles\b",
+]
+# Written to a member that has to be emptied. A "#"-prefixed entry is a
+# comment to the network profile API, so it matches no traffic. A real IP
+# must never be used here: an emptied profile may still be referenced by a
+# policy, and any address (even a loopback) would start matching traffic.
+NETWORK_PROFILE_EMPTY_PLACEHOLDER = "# Empty Profile"
+# A value starting with one of these characters is a comment to the network
+# profile API, not an IP value. A comment nevertheless occupies a slot out of
+# the per-profile and tenant-wide value limits, so it is treated as a real
+# value everywhere: counted towards capacity, preserved when a member is
+# rewritten, and carried over when a group is re-packed. The single exception
+# is the placeholder this plugin itself wrote - see
+# ``_is_network_profile_placeholder`` - which the plugin is free to overwrite
+# and therefore does count as reclaimable room.
+NETWORK_PROFILE_COMMENT_PREFIXES = ("#", ";")
+# The prefixes rendered for an operator-facing message, e.g. "'#' or ';'".
+NETWORK_PROFILE_COMMENT_PREFIX_DISPLAY = " or ".join(
+    f"'{prefix}'" for prefix in NETWORK_PROFILE_COMMENT_PREFIXES
+)
+# Maximum length of a single network profile element (value or comment).
+MAX_NETWORK_PROFILE_VALUE_LENGTH = 80
+# Longest roll-over suffix a base profile name has to leave room for. A
+# sibling is named "<base> <number>"; a tenant caps out at
+# MAX_NETWORK_PROFILES profiles, so the widest number is 3 digits and the
+# suffix is " 512" -- 4 characters.
+NETWORK_PROFILE_SIBLING_SUFFIX = f" {MAX_NETWORK_PROFILES}"
+# Network profile by-id PATCH / create POST request body byte budget with a
+# safety buffer. Netskope enforces a 10 MB max request body for this API.
+NETWORK_PROFILE_PAYLOAD_LIMIT = 10 * 1024 * 1024
+NETWORK_PROFILE_PAYLOAD_SAFETY_BUFFER = 1024
+# The network profile values endpoint (PATCH with op "append") accepts at
+# most this many values per call, so overflow values are appended in
+# batches of this size (mirrors the destination profile values endpoint).
+NETWORK_PROFILE_VALUES_PER_APPEND = 10
+# Status value returned by the networks list/by-id API for a profile that
+# is staged for deletion. Calling the deploy endpoint on such a profile
+# applies the pending delete, so it must never be auto-deployed.
+NETWORK_PROFILE_STATUS_PENDING_DELETE = "pending-delete"
+# Network profile name/description length limits, and characters not
+# allowed in a name (a description allows any character).
+MAX_NETWORK_PROFILE_NAME_LENGTH = 150
+MAX_NETWORK_PROFILE_DESC_LENGTH = 200
+NETWORK_PROFILE_NAME_FORBIDDEN_CHARS = ['"', ";"]
+
+# ---------------------------------------------------------------------------
+# Action parameter templates
+# ---------------------------------------------------------------------------
+# Static field definitions for the actions added in this release. They are
+# deep-copied in ``get_action_params`` and the fields whose ``choices`` (and
+# in some cases ``default``) depend on live API responses are populated
+# there by parameter ``key``:
+#   - destination_profile -> "destination_profile_name"
+#   - dns_profile         -> "dns_profile_name", "dns_security_categories",
+#                            "dns_record_types"
+#   - service_profile     -> "service_profile_name"
+#   - device_classification -> "device_classification",
+#                              "device_classification_rule"
+#   - network_profile     -> "network_profile_name"
+DESTINATION_PROFILE_ACTION_PARAMS = [
+    {
+        "label": "Operation",
+        "key": "operation",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in OPERATION_OPTIONS.items()
+        ],
+        "default": "append",
+        "mandatory": True,
+        "description": (
+            "Select whether to append the values to the existing values or"
+            " replace the current values with new values on the profile."
+            " Select from the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Destination Profile",
+        "key": "destination_profile_name",
+        "type": "choice",
+        "choices": [],
+        "default": "",
+        "mandatory": True,
+        "description": (
+            "Select an existing destination profile from the Static "
+            "field dropdown or select 'Create new profile'."
+        ),
+    },
+    {
+        "label": "Create New Profile",
+        "key": "new_profile_name",
+        "type": "text",
+        "default": "",
+        "mandatory": False,
+        "description": (
+            "Name of the destination profile to create. Provide the "
+            "name in the Static field only if 'Create new profile' is "
+            "selected in Destination Profile. The profile name should "
+            f"not exceed {MAX_DESTINATION_PROFILE_NAME_LENGTH} "
+            "characters and it cannot contain '\"' (Double Quotes) or"
+            " ';' (Semicolon)."
+        ),
+    },
+    {
+        "label": "Profile Description",
+        "key": "new_profile_description",
+        "type": "text",
+        "default": "Created from Netskope CE.",
+        "mandatory": False,
+        "description": (
+            "Description for the destination profile. It will add or replace"
+            " the current description with provided. The description should"
+            f" not exceed {MAX_DESTINATION_PROFILE_DESC_LENGTH} characters."
+        ),
+    },
+    {
+        "label": "Match Type",
+        "key": "profile_match_type",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in MATCH_TYPE_OPTIONS.items()
+        ],
+        "default": "insensitive",
+        "mandatory": False,
+        "description": (
+            "Match type for the destination profile. Select from the "
+            "Static field dropdown only. It will add or replace the current"
+            " match type with the provided value."
+        ),
+    },
+    {
+        "label": "Apply Pending Changes",
+        "key": "apply_pending_changes",
+        "type": "choice",
+        "choices": [
+            {"key": "Yes", "value": "Yes"},
+            {"key": "No", "value": "No"},
+        ],
+        "default": "No",
+        "mandatory": True,
+        "description": (
+            "Select 'Yes' to deploy pending changes and retry when the "
+            "destination profile has undeployed changes. Select from "
+            "the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Network Targets",
+        "key": "destination_values",
+        "type": "text",
+        "default": "",
+        "placeholder": "i.e. 10.0.0.1, example.com",
+        "mandatory": True,
+        "allowMultipleSource": True,
+        "description": (
+            "Select one or more Source fields for the destination values "
+            "or provide Static comma-separated values, IPs, or URLs to "
+            "add to the profile."
+        ),
+    },
+    {
+        "label": "Tenant Exact-Match Value Limit",
+        "key": "exact_match_total_limit",
+        "type": "number",
+        "default": DESTINATION_PROFILE_EXACT_TOTAL_LIMIT,
+        "mandatory": False,
+        "description": (
+            "Maximum number of exact-match (Case Insensitive / Case "
+            "Sensitive) values allowed tenant-wide, used as the capacity "
+            "ceiling when adding values to a profile. Provide a positive "
+            "integer in the Static field only. The default tenant limit is"
+            f" {DESTINATION_PROFILE_EXACT_TOTAL_LIMIT}. If you have increased"
+            " limit enter that value here. Leave empty to use the "
+            f"default of {DESTINATION_PROFILE_EXACT_TOTAL_LIMIT}."
+        ),
+    },
+]
+
+DNS_PROFILE_ACTION_PARAMS = [
+    {
+        "label": "Operation",
+        "key": "operation",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in OPERATION_OPTIONS.items()
+        ],
+        "default": "append",
+        "mandatory": True,
+        "description": (
+            "Select whether to append the values to the existing values or"
+            " replace the current values with new values on the profile."
+            " Select from the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Action Type",
+        "key": "dns_profile_action_type",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in DNS_PROFILE_ACTION_TYPE_OPTIONS.items()
+        ],
+        "default": "add_to_allow_list",
+        "mandatory": True,
+        "description": (
+            "Whether to add the domains to the allow list or the block "
+            "list of the DNS profile. Select from the Static field "
+            "dropdown only."
+        ),
+    },
+    {
+        "label": "DNS Profile",
+        "key": "dns_profile_name",
+        "type": "choice",
+        "choices": [],
+        "default": "",
+        "mandatory": True,
+        "description": (
+            "Select an existing DNS profile from the Static field "
+            "dropdown or select 'Create new DNS Profile'."
+        ),
+    },
+    {
+        "label": "Create New DNS Profile",
+        "key": "new_profile_name",
+        "type": "text",
+        "default": "",
+        "mandatory": False,
+        "description": (
+            "Name of the DNS profile to create. Provide the name in "
+            "the Static field only if 'Create new DNS Profile' is "
+            "selected in DNS Profile. The profile name should not exceed "
+            f"{MAX_DNS_PROFILE_NAME_LENGTH} characters and it cannot contain"
+            " '(', ')' or '\"'."
+        ),
+    },
+    {
+        "label": "Profile Description",
+        "key": "new_profile_description",
+        "type": "text",
+        "default": "Created from Netskope CE.",
+        "mandatory": False,
+        "description": (
+            "Description for the DNS profile to be created. Used only "
+            "when 'Create new DNS Profile' is selected in DNS Profile. "
+            f"The description should not exceed {MAX_DNS_PROFILE_DESC_LENGTH}"
+            " characters"
+        ),
+    },
+    {
+        "label": "Categories",
+        "key": "dns_security_categories",
+        "type": "multichoice",
+        "choices": [],
+        "default": [],
+        "mandatory": False,
+        "description": (
+            "Select the security categories to apply on the DNS profile"
+            " from the Static field dropdown only. The same category cannot"
+            " be selected with both 'Block' and 'Sinkhole' actions."
+            " Selecting any 'Sinkhole' variant requires a value in the"
+            " 'Sinkhole IP' parameter."
+        ),
+    },
+    {
+        "label": "Sinkhole IP",
+        "key": "sinkhole_ip",
+        "type": "text",
+        "default": "",
+        "mandatory": False,
+        "description": (
+            "Sinkhole IP address for the DNS profile. Required only "
+            "when a '(Sinkhole)' category is selected in Categories. "
+            "Provide in the Static field only."
+        ),
+    },
+    {
+        "label": "Record Types",
+        "key": "dns_record_types",
+        "type": "multichoice",
+        "choices": [],
+        "default": [],
+        "mandatory": True,
+        "description": (
+            "Select the DNS record types from the Static field dropdown."
+            " The 'All Record Types' value cannot be selected together with"
+            " any other Record Type value."
+        ),
+    },
+    {
+        "label": "Block all except Allow list",
+        "key": "block_all_except_allow_list",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in BLOCK_ALL_EXCEPT_ALLOW_LIST_OPTIONS.items()
+        ],
+        "default": "False",
+        "mandatory": True,
+        "description": (
+            "Select 'Yes' to block all domains except those on the "
+            "allow list. Select from the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Domain Names",
+        "key": "domain_names",
+        "type": "text",
+        "default": "",
+        "placeholder": "i.e. example.com, test.org",
+        "mandatory": True,
+        "allowMultipleSource": True,
+        "description": (
+            "Select one or more Source fields for the domain names or "
+            "provide Static comma-separated domains or FQDNs to add to "
+            "the DNS profile."
+        ),
+    },
+]
+
+SERVICE_PROFILE_ACTION_PARAMS = [
+    {
+        "label": "Operation",
+        "key": "operation",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in SERVICE_PROFILE_OPERATION_OPTIONS.items()
+        ],
+        "default": "append",
+        "mandatory": True,
+        "description": (
+            "Select whether to append the values to the existing values or"
+            " replace the current values with new values on the profile."
+            " Select from the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Service Profile",
+        "key": "service_profile_name",
+        "type": "choice",
+        "choices": [],
+        "default": "",
+        "mandatory": True,
+        "description": (
+            "Select an existing custom service profile from the Static "
+            "field dropdown or select 'Create new service profile'. "
+            "Only custom (editable) profiles are listed."
+        ),
+    },
+    {
+        "label": "Service Profile Name",
+        "key": "new_profile_name",
+        "type": "text",
+        "default": "",
+        "mandatory": False,
+        "description": (
+            "Name of the service profile to create. Provide the name "
+            "in the Static field only if 'Create new service profile' "
+            "is selected in Service Profile. The profile name should "
+            f"not exceed {MAX_SERVICE_PROFILE_NAME_LENGTH} characters."
+        ),
+    },
+    {
+        "label": "Description",
+        "key": "new_profile_description",
+        "type": "text",
+        "default": "Created from Netskope CE.",
+        "mandatory": False,
+        "description": (
+            "Description for the service profile to be created. Used "
+            "only when 'Create new service profile' is selected in "
+            "Service Profile. The description should not exceed "
+            f"{MAX_SERVICE_PROFILE_DESC_LENGTH} characters."
+        ),
+    },
+    {
+        "label": "TCP Ports",
+        "key": "tcp_ports",
+        "type": "text",
+        "default": "",
+        "placeholder": "i.e. 443, 8080-8090",
+        "mandatory": False,
+        "allowMultipleSource": True,
+        "description": (
+            "Select one or more Source fields for the TCP ports or "
+            "provide Static comma-separated ports or port ranges "
+            "(e.g. 9000-9500)."
+        ),
+    },
+    {
+        "label": "UDP Ports",
+        "key": "udp_ports",
+        "type": "text",
+        "default": "",
+        "placeholder": "i.e. 53, 8080-8090",
+        "mandatory": False,
+        "allowMultipleSource": True,
+        "description": (
+            "Select one or more Source fields for the UDP ports or "
+            "provide Static comma-separated ports or port ranges "
+            "(e.g. 9000-9500)."
+        ),
+    },
+    {
+        "label": "TCP/UDP Ports",
+        "key": "tcp_udp_ports",
+        "type": "text",
+        "default": "",
+        "placeholder": "i.e. 443, 8080-8090",
+        "mandatory": False,
+        "allowMultipleSource": True,
+        "description": (
+            "Select one or more Source fields for the TCP_UDP ports or "
+            "provide Static comma-separated ports or port ranges "
+            "(e.g. 9000-9500)."
+        ),
+    },
+    {
+        "label": "ICMP",
+        "key": "icmp",
+        "type": "choice",
+        "choices": [
+            {"key": "No", "value": False},
+            {"key": "Yes", "value": True},
+        ],
+        "default": False,
+        "mandatory": False,
+        "description": (
+            "Select 'Yes' to enable the ICMP protocol on the service "
+            "profile. Select from the Static field dropdown only."
+        ),
+    },
+]
+
+DEVICE_CLASSIFICATION_ACTION_PARAMS = [
+    {
+        "label": "Operation",
+        "key": "operation",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in OPERATION_OPTIONS.items()
+        ],
+        "default": "append",
+        "mandatory": True,
+        "description": (
+            "Select whether to append the values to the existing values or"
+            " replace the current values with new values on the rule."
+            " Select from the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Device Classification",
+        "key": "device_classification",
+        "type": "choice",
+        "choices": [],
+        "default": "",
+        "mandatory": True,
+        "description": (
+            "Select an existing device classification from the Static "
+            "field dropdown to use as the rule's classification, or "
+            "select 'Create new Device Classification'."
+        ),
+    },
+    {
+        "label": "Device Classification Name",
+        "key": "new_classification_name",
+        "type": "text",
+        "default": "",
+        "mandatory": False,
+        "description": (
+            "Name of the device classification to create. Provide the "
+            "name in the Static field only if 'Create new Device "
+            "Classification' is selected in Device Classification. The "
+            "name should not exceed "
+            f"{MAX_DEVICE_CLASSIFICATION_NAME_LENGTH} characters."
+        ),
+    },
+    {
+        "label": "Device Classification Rule",
+        "key": "device_classification_rule",
+        "type": "choice",
+        "choices": [],
+        "default": "",
+        "mandatory": True,
+        "description": (
+            "Select an existing device classification rule to update "
+            "from the Static field dropdown, or select 'Create new "
+            "Device Classification Rule'."
+        ),
+    },
+    {
+        "label": "Device Classification Rule Name",
+        "key": "new_rule_name",
+        "type": "text",
+        "default": "",
+        "mandatory": False,
+        "description": (
+            "Name of the device classification rule to create. Provide "
+            "the name in the Static field only if 'Create new Device "
+            "Classification Rule' is selected in Device Classification "
+            "Rule. The rule name should not exceed "
+            f"{MAX_DEVICE_CLASSIFICATION_NAME_LENGTH} characters."
+        ),
+    },
+    {
+        "label": "Operating System",
+        "key": "os",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in DEVICE_CLASSIFICATION_OS_OPTIONS.items()
+        ],
+        "default": "windows",
+        "mandatory": True,
+        "description": (
+            "Target operating system for the device classification "
+            "rule. Select from the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Match Type",
+        "key": "logical_operator",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in DEVICE_CLASSIFICATION_OPERATOR_OPTIONS.items()
+        ],
+        "default": "and",
+        "mandatory": True,
+        "description": (
+            "Select the Match Type (Logical Operator) to be applied on the"
+            "tags in the Device Classification Rule. Select from the Static"
+            " field dropdown only."
+        ),
+    },
+    {
+        "label": "Group Match Type",
+        "key": "group_operator",
+        "type": "choice",
+        "choices": [
+            {"key": value, "value": key}
+            for key, value in DEVICE_CLASSIFICATION_OPERATOR_OPTIONS.items()
+        ],
+        "default": "and",
+        "mandatory": True,
+        "description": (
+            "Select how the top-level condition groups are combined in"
+            " the Device Classification Rule. 'All' requires every"
+            " group to match; 'Any' requires at least one group to"
+            " match. Takes effect when more than"
+            f" {DEVICE_CLASSIFICATION_TAGS_PER_GROUP} tags are provided"
+            " (creating multiple tag groups) or when the existing rule"
+            " already contains multiple condition groups. Select from"
+            " the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Tags",
+        "key": "classification_tags",
+        "type": "text",
+        "default": "",
+        "placeholder": "i.e. tag1, tag2",
+        "mandatory": True,
+        "allowMultipleSource": True,
+        "description": (
+            "Select one or more Source fields for the device tags or "
+            "provide Static comma-separated device tag names to use in "
+            "the rule conditions. If more than "
+            f"{DEVICE_CLASSIFICATION_TAGS_PER_GROUP} tags are provided,"
+            " they are split into groups of "
+            f"{DEVICE_CLASSIFICATION_TAGS_PER_GROUP} and each group"
+            " becomes a separate condition block in the rule. For an"
+            " Append, new tags are unioned with the existing ones and"
+            " the result is re-grouped. Each tag must already exist on"
+            " the Netskope Tenant."
+        ),
+    },
+]
+
+# This action has no Operation parameter. It always appends: values are added
+# to whatever the group already holds, and removing a value is the revert
+# action's job (it runs when a record stops matching the business rule). The
+# same choice the 'Add Host to Private App' action makes. A Replace would have
+# to rewrite whole profiles from one record's values, which cannot be done
+# safely for a bulk action - the records of a single sync arrive in batches, so
+# each batch would wipe the values written by the batch before it.
+NETWORK_PROFILE_ACTION_PARAMS = [
+    {
+        "label": "Network Profile",
+        "key": "network_profile_name",
+        "type": "choice",
+        "choices": [],
+        "default": "",
+        "mandatory": True,
+        "description": (
+            "Select an existing network profile from the Static field "
+            "dropdown or select 'Create new profile'."
+        ),
+    },
+    {
+        "label": "Create New Network Profile",
+        "key": "new_profile_name",
+        "type": "text",
+        "default": "",
+        "mandatory": False,
+        "description": (
+            "Name of the network profile to create. Provide the name "
+            "in the Static field only if 'Create new profile' is "
+            "selected in Network Profile."
+        ),
+    },
+    {
+        "label": "Description",
+        "key": "new_profile_description",
+        "type": "text",
+        "default": "Created from Netskope CE.",
+        "mandatory": False,
+        "description": (
+            "Description for the network profile. It will add or "
+            "replace the current description with the provided value."
+        ),
+    },
+    {
+        "label": "IPs",
+        "key": "network_values",
+        "type": "text",
+        "default": "",
+        "placeholder": "i.e. 10.50.2.2, 10.0.0.0-10.0.0.240, 10.50.0.0/12",
+        "mandatory": True,
+        "allowMultipleSource": True,
+        "description": (
+            "Select one or more Source fields for the IP values or "
+            "provide Static comma-separated values to add to the network "
+            "profile. Each "
+            "value must be a single IPv4/IPv6 address (10.50.2.2), an "
+            "IPv4/IPv6 range (10.0.0.0-10.0.0.240), or an IPv4/IPv6 CIDR"
+            " block (10.50.0.0/12)."
+        ),
+    },
+    {
+        "label": "Apply Pending Changes",
+        "key": "apply_pending_changes",
+        "type": "choice",
+        "choices": [
+            {"key": "Yes", "value": "Yes"},
+            {"key": "No", "value": "No"},
+        ],
+        "default": "No",
+        "mandatory": True,
+        "description": (
+            "Select 'Yes' to deploy pending changes and retry when the "
+            "network profile has undeployed changes. Select from the "
+            "Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Skip Excess IPs",
+        "key": "skip_excess_ips",
+        "type": "choice",
+        "choices": [
+            {"key": "Yes", "value": "Yes"},
+            {"key": "No", "value": "No"},
+        ],
+        "default": "No",
+        "mandatory": True,
+        "description": (
+            "Select 'No' to roll the values that do not fit over into "
+            "additional numbered network profiles (e.g. 'MyProfile 2') "
+            "when a profile reaches its value limit, or 'Yes' to skip "
+            "those values instead. Room on profiles that already exist "
+            "is used either way, and the profile this action selects or "
+            "creates is always created even when this is set to 'Yes'. "
+            "Select from the Static field dropdown only."
+        ),
+    },
+    {
+        "label": "Network Profile Value Limit",
+        "key": "network_profile_value_limit",
+        "type": "number",
+        "default": NETWORK_PROFILE_PER_PROFILE_LIMIT,
+        "mandatory": False,
+        "description": (
+            "Maximum number of values allowed on a single network "
+            "profile. A profile that reaches this limit is rolled over: "
+            "the remaining values go to the next numbered profile in the"
+            " group. Provide a positive integer in the Static field "
+            "only. The default per-profile limit is "
+            f"{NETWORK_PROFILE_PER_PROFILE_LIMIT}. If you have increased"
+            " limit enter that value here. Leave empty to use the "
+            f"default of {NETWORK_PROFILE_PER_PROFILE_LIMIT}. The "
+            f"tenant-wide limit of {NETWORK_PROFILE_TENANT_TOTAL_LIMIT} "
+            "values across all network profiles cannot be increased and "
+            "is always enforced, so this value cannot exceed "
+            f"{NETWORK_PROFILE_TENANT_TOTAL_LIMIT} either."
+        ),
+    },
+    {
+        "label": "Default Value",
+        "key": "default_value",
+        "type": "text",
+        "default": NETWORK_PROFILE_EMPTY_PLACEHOLDER,
+        "mandatory": False,
+        "description": (
+            "Value written to a network profile that this action has to "
+            "empty - a profile left holding nothing by a revert, whose "
+            "deletion the Netskope Tenant refuses. It "
+            "must start with "
+            f"{NETWORK_PROFILE_COMMENT_PREFIX_DISPLAY}: the network "
+            "profile API treats such an entry as a comment, so the "
+            "profile matches no traffic. Do not use a real IP address "
+            "here - an emptied profile may still be referenced by a "
+            "policy, and any address would start matching traffic. This "
+            "value is the only entry the action ever overwrites: every "
+            "other comment already on the profile is left alone and "
+            "counts towards the per-profile value limit. Provide the "
+            "value in the Static field only. Leave empty to use the "
+            f"default of '{NETWORK_PROFILE_EMPTY_PLACEHOLDER}'."
+        ),
+    },
+]

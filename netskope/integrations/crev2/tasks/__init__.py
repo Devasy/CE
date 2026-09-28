@@ -8,4 +8,5 @@ TASKS = [
     "netskope.integrations.crev2.tasks.perform_action",
     "netskope.integrations.crev2.tasks.historical_pull",
     "netskope.integrations.crev2.tasks.delete_logs",
+    "netskope.integrations.crev2.tasks.unified_mapping_actions",
 ]

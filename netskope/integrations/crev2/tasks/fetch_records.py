@@ -31,11 +31,12 @@ from ..models import (
     get_entity_by_name,
     NormalizedType
 )
+from netskope.common.utils.unified_mapping_exec import resolve_normalized_field_value
 from .evaluate_records import (
     evaluate_records,
-    _get_normalized_field_value,
     _get_normalized_fields
 )
+from ..utils import THREAT_INDICATORS_ENTITY, get_entity_collection
 
 RECORDS_BATCH_SIZE = 1000
 MAX_ENTITY_SIZE_WITH_VALUE_MAP = 14 * 1024 * 1024  # More than 14MB
@@ -90,19 +91,9 @@ def fetch_records(
             }
         if isinstance(data, bytes):
             data = (
-                parse_events(
-                    data,
-                    tenant_config_name=configuration_db.tenant,
-                    data_type=data_type,
-                    sub_type=sub_type,
-                )
+                parse_events(data, tenant_config_name=configuration_db.tenant, data_type=data_type, sub_type=sub_type)
                 if configuration_db.tenant
-                else parse_events(
-                    data,
-                    configuration=configuration_db,
-                    data_type=data_type,
-                    sub_type=sub_type,
-                )
+                else parse_events(data, configuration=configuration_db, data_type=data_type, sub_type=sub_type)
             )
         for mapped_entity in configuration_db.mappedEntities:
             logger.debug(
@@ -169,16 +160,16 @@ def fetch_records(
                     f"Updated calculated fields for {mapped_entity.destination}."
                 )
                 if stored_records:
-                    initial_record_ids.setdefault(mapped_entity.destination, []).extend(
-                        record["_id"] for record in stored_records
-                    )
+                    initial_record_ids.setdefault(
+                        mapped_entity.destination, []
+                    ).extend(record["_id"] for record in stored_records)
         _end_life(configuration_db.name, True)
     except Exception:
         logger.error(
             f"Error occurred while storing records for {configuration_db.name}.",
             details=traceback.format_exc(),
         )
-        _end_life(configuration, False)
+        _end_life(configuration_db.name, False)
     logger.debug(f"Finished fetching records for {configuration_db.name}.")
     if isinstance(configuration_db, ConfigurationDB) and not configuration_db.tenant:
         # is not a netskope configuration; do the update records
@@ -192,6 +183,7 @@ def fetch_records(
                 f"Error occurred while updating records for {configuration_db.name}.",
                 details=traceback.format_exc(),
             )
+
 
 def _update_mapped_fields(
     destination: str,
@@ -207,6 +199,10 @@ def _update_mapped_fields(
         Only the dependent mapped fields will be updated. ... for all.
         records (list[dict]): List of records to be updated with _id.
     """
+    if destination == THREAT_INDICATORS_ENTITY:
+        # TI records live in the CTE `indicators` collection and must not be
+        # mutated by CRE ingestion pipelines.
+        return
     entity = get_entity_by_name(destination)
     if mapped_fields is not ...:
         mapped_fields = set(map(lambda x: x.destination, mapped_fields))
@@ -254,65 +250,75 @@ def _update_mapped_fields(
         set_fields = {}
         push_fields = {}
         for field, mappings in prepped_value_maps.items():
-            if field_mappings[field].params.field not in record:
+            source_field = field_mappings[field].params.field
+            if source_field not in record:
                 continue
-            if not mappings.get(
-                record[field_mappings[field].params.field]
-            ):
+            # Normalized source fields are stored as
+            # ``{"value": ..., "plugins": [...]}``; the scalar used for the
+            # value-map lookup lives under `.value`. Skip anything that is
+            # still not a scalar after unwrapping -- a non-scalar key would be
+            # unhashable and break the lookup.
+            source_value = record[source_field]
+            if isinstance(source_value, dict):
+                source_value = source_value.get("value")
+            if isinstance(source_value, (dict, list)):
+                continue
+            # Only strings are eligible as new mapping labels:
+            # ``ValueMapMapping*.label`` is a non-empty ``str``, so pushing a
+            # numeric label would make the entity fail validation on every
+            # subsequent read. A non-string can never match a label anyway.
+            if isinstance(source_value, str) and source_value not in mappings:
                 field_value_map = {
-                    "label": record[field_mappings[field].params.field],
+                    "label": source_value,
                     "value": None
-                } if record[field_mappings[field].params.field] else {}
+                } if source_value else {}
                 if field_value_map and field not in update_value_map:
                     update_value_map[field] = [field_value_map]
                 elif field_value_map and field_value_map not in update_value_map[field]:
                     update_value_map[field].append(field_value_map)
-            if (
-                field_mappings[field].coalesceStrategy
-                == EntityTypeCoalesceStrategy.OVERWRITE
-            ):
-                set_fields[field] = mappings.get(
-                    record[field_mappings[field].params.field]
-                )
-            elif (
-                field_mappings[field].coalesceStrategy
-                == EntityTypeCoalesceStrategy.MERGE
-            ) and (
-                value := mappings.get(
-                    record[field_mappings[field].params.field]
-                )
-            ) is not None:
-                push_fields[field] = value
+            coalesce_strategy = field_mappings[field].coalesceStrategy
+            if coalesce_strategy == EntityTypeCoalesceStrategy.MERGE:
+                if (value := mappings.get(source_value)) is not None:
+                    push_fields[field] = value
+            elif coalesce_strategy in (None, EntityTypeCoalesceStrategy.OVERWRITE):
+                # OVERWRITE is the default: value-map fields are always saved
+                # with a null strategy from the UI and behave as single-value
+                # overwrites.
+                set_fields[field] = mappings.get(source_value)
         for field, mappings in prepped_range_maps.items():
-            if field_mappings[field].params.field not in record:
+            source_field = field_mappings[field].params.field
+            if source_field not in record:
+                continue
+            source_value = record[source_field]
+            if isinstance(source_value, dict):
+                source_value = source_value.get("value")
+            if isinstance(source_value, (dict, list)):
+                continue
+            coalesce_strategy = field_mappings[field].coalesceStrategy
+            is_merge = coalesce_strategy == EntityTypeCoalesceStrategy.MERGE
+            # OVERWRITE is the default (null strategy from the UI); any other
+            # strategy is left untouched rather than silently overwritten.
+            is_overwrite = coalesce_strategy in (
+                None,
+                EntityTypeCoalesceStrategy.OVERWRITE,
+            )
+            if not (is_merge or is_overwrite):
                 continue
             for mapping_range, label in mappings.items():
-                if record[field_mappings[field].params.field] in mapping_range:
-                    if (
-                        field_mappings[field].coalesceStrategy
-                        == EntityTypeCoalesceStrategy.OVERWRITE
-                    ):
-                        set_fields[field] = label
-                    elif (
-                        field_mappings[field].coalesceStrategy
-                        == EntityTypeCoalesceStrategy.MERGE
-                    ):
+                if source_value in mapping_range:
+                    if is_merge:
                         push_fields[field] = label
+                    else:
+                        set_fields[field] = label
                     break
             else:
-                if (
-                    field_mappings[field].coalesceStrategy
-                    == EntityTypeCoalesceStrategy.OVERWRITE
-                ):
-                    set_fields[field] = None
-                elif (
-                    field_mappings[field].coalesceStrategy
-                    == EntityTypeCoalesceStrategy.MERGE
-                ):
+                if is_merge:
                     push_fields[field] = None
+                else:
+                    set_fields[field] = None
         if set_fields or push_fields:
             connector.collection(
-                f"{Collections.CREV2_ENTITY_PREFIX.value}{destination}"
+                get_entity_collection(destination)
             ).update_one(
                 {"_id": record["_id"]},
                 ({"$set": set_fields} if set_fields else {})
@@ -378,6 +384,9 @@ def _update_calculated_fields(
         updated.
         records (list[dict]): List of records with _id.
     """
+    if destination == THREAT_INDICATORS_ENTITY:
+        # See `_update_mapped_fields` -- TI is read-only for CRE.
+        return
     entity = get_entity_by_name(destination)
     if updated_fields is not ...:
         updated_fields = set(map(lambda x: x.destination, updated_fields))
@@ -441,7 +450,7 @@ def _update_calculated_fields(
                     details=traceback.format_exc(),
                 )
         connector.collection(
-            f"{Collections.CREV2_ENTITY_PREFIX.value}{destination}"
+            get_entity_collection(destination)
         ).update_one(
             {"_id": record["_id"]}, {"$set": set_fields, "$push": push_fields}
         )
@@ -494,7 +503,7 @@ def update_records(
             "message": f"Plugin {configuration_db.plugin} does not exist.",
         }
     if not configuration_db.active:
-        logger.debug(f"{configuration_db} is not active.")
+        logger.debug(f"{configuration_db.name} is not active.")
         return {
             "success": False,
             "message": f"{configuration_db.name} is not active.",
@@ -521,11 +530,11 @@ def update_records(
         }
         normalized_entity_fields = _get_normalized_fields(get_entity_by_name(mapped_entity.destination))
         records = connector.collection(
-            f"{Collections.CREV2_ENTITY_PREFIX.value}{mapped_entity.destination}"
+            get_entity_collection(mapped_entity.destination)
         ).find({}, {field_mappings[field]: True for field in required_fields})
         mapped_records = [
             {
-                source: _get_normalized_field_value(record.get(destination), configuration_db.name)
+                source: resolve_normalized_field_value(record.get(destination), configuration_db.name)
                 if destination in normalized_entity_fields
                 else record.get(destination)
                 for source, destination in field_mappings.items()
@@ -622,6 +631,10 @@ def get_normalized_value(value: Optional[str], normalized_type: NormalizedType) 
 
 def _store_records(destination: str, records: list, config_name: str = None) -> list[dict]:
     """Store records in destination."""
+    if destination == THREAT_INDICATORS_ENTITY:
+        # TI ingestion is handled by CTE plugins writing to `indicators`.
+        # CRE must never insert/update entries in that collection.
+        return []
     entity = get_entity_by_name(destination)
     updated_records = []
     # TODO: verify for multiple unique fields
@@ -760,12 +773,12 @@ def _store_records(destination: str, records: list, config_name: str = None) -> 
             find = {"ne": {"$in": []}}
         original = (
             connector.collection(
-                f"{Collections.CREV2_ENTITY_PREFIX.value}{destination}"
+                get_entity_collection(destination)
             ).find_one(find)
             or {}
         )
         updated = connector.collection(
-            f"{Collections.CREV2_ENTITY_PREFIX.value}{destination}"
+            get_entity_collection(destination)
         ).find_one_and_update(
             find,
             [
@@ -848,7 +861,7 @@ def update_calculated_fields(entity: str):
     )
     records = []
     for record in connector.collection(
-        f"{Collections.CREV2_ENTITY_PREFIX.value}{entity}"
+        get_entity_collection(entity)
     ).find({}):
         records.append(record)
         if len(records) == RECORDS_BATCH_SIZE:
@@ -871,7 +884,7 @@ def update_mapped_fields(entity: str):
     logger.debug(f"Task started to update mapped fields for entity {entity}.")
     records = []
     for record in connector.collection(
-        f"{Collections.CREV2_ENTITY_PREFIX.value}{entity}"
+        get_entity_collection(entity)
     ).find({}):
         records.append(record)
         if len(records) == RECORDS_BATCH_SIZE:

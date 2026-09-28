@@ -1,3 +1,31 @@
+# 1.9.0 (Requires minimum Cloud Exchange version 7.0.0 and minimum Netskope Provider version 1.6.2)
+## Added
+- Added support for the 'Add to Network Profile' action on Netskope.
+- Added CIDR and RANGE prefix for IP CIDR and Range values before adding them to Destination Profile.
+- Added support for mapping multiple source fields to the following action parameters: Host and Tags ('Add host to Private App'), Tags ('Tag/Untag Application', 'Tag/Untag Device', 'Create Device Classification'), Network Targets ('Add to Destination Profile'), IPs ('Add to Network Profile'), Domain Names ('Add to DNS Profile'), and TCP Ports, UDP Ports and TCP/UDP Ports ('Add to Service Profile').
+- Added validation of port values during action execution for the 'Add to Service Profile' action; values that are not a valid port or port range are skipped and reported.
+
+# 1.8.0 (Requires minimum Cloud Exchange version 6.1.0 and minimum Netskope Provider version 1.6.1)
+## Added
+- Added support for the 'Add to Destination Profile' action on Netskope.
+- Added support for the 'Add to DNS Profile' action on Netskope.
+- Added support for the 'Add to Service Profile' action on Netskope.
+- Added support for the 'Create Device Classification' action on Netskope.
+- Added coordinated cleanup of the shared client status iterator so it is removed only once no Netskope plugin (CRE or CLS) is using it.
+## Changed
+- Updated the 'Add Host to Private App' action to roll hosts over into additional private apps when a private app reaches its host limit, with a 'Skip Excess Hosts' option to skip the excess hosts instead.
+
+# 1.7.0
+## Added
+- Added the required `hostname` parameter to the device payload for device tagging APIs.
+- Added validation for required fields in entity mappings.
+## Changed
+- Updated rate limit handling to retry based on the `Retry-After` header value, with a 12-second delay between each device tagging API call.
+- Increased the batch size for device tagging to `1000` devices per API call.
+## Fixed
+- Fixed an issue to ensure the revert action is executed only for supported action types.
+
+
 # 1.6.0
 ## Added
 - Added support for 'Tag/Untag Device' action on Netskope.

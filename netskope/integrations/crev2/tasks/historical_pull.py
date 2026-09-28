@@ -1,5 +1,4 @@
 """Fetch historical app data."""
-import gzip
 import json
 import time
 from datetime import datetime
@@ -10,6 +9,8 @@ from netskope.common.celery.main import APP
 from netskope.common.celery.scheduler import execute_celery_task
 from netskope.common.models import TenantDB
 from netskope.common.utils import (
+    DATA_FORMAT_JSON,
+    compress_batch,
     Collections,
     DBConnector,
     Logger,
@@ -120,9 +121,9 @@ def historical_appdata(
             "cre.fetch_records",
             args=[configuration_name],
             kwargs={
-                "data": gzip.compress(
+                "data": compress_batch(
                     json.dumps({"result": events}).encode("utf-8"),
-                    compresslevel=3,
+                    DATA_FORMAT_JSON,
                 ),
                 "data_type": "events",
                 "sub_type": "application",
