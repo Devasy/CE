@@ -204,8 +204,7 @@ class CFCFileUtils:
                 }
             },
         )
-
-        if result.modified_count < 1:
+        if result.matched_count < 1:
             CFCFileUtils.connector.collection(
                 Collections.CFC_IMAGES_METADATA
             ).update_one(
@@ -225,6 +224,31 @@ class CFCFileUtils:
                     }
                 },
             )
+
+    @staticmethod
+    def calculate_status_from_files(files: list) -> str:
+        """Calculate overall status from individual file statuses.
+
+        Args:
+            files (list): List of file objects with 'status' field.
+
+        Returns:
+            str: Calculated status - 'success', 'partial_success', or 'failed'.
+        """
+        from netskope.integrations.cfc.models import StatusType
+
+        if not files:
+            return StatusType.FAILED.value
+
+        statuses = [f.get("status") for f in files]
+        success_statuses = {StatusType.SUCCESS.value, StatusType.COMPLETED.value}
+
+        if all(status_value in success_statuses for status_value in statuses):
+            return StatusType.SUCCESS.value
+        elif any(status_value in success_statuses for status_value in statuses):
+            return StatusType.PARTIAL_SUCCESS.value
+        else:
+            return StatusType.FAILED.value
 
     @staticmethod
     def categorize_files(files, invalid_files, new_file_path_mappings):

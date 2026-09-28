@@ -59,24 +59,34 @@ async def get_tasks_status(
             ).find({})
             tasks = []
             for config in configs:
+                status = config.get("status", StatusType.PENDING)
                 task = {
                     "id": str(config.get("_id")),
                     "source": config.get("name"),
                     "target": config.get("destinationConfiguration"),
-                    "status": config.get("status", StatusType.PENDING),
+                    "status": status,
                     "files": config.get("files", []),
                     "classifierName": config.get("classifierName"),
                     "trainingType": config.get("trainingType"),
                     "sharedAt": (
                         config.get("updatedAt")
-                        if config.get("status")
-                        in (StatusType.COMPLETED, StatusType.PARTIALLY_COMPLETED)
+                        if status
+                        in (
+                            StatusType.COMPLETED,
+                            StatusType.PARTIALLY_COMPLETED,
+                            StatusType.SUCCESS,
+                            StatusType.PARTIAL_SUCCESS,
+                        )
                         else None
                     ),
                     "has_failed_uploads": (
                         True
-                        if config.get("status")
-                        in (StatusType.FAILED, StatusType.PARTIALLY_COMPLETED)
+                        if status
+                        in (
+                            StatusType.FAILED,
+                            StatusType.PARTIALLY_COMPLETED,
+                            StatusType.PARTIAL_SUCCESS,
+                        )
                         else False
                     ),
                     "createdAt": config.get("createdAt")

@@ -51,8 +51,13 @@ def get_images_data(filters, skip, limit, sort, ascending) -> List[ImageMetadata
         "lastFetched",
         "fileSize"
     ]:
+        sort_direction = ASCENDING if ascending else DESCENDING
         pipeline.append(
-            {"$sort": SON([(sort, ASCENDING if ascending else DESCENDING)])}
+            {"$sort": SON([(sort, sort_direction), ("_id", sort_direction)])}
+        )
+    else:
+        pipeline.append(
+            {"$sort": SON([("_id", ASCENDING)])}
         )
     pipeline.append({"$skip": skip})
     pipeline.append({"$limit": limit})
