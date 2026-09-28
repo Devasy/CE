@@ -10,7 +10,13 @@ from starlette.responses import JSONResponse
 from netskope.common.api.routers.auth import get_current_user
 from netskope.common.celery.scheduler import execute_celery_task
 from netskope.common.models import User
-from netskope.common.utils import Collections, DBConnector, Logger, parse_dates
+from netskope.common.utils import (
+    Collections,
+    DBConnector,
+    Logger,
+    is_platform_enabled,
+    parse_dates,
+)
 
 from ..models import (
     BusinessRuleDB,
@@ -21,11 +27,22 @@ from ..models import (
     get_entity_by_name,
 )
 from ..tasks.evaluate_records import evaluate_records
-from ..utils import build_pipeline_from_entity
+from ..utils import (
+    THREAT_INDICATORS_ENTITY,
+    build_pipeline_from_entity,
+    build_threat_indicator_business_rule_match,
+    get_entity_collection,
+    get_entity_recency_field,
+)
 
 connector = DBConnector()
 logger = Logger()
 router = APIRouter()
+
+CTE_DISABLED_RULE_MESSAGE = (
+    "This business rule uses the Threat Indicators entity and is disabled because "
+    "the CTE module is turned off. Enable the CTE module to modify or use it."
+)
 
 
 @router.get("/business_rules", tags=["CREv2 Business Rules"])
@@ -47,6 +64,12 @@ async def create_business_rule(
     _: User = Security(get_current_user, scopes=["cre_write"]),
 ) -> BusinessRuleOut:
     """Create a business rule."""
+    if rule.entity == THREAT_INDICATORS_ENTITY and not is_platform_enabled("cte"):
+        raise HTTPException(
+            400,
+            "Cannot create a Threat Indicators business rule while the CTE module "
+            "is disabled. Enable the CTE module first.",
+        )
     connector.collection(Collections.CREV2_BUSINESS_RULES).insert_one(
         rule.model_dump()
     )
@@ -59,6 +82,11 @@ async def update_business_rule(
     _: User = Security(get_current_user, scopes=["cre_write"]),
 ) -> BusinessRuleOut:
     """Update a business rule."""
+    stored_rule = connector.collection(
+        Collections.CREV2_BUSINESS_RULES
+    ).find_one({"name": rule.name})
+    if stored_rule and stored_rule.get("disabledByCte"):
+        raise HTTPException(400, CTE_DISABLED_RULE_MESSAGE)
     result = connector.collection(
         Collections.CREV2_BUSINESS_RULES
     ).find_one_and_update(
@@ -75,6 +103,11 @@ async def delete_business_rule(
     _: User = Security(get_current_user, scopes=["cre_write"]),
 ):
     """Delete a business rule."""
+    stored_rule = connector.collection(
+        Collections.CREV2_BUSINESS_RULES
+    ).find_one({"name": rule.name})
+    if stored_rule and stored_rule.get("disabledByCte"):
+        raise HTTPException(400, CTE_DISABLED_RULE_MESSAGE)
     result = connector.collection(Collections.CREV2_BUSINESS_RULES).delete_one(
         {"name": rule.name}
     )
@@ -98,15 +131,22 @@ async def test_business_rules(
     if rule is None:
         raise ValueError(400, "Business rule does not exist.")
     rule: BusinessRuleDB = BusinessRuleDB(**rule)
-    query = json.loads(rule.entityFilters.mongo, object_hook=parse_dates)
+    if rule.entity == THREAT_INDICATORS_ENTITY:
+        query = build_threat_indicator_business_rule_match(
+            rule.entityFilters.mongo,
+            rule.sourceConfiguration,
+        )
+    else:
+        query = json.loads(rule.entityFilters.mongo, object_hook=parse_dates)
+    recency_field = get_entity_recency_field(rule.entity)
     result = connector.collection(
-        f"{Collections.CREV2_ENTITY_PREFIX.value}{rule.entity}"
+        get_entity_collection(rule.entity)
     ).aggregate(
         build_pipeline_from_entity(get_entity_by_name(rule.entity))
         + [
             {
                 "$match": {
-                    "lastUpdated": {
+                    recency_field: {
                         "$gte": datetime.now() - timedelta(days=days)
                     }
                 }
@@ -142,6 +182,8 @@ async def sync_action(
     )
     if rule is None:
         raise ValueError(400, "Business rule does not exist.")
+    if rule.get("disabledByCte"):
+        raise HTTPException(400, CTE_DISABLED_RULE_MESSAGE)
     rule: BusinessRuleDB = BusinessRuleDB(**rule)
     execute_celery_task(
         evaluate_records.apply_async,

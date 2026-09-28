@@ -129,14 +129,42 @@ class EntityMapping(BaseModel):
 
     @field_validator("fields")
     @classmethod
-    def validate_fields(cls, v: list[EntityMappingField]):
-        """Validate that fields are unique."""
+    def validate_fields(cls, v: list[EntityMappingField], info: ValidationInfo):
+        """Validate that fields are unique and exist on the destination entity."""
         if len([f.destination for f in v]) != len(
             set([f.destination for f in v])
         ):
             raise ValueError(
                 "Can not map multiple source fields to same target field."
             )
+        # Every mapped destination must be an existing field on the destination
+        # entity — e.g. Auto-Mapper-suggested fields that were never created
+        # must not be saved as dangling references. This check is intentionally
+        # only on this input model, not EntityMappingOut, so stored configs
+        # whose fields were removed later can still be read. `destination` is
+        # absent from info.data when its own validator failed; skip then.
+        destination = info.data.get("destination")
+        if destination:
+            entity = connector.collection(Collections.CREV2_ENTITIES).find_one(
+                {"name": destination}
+            )
+            if entity is not None:
+                existing_fields = {
+                    field.get("name") for field in entity.get("fields", [])
+                }
+                missing = sorted(
+                    {
+                        f.destination
+                        for f in v
+                        if f.destination and f.destination not in existing_fields
+                    }
+                )
+                if missing:
+                    raise ValueError(
+                        f"Field(s) '{', '.join(missing)}' do not exist in "
+                        f"entity '{destination}'. Create the fields before "
+                        "saving the mapping."
+                    )
         return v
 
 

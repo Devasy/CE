@@ -11,6 +11,8 @@ from netskope.common.utils import (
 from netskope.common.models import User
 from netskope.common.api.routers.auth import get_current_user
 
+from ..utils import THREAT_INDICATORS_ENTITY, get_entity_collection
+
 router = APIRouter(prefix="/dashboard", tags=["CREv2 Dashboard"])
 logger = Logger()
 connector = DBConnector()
@@ -64,16 +66,35 @@ def _get_time_bounds(
 
 
 def _get_entity_names(entity_filter: Optional[str]) -> List[str]:
-    """Get validated entity names based on filter."""
+    """Get validated entity names based on filter.
+
+    Excludes the ``Threat Indicators`` entity throughout. It is a read-only
+    bridge onto the CTE ``indicators`` collection rather than CRE-owned data, so
+    it is not reported here — matching the Records page, the schema editor and
+    plugin entity mapping, which all hide it too. It was also misleading on this
+    endpoint specifically: ``get_entity_collection`` resolves it to
+    ``indicators``, whose recency field is ``lastSeen``, so any non-``all_time``
+    range counted zero.
+    """
     if not entity_filter or entity_filter.lower() == "all":
         # Get all entities
         entities = connector.collection(Collections.CREV2_ENTITIES).find(
-            {}, {"name": 1, "_id": 0}
+            {"name": {"$ne": THREAT_INDICATORS_ENTITY}}, {"name": 1, "_id": 0}
         )
         return [entity["name"] for entity in entities]
 
     # Get specific entities and validate they exist
     requested_entities = [item.strip() for item in entity_filter.split(",") if item.strip()]
+    if THREAT_INDICATORS_ENTITY in requested_entities:
+        # Explicit and actionable rather than a generic "not found": the entity
+        # does exist, it is simply out of scope for the CRE dashboard.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"The '{THREAT_INDICATORS_ENTITY}' entity is owned by CTE and is "
+                f"not reported on the CRE dashboard."
+            ),
+        )
     entities = list(
         connector.collection(Collections.CREV2_ENTITIES).find(
             {"name": {"$in": requested_entities}},
@@ -112,7 +133,7 @@ def _get_entity_record_counts(
 
     for entity_name in entity_names:
         try:
-            entity_collection = f"{Collections.CREV2_ENTITY_PREFIX.value}{entity_name}"
+            entity_collection = get_entity_collection(entity_name)
             count = connector.collection(entity_collection).count_documents(time_query)
             result_data.append({
                 "entity": entity_name,
@@ -234,6 +255,9 @@ async def get_action_records(
     """
     # Verify business rule exists
     business_rule_doc = connector.collection(Collections.CREV2_BUSINESS_RULES).find_one(
+        {"name": business_rule},
+        {"_id": 1},
+    ) or connector.collection(Collections.UNIFIED_MAPPING_RULES).find_one(
         {"name": business_rule},
         {"_id": 1},
     )

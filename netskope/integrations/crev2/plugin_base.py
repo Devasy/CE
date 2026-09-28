@@ -30,6 +30,7 @@ class EntityField(BaseModel):
     type: EntityFieldType
     required: bool = False
     label: Optional[str] = None
+    description: Optional[str] = None
 
 
 class Entity(BaseModel):
@@ -58,23 +59,43 @@ class PluginBase(CommonPluginBase):
         raise NotImplementedError
 
     def fetch_records(self, entity: str) -> list:
-        """Pull records from 3rd party source."""
+        """Pull records from 3rd party source.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         raise NotImplementedError
 
     def update_records(self, entity: str, records: list[dict]) -> list:
-        """Update the given records."""
+        """Update the given records.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         raise NotImplementedError
 
     def get_actions(self) -> list[ActionWithoutParams]:
-        """Get list of actions."""
+        """Get list of actions.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         return []
 
     def get_action_params(self, action) -> list:
-        """Get list of action parameters."""
+        """Get list of action parameters.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         return []
 
     def validate_action(self, action: Action) -> ValidationResult:
-        """Validate action parameters."""
+        """Validate action parameters.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         raise NotImplementedError
 
     def execute_action(self, action: Action, revert: bool = False):
@@ -84,6 +105,9 @@ class PluginBase(CommonPluginBase):
             action (Action): The action to execute.
             revert (bool): If True, this is a revert operation. Plugin should undo the action.
                          If False (default), this is a normal action execution.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError
 
@@ -98,9 +122,16 @@ class PluginBase(CommonPluginBase):
         Returns:
             Optional[ActionResult]: Result with partial success information.
                                   If None, all actions are considered successful.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError
 
     def revert_action(self, action: Action):
-        """Execute an action with the given paramters."""
+        """Execute an action with the given paramters.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         raise NotImplementedError

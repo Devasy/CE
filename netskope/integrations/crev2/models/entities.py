@@ -38,6 +38,47 @@ class EntityFieldType(str, Enum):
     RANGE_MAP = "range_map"
 
 
+# The primitive a record actually holds for each field type -- NOT the filter
+# widget it renders as. This is the ``valueType`` half of the convention already
+# used across the product: ``type`` is the widget, ``valueType`` (when present)
+# is the stored primitive, so a Value Map String rendered as a ``select`` still
+# advertises that it holds plain text (see ``_field_to_query_def`` in
+# crev2/routers/records.py and ``build_threat_indicators_query_schema`` in
+# crev2/utils/threat_indicators_entity.py).
+#
+# Vocabulary is the query-builder's ("text", not "string"), matching the
+# existing ``valueType`` values those two modules emit.
+#
+# A LIST holds STRINGS, so its entry is the element primitive -- the product
+# treats a List's contents as text throughout: CSV import builds it by splitting
+# on commas and stripping (``map_record`` in crev2/routers/entities.py),
+# ``_field_to_query_def`` gives it a text filter widget, and the Threat
+# Indicators entity declares ``valueType: "text"`` for its own List fields.
+# Pair it with ``multiValued`` to know it is an ARRAY of that primitive.
+#
+# REFERENCE is deliberately absent: its target field's type is not resolved
+# here, and "absent" means "unknown primitive" per that convention -- consumers
+# must treat a missing entry as unknown rather than defaulting it to text.
+ENTITY_FIELD_VALUE_TYPES = {
+    EntityFieldType.STRING: "text",
+    EntityFieldType.IPV4: "text",
+    EntityFieldType.IPV6: "text",
+    EntityFieldType.EMAIL: "text",
+    EntityFieldType.VALUE_MAP_STRING: "text",
+    # Stores the matched mapping's label, not the number that selected it.
+    EntityFieldType.RANGE_MAP: "text",
+    EntityFieldType.LIST: "text",
+    EntityFieldType.NUMBER: "number",
+    # ``int(expr.evaluate(...))`` -- see _update_calculated_fields in
+    # crev2/tasks/fetch_records.py.
+    EntityFieldType.CALCULATED: "number",
+    # ``ValueMapMappingNumber.value`` is an int.
+    EntityFieldType.VALUE_MAP_NUMBER: "number",
+    EntityFieldType.BOOLEAN: "boolean",
+    EntityFieldType.DATETIME: "datetime",
+}
+
+
 # START Type params
 class ReferenceTypeParams(BaseModel):
     """Reference type parameters."""
@@ -167,6 +208,9 @@ class EntityField(BaseModel):
     ]
     unique: bool
     coalesceStrategy: Optional[EntityTypeCoalesceStrategy]
+    # Free-form provenance/analytics info (e.g. {"ai_suggested": True} for
+    # fields created via the CRE Auto-Mapper). Not used in business logic.
+    metadata: Optional[dict] = None
 
     @validator("coalesceStrategy")
     def validate_coalesce_strategy(cls, v, values, **kwargs):
@@ -193,14 +237,25 @@ class EntityField(BaseModel):
 class EntityFieldIn(BaseModel):
     """Entity field model."""
 
-    label: Annotated[str, StringConstraints(strip_whitespace=True)]
+    label: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
     name: Optional[str] = Field(None, validate_default=True)
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, v):
+        """Validate label."""
+        if not v:
+            raise ValueError("Label cannot be empty.")
+        return v
 
     @field_validator("name")
     @classmethod
     def validate_name(cls, v, info: ValidationInfo):
         """Validate that name is unique."""
-        return ("_".join(info.data["label"].strip().lower().split(" "))).replace(
+        label = info.data.get("label")
+        if label is None:
+            return v
+        return ("_".join(label.strip().lower().split(" "))).replace(
             ".", "_"
         )
 
@@ -215,6 +270,11 @@ class EntityFieldIn(BaseModel):
     ] = None
     unique: bool
     coalesceStrategy: Optional[EntityTypeCoalesceStrategy]
+    # Free-form provenance/analytics info (e.g. {"ai_suggested": True}).
+    # Must exist here as well as on EntityField: create_field round-trips all
+    # existing DB fields through EntityFieldIn (EntityUpdate.fields), so a key
+    # missing from this model would be silently stripped on the next write.
+    metadata: Optional[dict] = None
 
     @validator("coalesceStrategy")
     def validate_coalesce_strategy(cls, v, values, **kwargs):
@@ -245,6 +305,30 @@ class Entity(BaseModel):
     ongoingCalculationUpdateTaskId: Optional[str] = None
     ongoingMappingUpdateTaskId: Optional[str] = None
     fields: list[EntityField]
+
+
+class EntityFieldOut(EntityField):
+    """An entity field plus the two computed facts a field mapping gates on.
+
+    Separate from ``EntityField`` because that is also the WRITE shape
+    (``EntityUpdate.fields`` round-trips every stored field on each entity
+    write), so a key added there would be persisted.
+
+    ``valueType`` is the stored primitive, ``None`` only for a Reference --
+    consumers must read that as "unknown", never as text.
+    """
+
+    valueType: Optional[str] = None
+    multiValued: bool = False
+    # Authored value set for the two bounded map types, else None. An empty list
+    # means the map has no mappings, so it can never match and stores nothing.
+    mapLabels: Optional[list] = None
+
+
+class EntityOut(Entity):
+    """Entity as served by ``GET /entities``, with field mapping metadata."""
+
+    fields: list[EntityFieldOut]
 
 
 class EntityIn(BaseModel):
