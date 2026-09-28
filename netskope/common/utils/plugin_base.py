@@ -33,6 +33,7 @@ class PluginMount(type):
                 "cls": [],
                 "cre": [],
                 "provider": [],
+                "llm_provider": [],
                 "edm": [],
                 "cfc": [],
             }
@@ -314,7 +315,11 @@ class PluginBase(metaclass=PluginMount):
         raise NotImplementedError
 
     def cleanup(self, action_type: str = ActionType.DELETE.value):
-        """Cleanup the plugin."""
+        """Cleanup the plugin.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         raise NotImplementedError()
 
     def parse_data(self, events: bytes, data_type: str, sub_type: str):

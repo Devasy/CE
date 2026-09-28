@@ -17,6 +17,7 @@ import requests
 import traceback
 import json
 import hvac
+from botocore.exceptions import NoCredentialsError
 from jsonschema import validate, ValidationError
 
 from ..models import LogType
@@ -208,6 +209,7 @@ class CTESettings(BaseModel):
     iocRetraction: bool = Field(False)
     iocRetractionInterval: int = Field(1)
     deleteInactiveIndicators: bool = Field(False)
+    generateAlerts: bool = Field(True)
 
 
 class EDMSettings(BaseModel):
@@ -714,6 +716,139 @@ class SecretsManagerAzureParamsOut(BaseModel):
     # Note: clientSecret and certificate are intentionally excluded
 
 
+class AwsAuthMethod(str, Enum):
+    """AWS Secrets Manager supported auth methods (aligned with AWS plugins)."""
+
+    DEPLOYED_ON_AWS = "deployed_on_aws"
+    IAM_ROLES_ANYWHERE = "aws_iam_roles_anywhere"
+
+
+def handle_aws_exceptions(fn):
+    """Handle exceptions for AWS Secrets Manager validation."""
+
+    @wraps(fn)
+    def decorated(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ValueError:
+            raise
+        except Exception as e:
+            from netskope.common.utils.logger import Logger
+
+            logger = Logger()
+            logger.error(
+                "Error occurred while validating AWS Secrets Manager params.",
+                details=traceback.format_exc(),
+            )
+            if isinstance(e, NoCredentialsError):
+                raise ValueError(
+                    "No AWS credentials were found. Deploy Cloud Exchange in an AWS "
+                    "environment with an IAM role, or use IAM Roles Anywhere."
+                )
+            raise ValueError(
+                "Error occurred while validating AWS params. Check logs for details."
+            )
+
+    return decorated
+
+
+class SecretsManagerAwsParams(BaseModel):
+    """AWS Secrets Manager related params."""
+
+    provider: Literal["aws"] = "aws"
+    authMethod: AwsAuthMethod = Field(...)
+    region: str = Field(...)
+
+    @field_validator("region", mode="before")
+    @classmethod
+    def validate_region(cls, v):
+        """Validate region is non-empty."""
+        if not v or not str(v).strip():
+            raise ValueError("Region is required.")
+        return str(v).strip()
+
+    profileArn: Annotated[str, Field(validate_default=True)] = Field("")
+    roleArn: Annotated[str, Field(validate_default=True)] = Field("")
+    trustAnchorArn: Annotated[str, Field(validate_default=True)] = Field("")
+    publicCertificate: Annotated[str, Field(validate_default=True)] = Field("")
+    privateKey: Annotated[str, Field(validate_default=True)] = Field("")
+    passPhrase: Union[str, None] = Field(None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def merge_sensitive_and_clear(cls, values):
+        """Clear Roles Anywhere fields when deployed on AWS."""
+        if isinstance(values, dict):
+            auth = values.get("authMethod")
+            if auth in (
+                AwsAuthMethod.DEPLOYED_ON_AWS,
+                AwsAuthMethod.DEPLOYED_ON_AWS.value,
+                "deployed_on_aws",
+            ):
+                values["profileArn"] = ""
+                values["roleArn"] = ""
+                values["trustAnchorArn"] = ""
+                values["publicCertificate"] = ""
+                values["privateKey"] = ""
+                values["passPhrase"] = None
+        return values
+
+    @model_validator(mode="after")
+    def validate_aws_connection(self):
+        """Validate AWS connectivity on save."""
+        from ..utils.proxy import get_proxy_params
+        from netskope.common.utils.secrets_manager import _validate_aws_connection
+
+        if self.authMethod == AwsAuthMethod.IAM_ROLES_ANYWHERE:
+            for label, val in (
+                ("Profile ARN", self.profileArn),
+                ("Role ARN", self.roleArn),
+                ("Trust Anchor ARN", self.trustAnchorArn),
+            ):
+                if not val or not str(val).strip():
+                    raise ValueError(f"{label} is required for IAM Roles Anywhere.")
+            if not self.publicCertificate or not self.publicCertificate.strip():
+                raise ValueError("Certificate Body is required for IAM Roles Anywhere.")
+            if not self.privateKey or not self.privateKey.strip():
+                raise ValueError("Private Key is required for IAM Roles Anywhere.")
+
+        @handle_aws_exceptions
+        def validate():
+            proxy = get_proxy_params(
+                SettingsDB(**connector.collection(Collections.SETTINGS).find_one({}))
+            )
+            _validate_aws_connection(self, proxy=proxy)
+            return self
+
+        return validate()
+
+
+class SecretsManagerAwsParamsDB(BaseModel):
+    """AWS Secrets Manager params for DB storage."""
+
+    provider: Literal["aws"] = "aws"
+    authMethod: AwsAuthMethod = Field(...)
+    region: str = Field(...)
+    profileArn: Union[str, None] = Field(None)
+    roleArn: Union[str, None] = Field(None)
+    trustAnchorArn: Union[str, None] = Field(None)
+    publicCertificate: Union[str, None] = Field(None)
+    privateKey: Union[str, None] = Field(None)
+    passPhrase: Union[str, None] = Field(None)
+
+
+class SecretsManagerAwsParamsOut(BaseModel):
+    """AWS Secrets Manager params for API output (hides secrets)."""
+
+    provider: Literal["aws"] = "aws"
+    authMethod: AwsAuthMethod = Field(...)
+    region: str = Field(...)
+    profileArn: Union[str, None] = Field(None)
+    roleArn: Union[str, None] = Field(None)
+    trustAnchorArn: Union[str, None] = Field(None)
+    # privateKey, passPhrase, publicCertificate intentionally excluded
+
+
 def is_vault_used(value) -> bool:
     """Check if vault is used."""
     if isinstance(value, str) and value.startswith(SECRET_PREFIX):
@@ -754,6 +889,7 @@ class SecretsManagerSettings(BaseModel):
             Collections.GRC_CONFIGURATIONS,
             Collections.EDM_CONFIGURATIONS,
             Collections.CFC_CONFIGURATIONS,
+            Collections.LLM_PROVIDER_CONFIGURATIONS,
         )
         for collection in config_collections:
             for config in connector.collection(collection).find({}):
@@ -767,6 +903,7 @@ class SecretsManagerSettings(BaseModel):
     params: Union[
         Annotated[SecretsManagerHashicorpParams, Field(validate_default=True)],
         Annotated[SecretsManagerAzureParams, Field(validate_default=True)],
+        Annotated[SecretsManagerAwsParams, Field(validate_default=True)],
         None,
     ] = Field(None, discriminator="provider")
 
@@ -824,6 +961,7 @@ class SecretsManagerSettings(BaseModel):
                 Collections.GRC_CONFIGURATIONS,
                 Collections.EDM_CONFIGURATIONS,
                 Collections.CFC_CONFIGURATIONS,
+                Collections.LLM_PROVIDER_CONFIGURATIONS,
             )
             for collection in config_collections:
                 for config in connector.collection(collection).find({}):
@@ -846,7 +984,10 @@ class SecretsManagerSettingsDB(BaseModel):
 
     enabled: bool = Field(False)
     params: Union[
-        SecretsManagerHashicorpParamsDB, SecretsManagerAzureParamsDB, None
+        SecretsManagerHashicorpParamsDB,
+        SecretsManagerAzureParamsDB,
+        SecretsManagerAwsParamsDB,
+        None,
     ] = Field(None, discriminator="provider")
 
 
@@ -855,7 +996,10 @@ class SecretsManagerSettingsOut(BaseModel):
 
     enabled: bool = Field(False)
     params: Union[
-        SecretsManagerHashicorpParamsOut, SecretsManagerAzureParamsOut, None
+        SecretsManagerHashicorpParamsOut,
+        SecretsManagerAzureParamsOut,
+        SecretsManagerAwsParamsOut,
+        None,
     ] = Field(None, discriminator="provider")
 
 
@@ -936,6 +1080,11 @@ class SettingsOut(BaseModel):
     notificationsCleanup: int = Field(7)
     notificationsCleanupUnit: Union[PollIntervalUnit, None] = Field(None)
     tasksCleanup: int = Field(24)
+    aiDataCleanup: int = Field(30)
+    # AI STATISTICS retention (days): auto-deletes usage telemetry (ai_usage_metrics — the analytics
+    # dashboard data) older than this. Kept as a SEPARATE knob from chat history because aggregate
+    # spend/usage stats are typically retained LONGER than raw transcripts.
+    aiStatsCleanup: int = Field(365)
     cre: CRESettings = Field(CRESettings())
     cls: CLSSettings = Field(CLSSettings())
     cte: CTESettings = Field(CTESettings())
@@ -999,6 +1148,8 @@ class SettingsIn(BaseModel):
     ticketsCleanupQuery: str = Field(None)
     notificationsCleanup: Union[int, None] = Field(None)
     tasksCleanup: Union[int, None] = Field(None, lt=168, gt=0)
+    aiDataCleanup: Union[int, None] = Field(None, lt=366, gt=0)
+    aiStatsCleanup: Union[int, None] = Field(None, lt=366, gt=0)
     cre: Union[CRESettings, None] = Field(None)
     cls: Union[CLSSettings, None] = Field(None)
     cte: Union[CTESettings, None] = Field(None)

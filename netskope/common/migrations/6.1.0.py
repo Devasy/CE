@@ -18,7 +18,6 @@ from netskope.common.models.user import User
 connector = DBConnector()
 logger = Logger()
 plugin_helper = PluginHelper()
-loop = asyncio.get_event_loop()
 
 
 def migrate_itsm_configurations_locking_fields():
@@ -112,7 +111,7 @@ def disable_invalid_edm_configurations():
             )
             if not config_db_dict:
                 continue
-            loop.run_until_complete(
+            asyncio.run(
                 update_configuration(
                     ConfigurationUpdate(
                         name=config_name,

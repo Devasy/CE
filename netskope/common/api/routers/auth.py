@@ -1,16 +1,18 @@
 """Provides authentication related methods."""
 
+import base64
 import os
 import re
 import json
 import traceback
 import math
 
-from typing import List
+from typing import Dict, List, Optional, Tuple
 import jwt
 from datetime import datetime, timedelta, UTC
 from jwt import PyJWTError  # noqa: F401
 from fastapi import Depends, APIRouter, HTTPException, Security
+from fastapi.openapi.models import OAuthFlowClientCredentials
 from fastapi.param_functions import Form
 from fastapi.security import (
     OAuth2PasswordBearer,
@@ -42,28 +44,60 @@ SRE_IDP_SSO_URL = os.environ.get("SRE_IDP_SSO_URL", None)
 SRE_IDP_SLO_URL = os.environ.get("SRE_IDP_SLO_URL", None)
 SRE_IDP_X509_CERT = os.environ.get("SRE_IDP_X509_CERT", None)
 
-oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl="/api/auth",
-    scopes={
-        "me": "Change account settings.",
-        "admin": "Admin access.",
-        "api": "Client ID generation access.",
-        "cte_read": "Read CTE information.",
-        "cte_write": "Write CTE information.",
-        "cto_read": "Read CTO information.",
-        "cto_write": "Write CTO information.",
-        "cre_read": "Read CRE information.",
-        "cre_write": "Write CRE information.",
-        "cls_read": "Read CLS information.",
-        "cls_write": "Write CLS information.",
-        "edm_read": "Read EDM information.",
-        "edm_write": "Write EDM information.",
-        "cfc_read": "Read CFC information.",
-        "cfc_write": "Write CFC information.",
-        "logs": "Read logs",
-        "settings_read": "Read settings information.",
-        "settings_write": "Write settings information.",
-    },
+TOKEN_URL = "/api/auth"
+
+API_SCOPES = {
+    "me": "Change account settings.",
+    "admin": "Admin access.",
+    "api": "Client ID generation access.",
+    "cte_read": "Read CTE information.",
+    "cte_write": "Write CTE information.",
+    "cto_read": "Read CTO information.",
+    "cto_write": "Write CTO information.",
+    "cre_read": "Read CRE information.",
+    "cre_write": "Write CRE information.",
+    "cls_read": "Read CLS information.",
+    "cls_write": "Write CLS information.",
+    "edm_read": "Read EDM information.",
+    "edm_write": "Write EDM information.",
+    "cfc_read": "Read CFC information.",
+    "cfc_write": "Write CFC information.",
+    "logs": "Read logs",
+    "settings_read": "Read settings information.",
+    "settings_write": "Write settings information.",
+    "ai_read": "Read AI feature information.",
+    "ai_write": "Configure and manage AI features.",
+}
+
+
+class OAuth2PasswordOrClientCredentialsBearer(OAuth2PasswordBearer):
+    """Bearer scheme advertising both grants that ``/api/auth`` accepts.
+
+    ``OAuth2PasswordBearer`` publishes only the ``password`` flow, so the
+    Swagger UI Authorize dialog could never issue a ``client_credentials``
+    grant -- the API tokens from Settings > API Tokens were unusable from
+    /api/docs even though ``/api/auth`` has always accepted them. Swagger UI
+    turns every declared flow into its own entry in the Authorize dialog, so
+    adding the second flow here surfaces a client id / secret form alongside
+    the existing username / password one. Token extraction from the
+    ``Authorization`` header is inherited unchanged.
+    """
+
+    def __init__(self, tokenUrl: str, scopes: Dict[str, str], **kwargs):
+        """Publish the client-credentials flow next to the password flow."""
+        super().__init__(tokenUrl=tokenUrl, scopes=scopes, **kwargs)
+        self.model.flows.clientCredentials = OAuthFlowClientCredentials(
+            tokenUrl=tokenUrl, scopes=scopes
+        )
+
+
+oauth2_scheme = OAuth2PasswordOrClientCredentialsBearer(
+    tokenUrl=TOKEN_URL,
+    scopes=API_SCOPES,
+    # FastAPI derives scheme_name from the class name. Pin the original so the
+    # securitySchemes key in the published spec stays "OAuth2PasswordBearer"
+    # and generated clients keep working.
+    scheme_name="OAuth2PasswordBearer",
 )
 
 SCOPE_MAPPING = {
@@ -76,6 +110,7 @@ SCOPE_MAPPING = {
         "cre_read",
         "settings_read",
         "logs",
+        "ai_read",
     ],
     "netskope-ce-write": [
         "cte_read",
@@ -93,6 +128,8 @@ SCOPE_MAPPING = {
         "cfc_write",
         "cre_write",
         "settings_write",
+        "ai_read",
+        "ai_write",
     ],
     "netskope-ce-api": ["api"],
     "netskope-ce-admin": ["admin"],
@@ -111,7 +148,39 @@ SCOPE_MAPPING = {
     "netskope-ce-logs": ["logs"],
     "netskope-settings-read": ["settings_read"],
     "netskope-settings-write": ["settings_read", "settings_write"],
+    "netskope-ce-ai-read": ["ai_read"],
+    "netskope-ce-ai-write": ["ai_read", "ai_write"],
 }
+
+
+def _assert_minting_token_still_valid(client_id: Optional[str], user_dict: dict) -> None:
+    """Reject a JWT whose API token has since been revoked or expired.
+
+    A JWT carries its own two hour ``exp``, so without this check deleting an
+    API token left every JWT already minted from it working until that expiry
+    elapsed -- revocation was not immediate. JWTs from a password grant have no
+    ``client_id`` claim and are unaffected.
+
+    The owning user document is already loaded by the caller, so re-checking the
+    token on every request costs no extra query.
+
+    Args:
+        client_id (Optional[str]): ``client_id`` claim of the presented JWT.
+        user_dict (dict): The owning user document.
+
+    Raises:
+        HTTPException: 401 if the API token no longer exists or has expired.
+    """
+    if client_id is None:
+        return
+    for token in user_dict.get("tokens", []):
+        if token.get("client_id") != client_id:
+            continue
+        expires_at = token.get("expiresAt")
+        if expires_at is not None and datetime.now() > expires_at:
+            raise HTTPException(401, "The API token has expired.")
+        return
+    raise HTTPException(401, "The API token has been revoked.")
 
 
 async def _get_current_user(
@@ -159,6 +228,7 @@ async def _get_current_user(
             )
             if user_dict is None:
                 raise HTTPException(401, "Could not authenticate the user.")
+            _assert_minting_token_still_valid(payload.get("client_id"), user_dict)
             if user_dict["firstLogin"] and not allow_on_first_login:
                 raise HTTPException(
                     401, "Change the password before using this endpoint."
@@ -190,11 +260,46 @@ async def first_time_user(
     return await _get_current_user(security_scopes, token, allow_on_first_login=True)
 
 
+def _client_credentials_from_basic_auth(
+    request: Request,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Read a client id / secret pair out of an HTTP Basic ``Authorization`` header.
+
+    Swagger UI's client-credentials flow transmits the pair this way only --
+    it puts just ``grant_type`` and ``scope`` in the form body -- so without
+    this the Authorize dialog would reach ``/api/auth`` with no credentials at
+    all. This is also how RFC 6749 section 2.3.1 expects a token endpoint to
+    authenticate a client, so it equally serves other standards-compliant
+    clients.
+
+    Args:
+        request (Request): The incoming token request.
+
+    Returns:
+        Tuple[Optional[str], Optional[str]]: The client id and secret, or
+            ``(None, None)`` when the header is absent, uses another scheme,
+            or is not decodable as ``id:secret``.
+    """
+    scheme, _, param = (request.headers.get("Authorization") or "").partition(" ")
+    if scheme.lower() != "basic" or not param:
+        return None, None
+    try:
+        decoded = base64.b64decode(param).decode("utf-8")
+    except ValueError:
+        # binascii.Error and UnicodeDecodeError both derive from ValueError.
+        return None, None
+    client_id, separator, client_secret = decoded.partition(":")
+    if not separator:
+        return None, None
+    return client_id, client_secret
+
+
 class OAuth2PasswordRequestForm:
     """Credential request form."""
 
     def __init__(
         self,
+        request: Request,
         grant_type: str = Form("password", pattern="password|client_credentials"),
         username: str = Form(None),
         password: str = Form(None),
@@ -209,6 +314,13 @@ class OAuth2PasswordRequestForm:
         self.scopes = scope.split()
         self.client_id = client_id
         self.client_secret = client_secret
+        if not (self.client_id and self.client_secret):
+            # Body parameters keep precedence; fall back to Basic auth so the
+            # Swagger UI client-credentials flow can authenticate.
+            basic_id, basic_secret = _client_credentials_from_basic_auth(request)
+            if basic_id and basic_secret:
+                self.client_id = basic_id
+                self.client_secret = basic_secret
 
 
 def is_weak_password(password):
@@ -406,13 +518,28 @@ async def get_token(form_data: OAuth2PasswordRequestForm = Depends()):
                         "This account has been locked due to multiple login failures."
                         f" Please retry after {_convert_seconds_user_display(time_difference)}.",
                     )
-                if not user or (
-                    token["expiresAt"] is not None
-                    and datetime.now() > token["expiresAt"]
-                    or form_data.client_secret != client_secret
-                ):
+                # Order matters twice over. The secret is checked first so that
+                # expiry is only ever disclosed to a caller who already proved
+                # it holds the secret -- otherwise anyone knowing just a
+                # client_id could probe whether that token exists and whether
+                # it has expired, unthrottled, because the expiry branch
+                # deliberately skips the lockout.
+                if form_data.client_secret != client_secret:
                     _lockout_mechanism(
                         consecutive_fail_attempts, current_time, form_data
+                    )
+                # Expiry is then checked separately from the secret, and leaves
+                # the lockout counters untouched: an expired token is a correct
+                # credential that has aged out, not a failed authentication,
+                # and the ladder exists to slow down secret guessing. Counting
+                # expiry there meant retrying an expired token walked it up to
+                # the 6 hour lock.
+                expires_at = token.get("expiresAt")
+                if expires_at is not None and current_time > expires_at:
+                    raise HTTPException(
+                        401,
+                        "The API token has expired. Generate a new one from "
+                        "Settings > API Tokens.",
                     )
 
                 # Reset the lockout attributes
@@ -448,15 +575,22 @@ async def get_token(form_data: OAuth2PasswordRequestForm = Depends()):
             form_data.username = data.get("username", None)
         logger.info(f"Authentication token generated for user {form_data.username}.")
 
+        claims = {
+            "username": user["username"],
+            "scopes": granted_scopes,
+            "exp": datetime.now(UTC)
+            + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        }
+        if form_data.grant_type == "client_credentials":
+            # Name the API token this JWT was minted from so every later request
+            # can confirm the token still exists; without it, revoking a token
+            # left its JWTs usable until they expired on their own.
+            claims["client_id"] = form_data.client_id
+
         # Include password policy in response for first login or policy violation
         response_data = {
             "access_token": jwt.encode(
-                {
-                    "username": user["username"],
-                    "scopes": granted_scopes,
-                    "exp": datetime.now(UTC)
-                    + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-                },
+                claims,
                 SECRET_KEY,
                 ALGORITHM,
             ),

@@ -44,6 +44,10 @@ class Notification(BaseModel):
     createdAt: datetime
     acknowledged: bool = Field(False)
     is_promotion: bool = Field(False)
+    # Name of the configuration a banner is about, so it can be traced back and
+    # acknowledged when that configuration is removed. None for banners that are
+    # not scoped to one configuration (disk space, tenant token, ...).
+    configuration: Union[str, None] = Field(None)
 
 
 class PollIntervalUnit(str, Enum):

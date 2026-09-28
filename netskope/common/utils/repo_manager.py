@@ -227,7 +227,7 @@ class RepoManager(metaclass=Singleton):
 
         if "minimum_provider_version" in manifest:
             provider_path = os.path.join(
-                REPO_STORAGE_PATH,
+                PLUGIN_PATH if repo.name == "custom_plugins" else REPO_STORAGE_PATH,
                 repo.name,
                 manifest["provider_id"],
                 "manifest.json",
@@ -402,20 +402,45 @@ class RepoManager(metaclass=Singleton):
                         )
         return changes
 
+    def get_plugin_status(self, repo: PluginRepo, plugin_id: str) -> PluginStatus:
+        """Report what update_plugin would do to a plugin, without touching the disk.
+
+        Callers need the disposition *before* the update is applied: removing a
+        plugin deletes its package, after which the plugin class can no longer be
+        resolved and any teardown that depends on it is silently skipped.
+
+        Args:
+            repo (PluginRepo): Repository owning the plugin.
+            plugin_id (str): Id of the plugin.
+
+        Returns:
+            PluginStatus: Status update_plugin would return, or None if the
+                package exists in neither the checkout nor the plugin directory.
+        """
+        package = plugin_id.split(".")[-2]
+        repo_path = os.path.join(self.get_dir(repo), package)
+        plugin_path = os.path.join(self.get_plugin_dir(repo), package)
+        if os.path.exists(repo_path) and not os.path.exists(plugin_path):
+            return PluginStatus.ADDED
+        if not os.path.exists(repo_path) and os.path.exists(plugin_path):
+            return PluginStatus.REMOVED
+        if os.path.exists(repo_path) and os.path.exists(plugin_path):
+            return PluginStatus.MODIFIED
+        return None
+
     def update_plugin(self, repo: PluginRepo, plugin_id: str) -> PluginStatus:
         """Update individual plugin from a repo."""
         package = plugin_id.split(".")[-2]
         repo_path = os.path.join(self.get_dir(repo), package)
         plugin_path = os.path.join(self.get_plugin_dir(repo), package)
-        status = None
+        status = self.get_plugin_status(repo, plugin_id)
         mappings = os.path.join(plugin_path, "mappings.json")
-        if os.path.exists(repo_path) and not os.path.exists(plugin_path):
+        if status == PluginStatus.ADDED:
             # new plugin added
             shutil.copytree(repo_path, plugin_path)
             self.logger.debug(
                 f"Adding new plugin with id={plugin_id} from repo {repo.name}."
             )
-            status = PluginStatus.ADDED
             self._add_plugin(repo, package, self._get_head_hash(repo))
             try:
                 if os.path.exists(mappings):
@@ -426,21 +451,19 @@ class RepoManager(metaclass=Singleton):
                     details=traceback.format_exc(),
                     error_code="CE_1015",
                 )
-        elif not os.path.exists(repo_path) and os.path.exists(plugin_path):
+        elif status == PluginStatus.REMOVED:
             # plugin removed
             shutil.rmtree(plugin_path)
             self.logger.debug(f"Removing plugin with id={plugin_id}.")
-            status = PluginStatus.REMOVED
             self._remove_plugin(repo, package)
-        elif os.path.exists(repo_path) and os.path.exists(
-            plugin_path
+        elif (
+            status == PluginStatus.MODIFIED
         ):  # assume plugin has been modified; replace with new one
             shutil.rmtree(plugin_path)
             shutil.copytree(repo_path, plugin_path)
             self.logger.debug(
                 f"Updating plugin with id={plugin_id} from repo {repo.name}."
             )
-            status = PluginStatus.MODIFIED
             try:
                 if os.path.exists(mappings):
                     self.import_mapping_file(mappings, repo.name)
@@ -593,7 +616,7 @@ class RepoManager(metaclass=Singleton):
             return False
         return True
 
-    def validate_repo_accessibility(self, repo: PluginRepo) -> tuple[bool, str]:
+    def validate_repo_accessibility(self, repo: PluginRepo) -> tuple[bool, str, str | None]:
         """Validate repository accessibility before cloning or updating.
 
         For private repositories we first ensure the URL isn't publicly accessible,
@@ -613,6 +636,7 @@ class RepoManager(metaclass=Singleton):
                 return (
                     False,
                     "Username and password are required for private repositories.",
+                    None,
                 )
 
         proc_check = Popen(
@@ -629,20 +653,34 @@ class RepoManager(metaclass=Singleton):
             return (
                 False,
                 "Repository validation timed out. Please check the URL and try again.",
+                None,
             )
 
         if proc_check.returncode != 0:
+            stderr_text = stderr.decode("utf-8") if stderr else ""
+            if "server certificate verification failed" in stderr_text or "SSL certificate problem" in stderr_text:
+                _ssl_resolution = (
+                    "Please make sure to add the CA certificate(s) of the repository server to the "
+                    "'data/ca_certs' directory and then restart the application."
+                )
+                return (
+                    False,
+                    "Repository not accessible due to SSL/TLS certificate verification failure.",
+                    _ssl_resolution,
+                )
             if repo.repoType == "private":
                 return (
                     False,
                     "Invalid credentials or repository not accessible. Please check username, password, and URL.",
+                    None,
                 )
             return (
                 False,
                 "Repository not accessible. Please check the URL or provide credentials if it's a private repository.",
+                None,
             )
 
-        return True, ""
+        return True, "", None
 
     def update(self, repo: PluginRepo, validate_creds=False) -> tuple[bool, bool]:
         """Update plugin repo."""

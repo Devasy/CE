@@ -10,7 +10,7 @@ from sys import stderr
 
 from bson import ObjectId
 from celery import Celery
-from celery.signals import worker_init, task_failure
+from celery.signals import worker_init, worker_process_init, task_failure
 from celery.worker.control import control_command
 from datetime import datetime
 from kombu import Queue, Exchange
@@ -27,7 +27,15 @@ from netskope.integrations.cfc.tasks import TASKS as CFC_TASKS
 from ..utils.db_connector import Collections, DBConnector
 from ..utils.repo_manager import RepoManager
 from ..utils import log_mem, release_lock
+from ..utils.requests_retry_mount import install_worker_response_guards
 from netskope.integrations.cls.utils import set_utf8_encoding_flag
+
+# Orbia case 601 (June mechanism): gate the reserved-task watchdog's
+# connection-tagging plumbing behind an env flag. Off by default — normal
+# customers get today's broker_transport_options unchanged.
+CE_ENABLE_RESERVED_TASK_WATCHDOG = (
+    os.environ.get("CE_ENABLE_RESERVED_TASK_WATCHDOG", "false").lower() == "true"
+)
 
 try:
     # Create custom SSL context with all advanced settings
@@ -77,6 +85,8 @@ try:
             "netskope.common.celery.pull_logs",
             "netskope.common.celery.heartbeat",
             "netskope.common.celery.pull",
+            "netskope.common.celery.attention_scan",
+            "netskope.common.celery.unmute_unified_mapping",
         ],
         broker_use_ssl=ssl_context,
     )
@@ -108,6 +118,17 @@ try:
         """Initialize workers."""
         set_utf8_encoding_flag()
 
+    @worker_process_init.connect
+    def init_worker_process(*args, **kwargs):
+        """Install the HTTP response guards in every forked worker process.
+
+        task_decorator.track() also installs these per task, but that ties
+        guard presence to every HTTP-calling task remembering to stack
+        @track(). Installing here at process boot makes it unconditional,
+        matching how the API process installs its guards at import time.
+        """
+        install_worker_response_guards()
+
     @task_failure.connect
     def handle_task_failure(*args, **kwargs):
         """Handle task failure."""
@@ -128,7 +149,7 @@ try:
                     }
                 },
             )
-        release_lock(kwargs.get("args", []), kwargs.get("kwargs", {}))
+        release_lock(kwargs.get("args", []), kwargs.get("kwargs", {}), task_name)
 
     APP.conf["task_serializer"] = "pickle"
     APP.conf["accept_content"] = ["json", "pickle"]
@@ -136,7 +157,22 @@ try:
     APP.conf["CELERY_MONGODB_SCHEDULER_COLLECTION"] = Collections.SCHEDULES
     APP.conf["CELERY_MONGODB_SCHEDULER_URL"] = os.environ["MONGO_CONNECTION_STRING"]
     APP.conf["worker_prefetch_multiplier"] = 1
-    APP.conf["broker_transport_options"] = {"heartbeat": 120}
+    broker_transport_options = {"heartbeat": 120}
+    if CE_ENABLE_RESERVED_TASK_WATCHDOG:
+        # Prevents prefetch from collapsing to 1 (and getting stuck there) on
+        # every broker reconnect (Orbia case 601, March mechanism).
+        APP.conf["worker_enable_prefetch_count_reduction"] = False
+        # Tag this connection so the health check can find and close exactly
+        # this worker's AMQP connection via the RabbitMQ management API — the
+        # broker's own peer_host/IP is unreliable under Docker NAT (a container's
+        # traffic can appear as the bridge gateway or the host IP, never its own
+        # address) and can't be used to attribute a connection to a worker.
+        worker_connection_tag = os.environ.get("CE_WORKER_CONNECTION_TAG")
+        if worker_connection_tag:
+            broker_transport_options["client_properties"] = {
+                "connection_name": worker_connection_tag
+            }
+    APP.conf["broker_transport_options"] = broker_transport_options
     APP.conf["task_track_started"] = True
     APP._conf["broker_connection_retry_on_startup"] = True
     APP.conf.update(

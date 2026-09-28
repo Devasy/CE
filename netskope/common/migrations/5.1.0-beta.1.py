@@ -44,7 +44,6 @@ connector = DBConnector()
 manager = RepoManager()
 scheduler = Scheduler()
 logger = Logger()
-loop = asyncio.get_event_loop()
 plugin_helper = PluginHelper()
 
 
@@ -1335,7 +1334,7 @@ def update_itsm_configurations_after_events_support():
                 {"_id": configuration["_id"]},
                 {"$set": configuration, "$unset": {"filters": 1}},
             )
-            loop.run_until_complete(
+            asyncio.run(
                 update_configuration(
                     ConfigurationUpdate(
                         name=configuration["name"],
@@ -1388,7 +1387,7 @@ def update_itsm_configurations_after_events_support():
                     }
                 },
             )
-            loop.run_until_complete(
+            asyncio.run(
                 update_configuration(
                     ConfigurationUpdate(
                         name=configuration["name"],
@@ -1419,7 +1418,7 @@ def update_itsm_configurations_after_events_support():
                     }
                 },
             )
-            loop.run_until_complete(
+            asyncio.run(
                 update_configuration(
                     ConfigurationUpdate(
                         name=configuration["name"],
@@ -1605,7 +1604,7 @@ if __name__ == "__main__":
     disable_webtx_plugins_and_add_banner()
     remove_security_scorecard_banner()
     schedule_or_delete_common_pull_tasks()
-    loop.run_until_complete(migrate_ztre())
+    asyncio.run(migrate_ztre())
     schedule_share_analytics_in_user_agent()
     # Migrations For Event support in CTO module
     add_data_type_in_cto_tasks()
@@ -1619,4 +1618,3 @@ if __name__ == "__main__":
     update_cls_siem_mappings()
     add_error_code_field_for_itsm_alerts()
     update_default_business_rules()
-    loop.close()

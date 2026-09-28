@@ -377,7 +377,9 @@ class CustomMongoScheduler(MongoScheduler):
             )
             return
         is_create_task = False
-        lock_collection, lock_field, query, lock_field_change = get_lock_params(entry.args, entry.kwargs)
+        lock_collection, lock_field, query, lock_field_change = get_lock_params(
+            entry.args, entry.kwargs, entry.task
+        )
         if (
             lock_collection is not None
         ):
@@ -392,7 +394,10 @@ class CustomMongoScheduler(MongoScheduler):
                         soft_time_limit = WEBTX_SOFT_TIME_LIMIT
                 if (
                     record.get(lock_field) is not None
-                    and (datetime.now() - record.get(lock_field)).seconds
+                    # total_seconds(), not seconds: the latter drops the day
+                    # component, so a lock stuck for 24-28h reads as 0-4h old
+                    # and the schedule stays blocked instead of expiring.
+                    and (datetime.now() - record.get(lock_field)).total_seconds()
                     < custom_wait_on_lock * 60
                 ):
                     # Adding failed task to queue
@@ -442,6 +447,18 @@ class CustomMongoScheduler(MongoScheduler):
             except AttributeError as ae:
                 print(ae)
                 print("Could not acquire lock", end="")
+                # flatten(None) lands here: no document matched `query`, so the
+                # lock row this schedule is keyed on is gone (renamed/deleted
+                # owner, or stale args). The entry is then skipped on every tick
+                # for good, which is invisible in a print-only beat log — log it
+                # so a dead schedule is diagnosable.
+                logger.error(
+                    f"Could not acquire lock for the task '{entry.task}': no "
+                    f"'{lock_collection}' document matched {query}. This "
+                    "schedule will never be dispatched until the lock document "
+                    "exists or the schedule is removed.",
+                    details=traceback.format_exc(),
+                )
             except Exception as ex:
                 print(repr(ex))
         else:

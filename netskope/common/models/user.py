@@ -44,6 +44,8 @@ class SecurityScopes(str, Enum):
     logs = "logs"
     settings_read = "settings_read"
     settings_write = "settings_write"
+    ai_read = "ai_read"
+    ai_write = "ai_write"
 
 
 class UserOut(BaseModel):

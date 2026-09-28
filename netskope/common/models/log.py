@@ -25,6 +25,7 @@ class Log(BaseModel):
     errorCode: Union[str, None] = Field(None)
     details: Union[str, None] = Field(None)
     resolution: Union[str, None] = Field(None)
+    isAnalyzable: Union[bool, None] = Field(None)
 
     class Config:
         """Config class for the Log model."""

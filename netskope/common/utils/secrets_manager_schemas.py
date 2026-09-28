@@ -296,6 +296,145 @@ AZURE_SECRET_PATH_SCHEMA = {
 }
 
 
+AWS_SECRET_PATH_SCHEMA = {
+    "fields": [
+        {
+            "key": "secretId",
+            "label": "Secret ID",
+            "type": "text",
+            "required": True,
+            "placeholder": "Secret ID",
+            "description": "Name or ARN of the secret in AWS Secrets Manager",
+        },
+        {
+            "key": "secretKey",
+            "label": "Secret Key",
+            "type": "text",
+            "required": False,
+            "placeholder": "Secret Key (optional)",
+            "description": (
+                "Optional JSON key within the secret. Leave empty to use the full "
+                "secret value."
+            ),
+        },
+    ],
+    "format": "secret:{secretId}:{secretKey}",
+    "parse_regex": r"^secret:([^:]+)(?::(.+))?$",
+    "display_format": "{secretId}:{secretKey}",
+}
+
+
+AWS_FIELDS = [
+    create_field(
+        key="authMethod",
+        label="Authentication Method",
+        field_type=FieldType.SELECT,
+        required=True,
+        description="Select how to authenticate with AWS.",
+        options=[
+            {"value": "deployed_on_aws", "label": "Deployed on AWS"},
+            {"value": "aws_iam_roles_anywhere", "label": "AWS IAM Roles Anywhere"},
+        ],
+        default="deployed_on_aws",
+    ),
+    create_field(
+        key="region",
+        label="Region",
+        field_type=FieldType.SELECT,
+        required=True,
+        description="AWS region where Secrets Manager secrets are stored.",
+        options=[
+            {"value": "us-east-1", "label": "US East (N. Virginia) [us-east-1]"},
+            {"value": "us-east-2", "label": "US East (Ohio) [us-east-2]"},
+            {"value": "us-west-1", "label": "US West (N. California) [us-west-1]"},
+            {"value": "us-west-2", "label": "US West (Oregon) [us-west-2]"},
+            {"value": "af-south-1", "label": "Africa (Cape Town) [af-south-1]"},
+            {"value": "ap-east-1", "label": "Asia Pacific (Hong Kong) [ap-east-1]"},
+            {"value": "ap-south-1", "label": "Asia Pacific (Mumbai) [ap-south-1]"},
+            {"value": "ap-south-2", "label": "Asia Pacific (Hyderabad) [ap-south-2]"},
+            {"value": "ap-northeast-1", "label": "Asia Pacific (Tokyo) [ap-northeast-1]"},
+            {"value": "ap-northeast-2", "label": "Asia Pacific (Seoul) [ap-northeast-2]"},
+            {"value": "ap-northeast-3", "label": "Asia Pacific (Osaka) [ap-northeast-3]"},
+            {"value": "ap-southeast-1", "label": "Asia Pacific (Singapore) [ap-southeast-1]"},
+            {"value": "ap-southeast-2", "label": "Asia Pacific (Sydney) [ap-southeast-2]"},
+            {"value": "ap-southeast-3", "label": "Asia Pacific (Jakarta) [ap-southeast-3]"},
+            {"value": "ap-southeast-4", "label": "Asia Pacific (Melbourne) [ap-southeast-4]"},
+            {"value": "ca-central-1", "label": "Canada (Central) [ca-central-1]"},
+            {"value": "ca-west-1", "label": "Canada (Calgary) [ca-west-1]"},
+            {"value": "cn-north-1", "label": "China (Beijing) [cn-north-1]"},
+            {"value": "cn-northwest-1", "label": "China (Ningxia) [cn-northwest-1]"},
+            {"value": "eu-central-1", "label": "Europe (Frankfurt) [eu-central-1]"},
+            {"value": "eu-central-2", "label": "Europe (Zurich) [eu-central-2]"},
+            {"value": "eu-west-1", "label": "Europe (Ireland) [eu-west-1]"},
+            {"value": "eu-west-2", "label": "Europe (London) [eu-west-2]"},
+            {"value": "eu-west-3", "label": "Europe (Paris) [eu-west-3]"},
+            {"value": "eu-south-1", "label": "Europe (Milan) [eu-south-1]"},
+            {"value": "eu-south-2", "label": "Europe (Spain) [eu-south-2]"},
+            {"value": "eu-north-1", "label": "Europe (Stockholm) [eu-north-1]"},
+            {"value": "il-central-1", "label": "Israel (Tel Aviv) [il-central-1]"},
+            {"value": "me-south-1", "label": "Middle East (Bahrain) [me-south-1]"},
+            {"value": "me-central-1", "label": "Middle East (UAE) [me-central-1]"},
+            {"value": "sa-east-1", "label": "South America (São Paulo) [sa-east-1]"},
+        ],
+        default="us-east-1",
+    ),
+    create_field(
+        key="profileArn",
+        label="Profile ARN",
+        field_type=FieldType.TEXT,
+        required=True,
+        placeholder="AWS Profile ARN",
+        description="AWS Profile ARN for IAM Roles Anywhere.",
+        depends_on={"authMethod": "aws_iam_roles_anywhere"},
+    ),
+    create_field(
+        key="roleArn",
+        label="Role ARN",
+        field_type=FieldType.TEXT,
+        required=True,
+        placeholder="AWS Role ARN",
+        description="IAM role ARN to assume via Roles Anywhere.",
+        depends_on={"authMethod": "aws_iam_roles_anywhere"},
+    ),
+    create_field(
+        key="trustAnchorArn",
+        label="Trust Anchor ARN",
+        field_type=FieldType.TEXT,
+        required=True,
+        placeholder="AWS Trust Anchor ARN",
+        description="Trust anchor ARN for IAM Roles Anywhere.",
+        depends_on={"authMethod": "aws_iam_roles_anywhere"},
+    ),
+    create_field(
+        key="publicCertificate",
+        label="Certificate Body",
+        field_type=FieldType.TEXTAREA,
+        required=True,
+        placeholder="-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+        description="PEM client certificate for IAM Roles Anywhere.",
+        depends_on={"authMethod": "aws_iam_roles_anywhere"},
+    ),
+    create_field(
+        key="privateKey",
+        label="Private Key",
+        field_type=FieldType.TEXTAREA,
+        required=True,
+        placeholder="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----",
+        description="PEM private key for the client certificate.",
+        depends_on={"authMethod": "aws_iam_roles_anywhere"},
+    ),
+    create_field(
+        key="passPhrase",
+        label="Private Key Passphrase",
+        field_type=FieldType.PASSWORD,
+        required=False,
+        placeholder="Optional",
+        description="Passphrase if the private key is encrypted.",
+        depends_on={"authMethod": "aws_iam_roles_anywhere"},
+    ),
+]
+
+
 SECRETS_MANAGER_PROVIDERS = {
     "hashicorp": {
         "id": "hashicorp",
@@ -310,6 +449,13 @@ SECRETS_MANAGER_PROVIDERS = {
         "description": "Microsoft Azure Key Vault secrets management",
         "fields": AZURE_FIELDS,
         "secret_path_schema": AZURE_SECRET_PATH_SCHEMA,
+    },
+    "aws": {
+        "id": "aws",
+        "name": "AWS Secrets Manager",
+        "description": "Amazon Web Services Secrets Manager",
+        "fields": AWS_FIELDS,
+        "secret_path_schema": AWS_SECRET_PATH_SCHEMA,
     },
 }
 

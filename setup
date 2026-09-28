@@ -160,12 +160,12 @@ DEFAULT_INPUTS = {
     "ENV_FILE": {"default": "./.env", "skip": True, "help": ""},
 }
 LATEST_TAG_AND_VERSION = {
-    "CORE_TAG": "netskopetechnicalalliances/cloudexchange:core6-6.1.0",
-    "UI_TAG": "netskopetechnicalalliances/cloudexchange:ui6-6.1.0",
-    "MONGO_TAG": "netskopetechnicalalliances/cloudexchange:mongo6-6.1.0-8.0.18",
-    "RABBITMQ_TAG": "netskopetechnicalalliances/cloudexchange:rabbitmq6-6.1.0-4.2.2",
+    "CORE_TAG": "netskopetechnicalalliances/cloudexchange:core7-7.0.0-beta",
+    "UI_TAG": "netskopetechnicalalliances/cloudexchange:ui7-7.0.0-beta",
+    "MONGO_TAG": "netskopetechnicalalliances/cloudexchange:mongo7-7.0.0-beta-8.3.4",
+    "RABBITMQ_TAG": "netskopetechnicalalliances/cloudexchange:rabbitmq7-7.0.0-beta-4.3.2",
     "BETA_OPT_IN": "No",
-    "INSTALL_VERSION": "6.1.0",
+    "INSTALL_VERSION": "7.0.0-beta",
 }
 CHECKS = {}
 MIN_CPU = 8

@@ -37,7 +37,8 @@ from ...utils import (
     Collections,
     PluginStatus,
     PluginHelper,
-    SecretDict
+    SecretDict,
+    Notifier,
 )
 from ... import api
 
@@ -96,6 +97,14 @@ from netskope.integrations.cfc.models import (
     ConfigurationDelete as CFCConfigurationDelete,
 )
 
+from netskope.common.api.routers.llm_providers import (
+    update_llm_provider_configuration, delete_llm_provider_configuration
+)
+from netskope.common.models.llm_provider import (
+    LLMProviderUpdate
+)
+
+
 MANIFEST_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -114,8 +123,10 @@ manager = RepoManager()
 logger = Logger()
 connector = DBConnector()
 helper = PluginHelper()
+notifier = Notifier()
 
 REPO_STORAGE_PATH = netskope.repos.__path__[0]
+PLUGIN_PATH = netskope.plugins.__path__[0]
 
 
 def update_plugins_updated_at():
@@ -190,9 +201,13 @@ async def create_repo(
         repo_exists = repo_exists is not None
 
         # Validate the new configuration before applying it
-        is_accessible, error_msg = manager.validate_repo_accessibility(repo)
+        is_accessible, error_msg, resolution = manager.validate_repo_accessibility(repo)
         if not is_accessible:
-            logger.error(f"Repository accessibility validation failed for {repo.name}.", details=error_msg)
+            logger.error(
+                f"Repository accessibility validation failed for {repo.name}.",
+                details=error_msg,
+                resolution=resolution,
+            )
             raise HTTPException(400, error_msg)
 
         # Now update the remote URL with validated credentials
@@ -236,29 +251,22 @@ async def update_repo(
     if repo.url != plugin_repo.url:
         raise HTTPException(403, "Repository url cannot be updated.")
 
-    # Check if credentials or repo type changed
-    creds_changed = (
-        repo.repoType != plugin_repo.repoType or
-        (repo.repoType == "private" and (
-            repo.username != plugin_repo.username or
-            (repo.password and repo.password != plugin_repo.password)
-        ))
-    )
+    # Validate the new configuration before applying it
+    is_accessible, error_msg, resolution = manager.validate_repo_accessibility(repo)
+    if not is_accessible:
+        logger.error(
+            f"Repository accessibility validation failed for {repo.name}.",
+            details=error_msg,
+            resolution=resolution,
+        )
+        raise HTTPException(400, error_msg)
 
-    # Always validate if credentials or repo type changed
-    if creds_changed:
-        # Validate the new configuration before applying it
-        is_accessible, error_msg = manager.validate_repo_accessibility(repo)
-        if not is_accessible:
-            logger.error(f"Repository accessibility validation failed for {repo.name}.", details=error_msg)
-            raise HTTPException(400, error_msg)
-
-        # Now update the remote URL with validated credentials
-        origin_update, _ = manager.update(repo, validate_creds=False)
-        if not origin_update:
-            raise HTTPException(
-                400, "Error occurred while updating plugin repository. Check logs."
-            )
+    # Now update the remote URL with validated credentials
+    origin_update, _ = manager.update(repo, validate_creds=False)
+    if not origin_update:
+        raise HTTPException(
+            400, "Error occurred while updating plugin repository. Check logs."
+        )
 
     updates = repo.model_dump()
     updates["updates"] = {"action": "update_repo"}
@@ -352,10 +360,21 @@ async def delete_repo(
     ).find():
         if f".{repo.name}." in tenant["plugin"]:
             logger.debug(
-                f"Deleting Netskope Tenant configuration {tenant['name']} as the plugin is removed."
+                f"Deleting Netskope Tenant configuration {tenant['name']} as the repo is removed."
             )
             await delete_tenant_configuration(
                 tenant['name'], user
+            )
+
+    for llm_provider in connector.collection(
+        Collections.LLM_PROVIDER_CONFIGURATIONS
+    ).find():
+        if f".{repo.name}." in llm_provider["plugin"]:
+            logger.debug(
+                f"Deleting LLM Provider configuration {llm_provider['name']} as the repo is removed."
+            )
+            await delete_llm_provider_configuration(
+                name=llm_provider['name'], user=user
             )
     # Delete Mapping file
     for mapping_files in connector.collection(
@@ -390,35 +409,137 @@ async def delete_repo(
     return {"success": True}
 
 
-def _get_config_diff(params: dict, expected: dict, plugin_id: str) -> list:
-    """Get diff if any between existing configuration and the new one."""
+def _has_value_in_other_step(
+    existing_config: dict, key: str, current_step: dict, field_keys: set = None
+) -> bool:
+    """Return True if ``key`` is a non-empty field of some step other than ``current_step``.
+
+    Used to decide whether an absent field was previously in use and has merely
+    moved location across versions (e.g. ``client_secret`` from the old ``params``
+    step to the new ``auth`` step). Only direct fields of sibling step dicts are
+    considered, so a coincidental same-named key nested elsewhere is not matched,
+    and the current step is excluded.
+    """
+    if not isinstance(existing_config, dict):
+        return False
+    field_keys = field_keys or set()
+    for name, value in existing_config.items():
+        if name in field_keys:
+            continue
+        if (
+            isinstance(value, dict)
+            and value is not current_step
+            and value.get(key) not in (None, "", [], {})
+        ):
+            return True
+    return False
+
+
+def _is_field_visible(item: dict, params: dict) -> bool:
+    """Honor a field's ``condition`` ({key, values}) against the stored params.
+
+    Mirrors the UI's field-visibility rule. Fields without a ``condition`` are
+    always visible; conditional fields are visible only when the stored value of
+    ``condition.key`` matches ``condition.values``.
+    """
+    condition = item.get("condition")
+    if not condition:
+        return True
+    actual = params.get(condition.get("key"))
+    values = condition.get("values")
+    if isinstance(values, list):
+        return actual in values
+    return actual == values
+
+
+def _get_config_diff(
+    params: dict,
+    expected: dict,
+    plugin_id: str,
+    existing_config: dict = None,
+    field_keys: set = None,
+) -> list:
+    """Get diff if any between existing configuration and the new one.
+
+    ``existing_config`` is the full stored configuration threaded through the
+    recursion. It lets an absent field be surfaced only when it is mandatory or
+    was previously populated somewhere (i.e. it moved location), so optional
+    fields the user never used are not prompted on upgrade.
+
+    ``field_keys`` is the set of top-level leaf-field keys, computed once from
+    the top-level schema and threaded unchanged through the recursion. It lets
+    ``_has_value_in_other_step`` tell a sibling step apart from a field whose
+    stored value is itself a dict.
+    """
+    if existing_config is None:
+        existing_config = params
+    if field_keys is None:
+        field_keys = {
+            item["key"]
+            for item in expected
+            if item.get("key") and item.get("type") not in ("step", "dynamic_step")
+        }
     diff = []
     for item in expected:
         is_already_added = False
-        if (
-            item.get("key") is not None
-            and item["key"] not in params
-            or (
-                item["type"] in ["password", "text", "choice"]
-                and type(params[item["key"]]) is not str
-            )
-            or (
-                item["type"] == "number"
-                and (
-                    params[item["key"]] != ""
-                    and type(params[item["key"]]) is not int
+        if not _is_field_visible(item, params):
+            continue
+        key = item.get("key")
+        key_absent = key is not None and key not in params
+        type_mismatch = (
+            key is not None
+            and key in params
+            and (
+                (
+                    item["type"] in ["password", "text", "choice"]
+                    and type(params[key]) is not str
+                )
+                or (
+                    item["type"] == "number"
+                    and params[key] != ""
+                    and type(params[key]) is not int
+                )
+                or (
+                    item["type"] == "multichoice"
+                    and (
+                        type(params[key]) is not list
+                        or (
+                            item.get("choices")
+                            and any(
+                                value not in {c.get("value") for c in item["choices"]}
+                                for value in params[key]
+                            )
+                        )
+                    )
+                )
+                or (
+                    item["type"] == "choice"
+                    and item.get("choices")
+                    and params[key]
+                    and params[key] not in {c.get("value") for c in item["choices"]}
                 )
             )
-            or (
-                item["type"] == "multichoice"
-                and type(params[item["key"]]) is not list
-            )
-        ):
+        )
+        if key_absent:
+            # Surface an absent field only when it is mandatory or was
+            # previously populated in another step (i.e. it has moved location
+            # and must be re-entered). This avoids prompting for optional fields
+            # the user never used under their chosen settings.
+            if item.get("mandatory") or _has_value_in_other_step(
+                existing_config, key, params, field_keys
+            ):
+                is_already_added = True
+                diff.append(item)
+        elif type_mismatch:
             is_already_added = True
             diff.append(item)
         elif item["type"] == "step":
             expected_in_step = _get_config_diff(
-                params.get(item["name"], {}), item["fields"], plugin_id
+                params.get(item["name"], {}),
+                item["fields"],
+                plugin_id,
+                existing_config,
+                field_keys,
             )
             if expected_in_step:
                 item = item.copy()
@@ -437,6 +558,7 @@ def _get_config_diff(params: dict, expected: dict, plugin_id: str) -> list:
                     None,
                     logger,
                 )
+                fields = None
                 try:
                     fields = plugin.get_fields(item["name"], SecretDict(params))
                 except NotImplementedError:
@@ -451,13 +573,24 @@ def _get_config_diff(params: dict, expected: dict, plugin_id: str) -> list:
                         details=traceback.format_exc(),
                         error_code="CE_1061",
                     )
-                    raise HTTPException(400, "Error occurred while fetching plugin fields. Check logs.")
-                expected_in_step = _get_config_diff(
-                    params.get(item["name"], {}), fields, plugin_id
-                )
-                if expected_in_step:
+                # On upgrade the stored credentials may still be in their old
+                # location, so get_fields can fail or return nothing. Surface
+                # the dynamic step for reconfiguration regardless; the UI
+                # re-fetches its live fields after the user re-enters auth.
+                if not fields:
                     item = item.copy()
                     diff.append(item)
+                else:
+                    expected_in_step = _get_config_diff(
+                        params.get(item["name"], {}),
+                        fields,
+                        plugin_id,
+                        existing_config,
+                        field_keys,
+                    )
+                    if expected_in_step:
+                        item = item.copy()
+                        diff.append(item)
         if not is_already_added and "has_api_call" in item and item["has_api_call"] and "payload_fields" in item:
             PluginClass = helper.find_by_id(plugin_id)  # NOSONAR S117
             if PluginClass is None:
@@ -476,7 +609,7 @@ def _get_config_diff(params: dict, expected: dict, plugin_id: str) -> list:
                 dynamic_fields = plugin.get_dynamic_fields()
 
                 expected_in_step = _get_config_diff(
-                    params, dynamic_fields, plugin_id
+                    params, dynamic_fields, plugin_id, existing_config, field_keys
                 )
                 if expected_in_step:
                     diff.append(item)
@@ -496,6 +629,65 @@ def _get_config_diff(params: dict, expected: dict, plugin_id: str) -> list:
     return diff
 
 
+def _get_entities_changed(plugin_id: str, parameters: dict, mapped_entities: list) -> bool:
+    """Detect whether an upgrade broke a CRE config's existing entity mapping.
+
+    The upgrade entity-mapping step only exists to reconcile a *stored* mapping
+    that would now fail validation. So this only inspects entities the user
+    actually mapped (``mapped_entities``) and compares each against the upgraded
+    plugin's fresh ``get_entities()``. Returns ``True`` when a now-required field
+    is unmapped, a previously-mapped field was removed, or a mapped entity no
+    longer exists.
+    """
+    # Nothing was mapped → nothing to reconcile on upgrade.
+    if not mapped_entities:
+        return False
+    try:
+        PluginClass = helper.find_by_id(plugin_id)
+        if PluginClass is None:
+            return True
+        plugin = PluginClass(
+            None,
+            SecretDict(parameters),
+            {},
+            None,
+            logger,
+        )
+        entities = plugin.get_entities()
+        if not entities:
+            return True
+        plugin_entities_by_name = {entity.name: entity for entity in entities}
+        # Only inspect entities the user actually mapped.
+        for mapping in mapped_entities:
+            entity = plugin_entities_by_name.get(mapping.get("entity"))
+            # A mapped entity that no longer exists in the plugin is a change.
+            if entity is None:
+                return True
+            mapped_sources = {
+                field.get("source")
+                for field in mapping.get("fields", [])
+                if field.get("source")
+            }
+            plugin_field_names = {field.name for field in entity.fields}
+            # Newly-required field that is not part of the stored mapping.
+            for field in entity.fields:
+                if field.required and field.name not in mapped_sources:
+                    return True
+            # Previously-mapped field that no longer exists in the plugin.
+            for source in mapped_sources:
+                if source not in plugin_field_names:
+                    return True
+        return False
+    except Exception:
+        logger.error(
+            f"Error occurred while diffing entities for plugin id='{plugin_id}'. "
+            "Defaulting to surfacing the entity-mapping step.",
+            details=traceback.format_exc(),
+            error_code="CE_1059",
+        )
+        return True
+
+
 async def _disable_configurations(
     plugin,
     metadata,
@@ -511,6 +703,7 @@ async def _disable_configurations(
                 "name": configuration["name"],
                 "plugin": plugin if migrated_plugin_id is None else migrated_plugin_id,
                 "category": "CTE",
+                "upgrade_notes": metadata.get("upgrade_notes"),
                 "existingConfiguration": configuration["parameters"],
                 "configuration": _get_config_diff(
                     configuration["parameters"],
@@ -535,6 +728,7 @@ async def _disable_configurations(
                 "name": configuration["name"],
                 "plugin": plugin if migrated_plugin_id is None else migrated_plugin_id,
                 "category": "CTO",
+                "upgrade_notes": metadata.get("upgrade_notes"),
                 "existingConfiguration": configuration["parameters"],
                 "configuration": _get_config_diff(
                     configuration["parameters"],
@@ -559,11 +753,18 @@ async def _disable_configurations(
                 "name": configuration["name"],
                 "plugin": plugin if migrated_plugin_id is None else migrated_plugin_id,
                 "category": "CRE",
+                "upgrade_notes": metadata.get("upgrade_notes"),
                 "existingConfiguration": configuration["parameters"],
                 "configuration": _get_config_diff(
                     configuration["parameters"],
                     metadata.get("configuration"),
                     plugin
+                ),
+                "mappedEntities": configuration.get("mappedEntities", []),
+                "entitiesChanged": _get_entities_changed(
+                    plugin,
+                    configuration["parameters"],
+                    configuration.get("mappedEntities", []),
                 ),
                 "active": configuration["active"],
                 "tenant": configuration["tenant"],
@@ -587,6 +788,7 @@ async def _disable_configurations(
                     "attributeMappingRepo"
                 ),
                 "category": "CLS",
+                "upgrade_notes": metadata.get("upgrade_notes"),
                 "existingConfiguration": configuration["parameters"],
                 "configuration": _get_config_diff(
                     configuration["parameters"],
@@ -611,6 +813,7 @@ async def _disable_configurations(
                 "name": configuration["name"],
                 "plugin": plugin,
                 "category": "EDM",
+                "upgrade_notes": metadata.get("upgrade_notes"),
                 "existingConfiguration": configuration["parameters"],
                 "configuration": _get_config_diff(
                     configuration["parameters"],
@@ -638,6 +841,7 @@ async def _disable_configurations(
                 "name": configuration["name"],
                 "plugin": plugin,
                 "category": "CFC",
+                "upgrade_notes": metadata.get("upgrade_notes"),
                 "existingConfiguration": configuration["parameters"],
                 "configuration": _get_config_diff(
                     configuration["parameters"],
@@ -665,6 +869,7 @@ async def _disable_configurations(
                 "name": tenant["name"],
                 "plugin": plugin if migrated_plugin_id is None else migrated_plugin_id,
                 "category": "Provider",
+                "upgrade_notes": metadata.get("upgrade_notes"),
                 "existingConfiguration": tenant["parameters"],
                 "configuration": _get_config_diff(
                     tenant["parameters"],
@@ -672,6 +877,33 @@ async def _disable_configurations(
                     plugin
                 ),
             }
+        )
+
+    for configuration in connector.collection(
+        Collections.LLM_PROVIDER_CONFIGURATIONS
+    ).find({"plugin": plugin, "active": True}):
+        diffs.append(
+            {
+                "name": configuration["name"],
+                "plugin": plugin,
+                "category": "LLMProvider",
+                "upgrade_notes": metadata.get("upgrade_notes"),
+                "existingConfiguration": configuration["parameters"],
+                "configuration": _get_config_diff(
+                    configuration["parameters"],
+                    metadata.get("configuration"),
+                    plugin
+                ),
+                "active": configuration["active"],
+            }
+        )
+        await update_llm_provider_configuration(
+            LLMProviderUpdate(
+                plugin=configuration["plugin"],
+                active=False,
+            ),
+            configuration['name'],
+            user
         )
 
 
@@ -682,40 +914,54 @@ async def _delete_configurations(plugin, user):
         await delete_cte_configuration(
             CTEConfigurationDelete(name=configuration["name"]), user=user
         )
+        notifier.acknowledge_config_banners(configuration["name"])
     for configuration in connector.collection(
         Collections.ITSM_CONFIGURATIONS
     ).find({"plugin": plugin}):
         await delete_itsm_configuration(
             ITSMConfigurationDelete(name=configuration["name"]), user=user
         )
+        notifier.acknowledge_config_banners(configuration["name"])
     for configuration in connector.collection(
         Collections.CREV2_CONFIGURATIONS
     ).find({"plugin": plugin}):
         await delete_crev2_configuration(name=configuration["name"], user=user)
+        notifier.acknowledge_config_banners(configuration["name"])
     for configuration in connector.collection(
         Collections.CLS_CONFIGURATIONS
     ).find({"plugin": plugin}):
         await delete_cls_configuration(
             CLSConfigurationDelete(name=configuration["name"]), user=user
         )
+        notifier.acknowledge_config_banners(configuration["name"])
     for configuration in connector.collection(
         Collections.NETSKOPE_TENANTS
     ).find({"plugin": plugin}):
         await delete_tenant_configuration(
             configuration['name'], user
         )
+        notifier.acknowledge_config_banners(configuration["name"])
     for configuration in connector.collection(
         Collections.EDM_CONFIGURATIONS
     ).find({"plugin": plugin}):
         await delete_edm_configuration(
             EDMConfigurationDelete(name=configuration["name"]), user=user
         )
+        notifier.acknowledge_config_banners(configuration["name"])
     for configuration in connector.collection(
         Collections.CFC_CONFIGURATIONS
     ).find({"plugin": plugin}):
         await delete_cfc_configuration(
             CFCConfigurationDelete(name=configuration["name"]), user=user
         )
+        notifier.acknowledge_config_banners(configuration["name"])
+    for configuration in connector.collection(
+        Collections.LLM_PROVIDER_CONFIGURATIONS
+    ).find({"plugin": plugin}):
+        await delete_llm_provider_configuration(
+            name=configuration["name"], user=user
+        )
+        notifier.acknowledge_config_banners(configuration["name"])
 
 
 def check_version_dependency(repo_name, manifest, plugin):
@@ -740,7 +986,8 @@ def check_version_dependency(repo_name, manifest, plugin):
 
     if "minimum_provider_version" in manifest:
         provider_path = os.path.join(
-            REPO_STORAGE_PATH, repo_name,
+            PLUGIN_PATH if repo_name == "custom_plugins" else REPO_STORAGE_PATH,
+            repo_name,
             manifest["provider_id"],
             "manifest.json",
         )
@@ -917,17 +1164,25 @@ async def update_plugins(
         manifest = None
         if os.path.exists(manifest_path):
             manifest = json.load(open(manifest_path))
-        PluginClass = helper.find_by_id(plugin)  # NOSONAR
-
         if manifest:
             check_version_dependency(name, manifest, plugin)
-        status = manager.update_plugin(repo, plugin)
+
+        # Resolve the disposition before touching the disk. update_plugin() deletes
+        # the package for a removal, after which find_by_id() can no longer resolve
+        # the plugin class and every delete handler skips its cleanup(), stranding
+        # whatever the plugin owns (banners included).
+        status = manager.get_plugin_status(repo, plugin)
+        if status == PluginStatus.REMOVED:
+            await _delete_configurations(plugin, user)
+            manager.update_plugin(repo, plugin)
+            continue
+
+        PluginClass = helper.find_by_id(plugin)  # NOSONAR
+        manager.update_plugin(repo, plugin)
         if PluginClass is None:
             continue
         if status == PluginStatus.MODIFIED:
             await _disable_configurations(plugin, manifest, diffs, user)
-        elif status == PluginStatus.REMOVED:
-            await _delete_configurations(plugin, user)
     connector.collection(Collections.PLUGIN_REPOS).update_one(
         {"name": repo.name},
         {

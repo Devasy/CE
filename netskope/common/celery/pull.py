@@ -135,7 +135,13 @@ def pull(data_type: str, tenant_name: str, configuration_name: str = None):
             should_apply_expo_backoff = should_apply_expo_backoff or is_expo_backoff
             temp_data = data
             if isinstance(data, bytes):
-                temp_data = parse_events(data)
+                temp_data = parse_events(
+                    data,
+                    tenant_config_name=tenant_name,
+                    data_type=data_type,
+                    sub_type=data_sub_type,
+                    tenant=tenant,
+                )
             data_count = len(
                 temp_data.get("result", [])
                 if isinstance(temp_data, dict)
@@ -166,7 +172,7 @@ def pull(data_type: str, tenant_name: str, configuration_name: str = None):
                     }
                     if modules[module]["batch_id_supported"]:
                         kwargs["batch_id"] = batch["_id"]
-                    if data:
+                    if data and data_count:
                         logger.debug(
                             f"Executing plugin lifecycle for {configuration['name']} configuration."
                         )
@@ -178,7 +184,11 @@ def pull(data_type: str, tenant_name: str, configuration_name: str = None):
                             soft_time_limit=SOFT_TIME_LIMIT,
                             time_limit=TASK_TIME_LIMIT,
                         )
-                    else:
+                    elif not data:
+                        logger.debug(
+                            f"Skipping plugin lifecycle sync for {configuration['name']} "
+                            "configuration as no data was pulled."
+                        )
                         connector.collection(module).update_one(
                             {"name": configuration["name"]},
                             {
@@ -187,6 +197,11 @@ def pull(data_type: str, tenant_name: str, configuration_name: str = None):
                                     modules[module].get("lastRunSuccess", "lastRunSuccess"): True,
                                 }
                             },
+                        )
+                    else:
+                        logger.debug(
+                            f"Skipping plugin lifecycle sync for {configuration['name']} "
+                            "configuration as the pulled data contained no records."
                         )
 
         end_time = time.time()

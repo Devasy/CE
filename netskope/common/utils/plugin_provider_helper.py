@@ -131,12 +131,23 @@ class PluginProviderHelper(metaclass=Singleton):
             {"name": field}
         )
 
-    def store_new_field(self, field, type_of_field, data_type: FieldDataType = FieldDataType.TEXT):
+    def store_new_field(
+        self,
+        field,
+        type_of_field,
+        data_type: FieldDataType = FieldDataType.TEXT,
+        label: str = None,
+    ):
         """Update or insert a new field in the NETSKOPE_FIELDS collection.
 
         Args:
             field: The name of the field to be updated or inserted.
             type_of_field: The type of the field to be updated or inserted.
+            data_type: The data type of the field.
+            label: Display label to store. Defaults to one derived from the
+                field name, which suits the snake_case names provider plugins
+                register but not camelCase ones — callers that supply those
+                pass their own label.
 
         Returns:
             None
@@ -146,9 +157,12 @@ class PluginProviderHelper(metaclass=Singleton):
             {
                 "$set": NetskopeField(
                     name=field,
-                    label=field
-                    if field.startswith("_")
-                    else field.replace("_", " ").title(),
+                    label=label
+                    or (
+                        field
+                        if field.startswith("_")
+                        else field.replace("_", " ").title()
+                    ),
                     type=type_of_field,
                     dataType=data_type,
                 ).model_dump()

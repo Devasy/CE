@@ -18,7 +18,7 @@ from io import StringIO
 from uuid import uuid4
 
 from .db_connector import DBConnector, Collections
-from .logger import Logger, LogType
+from .logger import Logger, LogType, PrefixedLogger
 from .notifier import Notifier
 from .singleton import Singleton
 from .task_decorator import integration, track, get_lock_params, log_mem, release_lock
@@ -36,8 +36,20 @@ from .data_batch import DataBatchManager
 
 from netskope.common.utils.db_connector import check_mongo_service
 from .password_validator import PasswordValidator, get_default_policy
-from .requests_retry_mount import MaxRetryExceededException
+from .llm_invoke import (
+    invoke_with_tracking,
+    invoke_agent_with_tracking,
+    plugin_id_to_provider,
+    get_active_llm_provider,
+    resolve_active_llm_plugin,
+)
+from .requests_retry_mount import MaxRetryExceededException, yield_retry_after_to_plugin
 from .installation import get_installation_id
+from .settings import (
+    is_platform_enabled,
+    cto_alerts_enabled,
+    log_cto_alerts_skipped,
+)
 from netskope.common.api import __version__
 from fastapi import HTTPException
 from netskope.common.models import FieldDataType
@@ -50,6 +62,14 @@ from .service_health_check import (
     check_node_services,
     check_standalone_services,
 )
+from .unified_mapping_fields import (
+    get_indicator_fields,
+    get_entity_fields_from_db,
+    get_all_unified_mapping_collections,
+    get_unified_mapping_collection_fields,
+)
+
+from .tools import build_triage_tools
 
 connector = DBConnector()
 helper = PluginHelper()
@@ -585,6 +605,98 @@ def convert_numpy_types(obj):
         return obj
 
 
+DATA_FORMAT_JSON = "json"
+DATA_FORMAT_CSV = "csv"
+
+# Sources that do not yet tag the batches they send, and are known to always
+# serialise JSON. An untagged batch is parsed as JSON only when it comes from
+# one of these; anything else untagged is preserved on disk instead of being
+# guessed at. Remove an entry once that plugin tags its batches.
+UNTAGGED_JSON_PLUGINS = frozenset(
+    {
+        "aws_netskope_logstreaming",
+        "azure_netskope_logstreaming",
+    }
+)
+
+
+class TaggedBytes(bytes):
+    """Compressed batch that carries the wire format it was serialised in.
+
+    A provider plugin learns the format from the tenant's ``Content-Type``
+    response header and records it here at the moment it serialises the batch,
+    so every consumer parses with the format the data was actually written in
+    instead of inferring one from its content.
+
+    The format is recorded at serialisation rather than at reception because a
+    provider may re-serialise a batch: DLP incident enrichment reads a CSV
+    response, enriches it, and writes JSON. Forwarding the received header
+    verbatim would mislabel those batches.
+
+    Subclassing ``bytes`` keeps every existing ``isinstance(x, bytes)`` check
+    and ``gzip.decompress()`` call working unchanged, and the tag survives the
+    pickling Celery uses to hand batches to workers.
+    """
+
+    data_format = None
+
+    def __new__(cls, raw: bytes, data_format: str = None):
+        """Wrap raw compressed bytes together with their wire format."""
+        obj = super().__new__(cls, raw)
+        obj.data_format = data_format
+        return obj
+
+
+def compress_batch(payload: bytes, data_format: str) -> TaggedBytes:
+    """Compress a batch and tag it with the format it was written in.
+
+    ``data_format`` is the format the batch is actually serialised in, which is
+    not always the format its source sent: the Netskope provider's DLP incident
+    enrichment reads a CSV response, enriches it, and writes JSON.
+
+    Args:
+        payload (bytes): Serialised batch.
+        data_format (str): ``DATA_FORMAT_JSON`` or ``DATA_FORMAT_CSV``.
+
+    Returns:
+        TaggedBytes: Compressed batch carrying its wire format.
+    """
+    return TaggedBytes(gzip.compress(payload, compresslevel=3), data_format)
+
+
+def get_plugin_package(plugin_id: str) -> Optional[str]:
+    """Return the package name from a plugin id.
+
+    Plugin ids look like ``netskope.plugins.<repo>.<package>.main``.
+
+    Args:
+        plugin_id (str): Fully qualified plugin id.
+
+    Returns:
+        Optional[str]: The package name, or None when it cannot be read.
+    """
+    if not plugin_id:
+        return None
+    parts = str(plugin_id).split(".")
+    return parts[-2] if len(parts) >= 2 else None
+
+
+def get_data_format(events: bytes) -> Optional[str]:
+    """Return the wire format a batch was tagged with, if any.
+
+    Untagged batches come from sources that predate tagging. Only the sources
+    listed in ``UNTAGGED_JSON_PLUGINS`` are read as JSON without a tag; any
+    other untagged batch is preserved on disk instead of being guessed at.
+
+    Args:
+        events (bytes): Compressed batch, tagged or not.
+
+    Returns:
+        Optional[str]: The tagged format, or None when the batch carries no tag.
+    """
+    return getattr(events, "data_format", None)
+
+
 def parse_csv_response(df: pd.DataFrame):
     """Parse complex datatype in CSV response."""
 
@@ -658,24 +770,41 @@ def parse_events(
     configuration: object = None,
     data_type: str = None,
     sub_type: str = None,
+    tenant: object = None,
 ) -> list[dict]:
     """Parse event bytes into list of dictionaries.
 
+    The batch is parsed as the format its producer tagged it with. An untagged
+    batch is read as JSON only when it comes from a source in
+    ``UNTAGGED_JSON_PLUGINS``; otherwise it is preserved on disk rather than
+    guessed at.
+
     Args:
-        events (bytes): Event bytes. May be JSON or CSV.
+        events (bytes): Event bytes, tagged with their wire format by the
+            producer. May be JSON or CSV.
+        tenant (TenantDB): Tenant the batch was pulled from, when the caller
+            already holds it. Callers that parse every batch of a pull cycle
+            pass it so the tenant is read from the database once per cycle
+            rather than once per batch. Looked up when not given.
 
     Returns:
-        list[dict]: List of events.
+        The parsed batch: a list of records, or the raw ``{"result": [...]}``
+        dict for a JSON batch that carries one. An empty list means the batch
+        could not be parsed, in which case it is preserved on disk.
     """
+    data_format = get_data_format(events)
+    source_package = None
     try:
         if tenant_config_name:
-            from netskope.common.models.tenant import TenantDB
+            if tenant is None:
+                from netskope.common.models.tenant import TenantDB
 
-            tenant = TenantDB(
-                **connector.collection(Collections.NETSKOPE_TENANTS).find_one(
-                    {"name": tenant_config_name}
+                tenant = TenantDB(
+                    **connector.collection(Collections.NETSKOPE_TENANTS).find_one(
+                        {"name": tenant_config_name}
+                    )
                 )
-            )
+            source_package = get_plugin_package(tenant.plugin)
             ProviderClass = helper.find_by_id(tenant.plugin)
             provider = ProviderClass(
                 tenant.name,
@@ -685,10 +814,19 @@ def parse_events(
                 logger_,
             )
             try:
+                # Providers that predate tagging keep their own format
+                # handling, so they are called with the original signature.
+                if has_source_info_args(
+                    ProviderClass, "parse_data", ["data_format"]
+                ):
+                    return provider.parse_data(
+                        events, data_type, sub_type, data_format=data_format
+                    )
                 return provider.parse_data(events, data_type, sub_type)
             except NotImplementedError:
                 pass
         if configuration:
+            source_package = get_plugin_package(configuration.plugin)
             PluginClass = helper.find_by_id(configuration.plugin)  # NOSONAR
             plugin = PluginClass(
                 configuration.name,
@@ -702,19 +840,38 @@ def parse_events(
                 logger_,
             )
             try:
+                # Plugins that predate tagging keep their own format handling,
+                # so they are called with the original signature.
+                if has_source_info_args(
+                    PluginClass, "parse_data", ["data_format"]
+                ):
+                    return plugin.parse_data(
+                        events, data_type, sub_type, data_format=data_format
+                    )
                 return plugin.parse_data(events, data_type, sub_type)
             except NotImplementedError:
                 pass
 
         decompressed_events = gzip.decompress(events)
-        try:
-            return json.loads(decompressed_events)
-        except json.decoder.JSONDecodeError:
+
+        if data_format == DATA_FORMAT_CSV:
             return parse_csv_response(
                 pd.read_csv(
                     StringIO(decompressed_events.decode("utf-8")), keep_default_na=False
                 )
             )
+        if data_format == DATA_FORMAT_JSON:
+            return json.loads(decompressed_events)
+        if source_package in UNTAGGED_JSON_PLUGINS:
+            # Does not tag yet, but is known to always serialise JSON.
+            return json.loads(decompressed_events)
+        # No format was sent and the source is not a known JSON-only one, so
+        # the batch is preserved on disk below instead of being guessed at.
+        raise ValueError(
+            "Pulled data carries no format and came from "
+            f"'{source_package or 'an unidentified source'}', which is not a "
+            "known JSON-only source."
+        )
     except Exception:
         file_path = None
         try:
@@ -740,6 +897,7 @@ def parse_events(
             error_code="CE_1058",
             details=traceback.format_exc(),
         )
+        return []
 
 
 def has_source_info_args(cls, method_name: str, args: list):
@@ -799,8 +957,7 @@ def get_change_log_till_version(md_content, current_version, target_version):
         elif match.group(1) == target_version:
             target_index = i
 
-    # If the target version is the last one in the file, return everything
-    if current_index == -1 or current_index == len(versions) - 1 or target_index == -1:
+    if current_index == -1 or target_index == -1:
         return md_content.strip()
 
     # Get the match object for the version *after* our target

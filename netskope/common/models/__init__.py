@@ -12,7 +12,7 @@ from .other import (
     NetskopeField,
     NetskopeFieldType,
     FieldDataType,
-    ActionType
+    ActionType,
 )
 from .user import (
     User,
@@ -32,7 +32,7 @@ from .settings import (
     ProxyIn,
     ProxySchemes,
     Ssosaml,
-    ScoreMappings
+    ScoreMappings,
 )
 
 from .repo import PluginRepo, PluginRepoOut, PluginRepoIn, PluginRepoUpdate
@@ -56,3 +56,25 @@ from .data_batch import (
     CLSSIEMStatusType,
     CLSSIEM,
 )
+
+from .unified_mapping import (
+    MatchOperator,
+    JoinCondition,
+    JoinRule,
+    UnifiedMappingIn,
+    UnifiedMappingOut,
+    FieldMeta,
+    CollectionMeta,
+    ExecuteResult,
+)
+
+from .llm_provider import (
+    LLMProviderDB,
+    LLMProviderIn,
+    LLMProviderOut,
+    LLMProviderUpdate,
+    LLMProviderValidateIn,
+)
+from .ai_copilot.analyze import AnalyzeRequest, AnalyzeResponse, Citation
+from .ai_copilot.ai_usage import AIFeature, AIProvider, AIUsageStatus, AIUsageRecord
+from .ai_copilot.triage import TriageRequest, TriageResponse, TimelineEvent, ActionItem

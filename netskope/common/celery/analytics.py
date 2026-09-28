@@ -18,12 +18,21 @@ import requests
 from netskope_api.iterator.netskope_iterator import NetskopeIterator
 from netskope.common.api import __version__ as CE_VERSION
 from netskope.common.models.settings import SettingsDB
+from netskope.common.models.ai_copilot.ai_usage import AIFeature
 from netskope.common.utils.analytics_mappings import (
+    AI_DOWN_REASON_ORDER,
+    AI_EFFORT_MAPPING,
+    AI_ERROR_BUCKETS,
+    AI_FINDING_KIND_ORDER,
+    AI_FINDING_MODULE_NUMBERS,
+    AI_MODEL_MAPPING,
+    AI_PROVIDER_MAPPING,
     HOST_PLATFORM_MAPPING,
     MODULES_MAPPING_NUMBERS,
     OS_MAPPING,
     PLUGINS_STATE_MAPPING,
     REPOSITORY_MAPPING,
+    PLUGIN_STATS,
 )
 from netskope.common.utils.disk_free_alarm import (
     get_available_disk_space,
@@ -41,6 +50,7 @@ from ..utils import (
     Logger,
     add_user_agent,
     get_installation_id,
+    plugin_id_to_provider,
     track,
 )
 from .main import APP
@@ -318,6 +328,8 @@ def get_active_plugins_data(
                     PLUGINS_STATE_MAPPING["UPDATE"] if update_success else 0
                 )
                 plugin_state = convert_to_hex(plugin_state, length=1)
+            else:
+                plugin_state = PLUGIN_STATS.get(configuration.get("lastRunSuccess"))
             if not provider:
                 active_plugins_data.append(
                     f"{repo_id}{hashed_plugin_id}{plugin_version_hex}{plugin_state}"
@@ -607,6 +619,829 @@ def get_cfc_details() -> dict:
     return data
 
 
+# --------------------------------------------------------------------------------------
+# AI Copilot analytics — the "ai" analytics type.
+#
+#   -{T}-{V}-{P}-{G}-{L}-{C}-{A}-{N}
+#     T  truncation flag: 1 = provider blocks were dropped, by EITHER limit on segment P
+#        (the _AI_MAX_PROVIDER_BLOCKS cap or the 255-char fit)
+#     V  format version
+#     P  provider config     2 header chars + 4 per configured provider (active first)
+#     G  copilot sessions    3
+#     L  log analyzer        27 core + 5 ext
+#     C  copilot bot         27 core + 30 ext
+#     A  automapper          27 core + 3 ext
+#     N  proactive findings  26
+#
+# Groups are '-' separated so a field added to one feature's extension never shifts
+# another group's offsets. Within a group the fields are FIXED-WIDTH and POSITIONAL:
+# widening, reordering or dropping one silently reinterprets every historical report, so
+# treat the layout and the AI_* mapping tables as a wire format, not an internal detail.
+# --------------------------------------------------------------------------------------
+AI_ANALYTICS_VERSION = "1"
+
+# Feature key the CRE auto-mapper stamps on its AIUsageRecord. Must match that value
+# exactly — segment A is looked up by this string, so a mismatch reports the feature as
+# entirely unused rather than failing.
+AI_FEATURE_AUTOMAPPER = "cre_auto_mapper"
+
+# Ceiling on the repeating provider blocks in segment P. This only stops a deployment with
+# a long tail of provider configs from crowding the rest of the payload out of the 255-char
+# cap; hitting it raises the truncation flag exactly like the length-driven drop does, so a
+# decoder never has to infer a shortfall from P1 vs the block count (and cannot be misled
+# by P1 saturating at 'f' once 16+ configs exist).
+_AI_MAX_PROVIDER_BLOCKS = 8
+
+
+def _ai_pct(numerator: int, denominator: int) -> str:
+    """Percentage as 2 hex chars (00-64). 'ff' means n/a — nothing to divide by.
+
+    'ff' is distinct from '00' so an empty denominator cannot be read as a real 0%.
+    """
+    if not denominator:
+        return "ff"
+    return convert_to_hex(round(100 * numerator / denominator), 2)
+
+
+def _ai_count3(value: int) -> str:
+    """Accumulating counter as 3 chars — EXACT 0-4095, 'fff' meaning 4095+.
+
+    convert_to_hex, NOT convert_size(n, 2, base=1000): a 2-digit mantissa against a
+    1000-wide decade saturates for every value in 256-999 (they all encode as 'ffA'),
+    so a deployment sitting in that band reports an unchanging number and its
+    day-over-day delta reads as ZERO. An exact counter keeps deltas correct across the
+    whole realistic range, in the same 3 characters.
+    """
+    return convert_to_hex(value, 3)
+
+
+def _ai_tokens(value: int) -> str:
+    """Encode a token total as 7 chars — EXACT thousands, 'fffffff' meaning 268B+.
+
+    Not convert_size: that helper computes ``n // 1000**i``, so its mantissa never
+    exceeds 999 no matter how wide it is. A total gets 1-3 significant decimal digits,
+    and only ONE right after a decade boundary — 1,000,000 and 1,999,999 both encode as
+    '001M', a 2x uncertainty on the number cost analysis is built on.
+
+    Exact thousands gives 1,000-token resolution (0.1% at a million) across a 268-billion
+    range, well beyond what a 365-day retention window accumulates. Totals under 1,000
+    tokens floor to 0, which a single turn exceeds.
+    """
+    return convert_to_hex(value // 1000, 7)
+
+
+def _ai_provider_segment(configured: int) -> tuple:
+    """Build segment P as ``(header, blocks, capped)`` — 2 header chars + a 4-char block each.
+
+    Returned unjoined so ``get_ai_details`` can pop blocks off the tail to fit the
+    255-char cap, the same way ``truncate_plugins_data`` pops plugin entries. ``capped``
+    reports whether _AI_MAX_PROVIDER_BLOCKS already dropped configs before that loop ever
+    runs, so the caller raises the truncation flag for BOTH ways segment P falls short —
+    the cap fires on deployments that sit well under the length limit, where the loop
+    below never executes.
+
+    Header: P1 configured count · P2 one-active boolean.
+    Block:  provider type (1) · model (2) · effort (1), repeated.
+
+    One block per configured provider, not just the enabled one: which vendors and models
+    an admin has set up is itself the signal. Blocks are ordered active first, so when P2
+    is 1 the first block is the live configuration and the rest follow sorted by name.
+
+    Capped at _AI_MAX_PROVIDER_BLOCKS so a long tail of configs cannot crowd out the rest
+    of the payload. P1 still carries the configured count (saturating at 15), so a
+    shortfall is also visible by comparing it against the number of blocks present.
+
+    Every field is POINT-IN-TIME: it describes config as it stands at collection, while
+    the token counters beside it span the whole retention window.
+    """
+    configs = list(
+        connector.collection(Collections.LLM_PROVIDER_CONFIGURATIONS).find(
+            {}, {"_id": 0, "name": 1, "plugin": 1, "active": 1, "parameters": 1}
+        )
+    )
+    configs.sort(key=lambda c: (not c.get("active"), c.get("name") or ""))
+
+    blocks = []
+    for config in configs[:_AI_MAX_PROVIDER_BLOCKS]:
+        provider = plugin_id_to_provider(config.get("plugin", "")).value
+        parameters = config.get("parameters") or {}
+        model = parameters.get("model")
+        effort = parameters.get("agentic_effort_calibration")
+        blocks.append(
+            AI_PROVIDER_MAPPING.get(provider, AI_PROVIDER_MAPPING[None])
+            + AI_MODEL_MAPPING.get(model, "fe" if model else "ff")
+            + (AI_EFFORT_MAPPING.get(effort, "e") if effort else "f")
+        )
+
+    header = convert_to_hex(configured, length=1) + (
+        # Product rule: at most ONE provider is active globally, so this is a boolean.
+        "1" if any(c.get("active") for c in configs) else "0"
+    )
+    # Measured against the list that was actually sliced, not the count_documents value in
+    # ``configured``: a config written between those two queries must not flip the flag.
+    return header, blocks, len(configs) > _AI_MAX_PROVIDER_BLOCKS
+
+
+def _ai_usage_stats() -> dict:
+    """Per-feature rollup of ai_usage_metrics, keyed by feature value.
+
+    One aggregation: the error buckets are expressible as $in tests, so there is no need
+    to post-process in Python. Feedback stubs are excluded here (they are not turns and
+    carry no tokens) — the thumbs counters read them separately, on purpose.
+    """
+    api_token_types = AI_ERROR_BUCKETS["api_token"]
+    network_types = AI_ERROR_BUCKETS["network"]
+    pipeline = [
+        {"$match": {"feedbackStub": {"$ne": True}}},
+        {
+            "$group": {
+                "_id": "$feature",
+                "turns": {"$sum": 1},
+                "inputTokens": {"$sum": {"$ifNull": ["$inputTokens", 0]}},
+                "outputTokens": {"$sum": {"$ifNull": ["$outputTokens", 0]}},
+                # No success counter: success = turns - errCode - errApiToken - errNetwork
+                # - cancelled, exactly, because every ERROR record carries an errorType and
+                # every errorType resolves to exactly one bucket below.
+                # Abandonment, not failure — kept out of any success-rate denominator.
+                "cancelled": {
+                    "$sum": {"$cond": [{"$eq": ["$errorType", "client_disconnected"]}, 1, 0]}
+                },
+                "errApiToken": {
+                    "$sum": {"$cond": [{"$in": ["$errorType", api_token_types]}, 1, 0]}
+                },
+                "errNetwork": {
+                    "$sum": {"$cond": [{"$in": ["$errorType", network_types]}, 1, 0]}
+                },
+                # "code" is the DEFAULT bucket: anything classified that is not
+                # api/token and not network. A negative test, so an unlisted LLMErrorType
+                # lands here rather than in no bucket at all — success is turns minus the
+                # three buckets, so an unbucketed error would read as a success.
+                "errCode": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$ne": [{"$ifNull": ["$errorType", None]}, None]},
+                                    {"$not": {"$in": ["$errorType", api_token_types]}},
+                                    {"$not": {"$in": ["$errorType", network_types]}},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "iterLimit": {
+                    "$sum": {"$cond": [{"$eq": ["$errorType", "iteration_limit"]}, 1, 0]}
+                },
+                "iterSum": {"$sum": {"$ifNull": ["$metadata.iterationsUsed", 0]}},
+                "iterCount": {
+                    "$sum": {
+                        "$cond": [
+                            {"$ne": [{"$type": "$metadata.iterationsUsed"}, "missing"]}, 1, 0
+                        ]
+                    }
+                },
+                # Grounding denominator: ONLY turns that actually carry citationCount.
+                # Errored turns produced no answer, and records written before the
+                # grounding instrumentation shipped have no such field — counting them
+                # would permanently depress every grounding percentage.
+                "groundDen": {
+                    "$sum": {
+                        "$cond": [
+                            {"$ne": [{"$type": "$metadata.citationCount"}, "missing"]}, 1, 0
+                        ]
+                    }
+                },
+                # webUsed and kbUsed MUST be scoped to the same population as groundDen.
+                # The gateway writes webSearchEnriched on EVERY record including errors,
+                # but citationCount is only stamped after a successful answer is
+                # normalised — so an unscoped numerator over a success-only denominator
+                # can exceed it and encode a percentage above 0x64 (an impossible value).
+                # An errored turn produced no answer, so it belongs in neither.
+                "webUsed": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$eq": ["$metadata.webSearchEnriched", True]},
+                                    {"$ne": [{"$type": "$metadata.citationCount"}, "missing"]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                # Inherently scoped: the field must exist to equal 0.
+                "zeroCitation": {
+                    "$sum": {"$cond": [{"$eq": ["$metadata.citationCount", 0]}, 1, 0]}
+                },
+                # KB grounding produces NO citations, so it is a separate signal — an
+                # answer grounded purely in the local knowledge packs legitimately has
+                # zero citations. Copilot-only (the log analyzer has no knowledge tool).
+                "kbUsed": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$eq": ["$metadata.kbGrounded", True]},
+                                    {"$ne": [{"$type": "$metadata.citationCount"}, "missing"]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "degRepaired": {
+                    "$sum": {"$cond": [{"$eq": ["$metadata.degraded", "repaired_structured"]}, 1, 0]}
+                },
+                "degNoStruct": {
+                    "$sum": {
+                        "$cond": [{"$eq": ["$metadata.degraded", "no_structured_response"]}, 1, 0]
+                    }
+                },
+            }
+        },
+    ]
+    stats = {}
+    for row in connector.collection(Collections.AI_USAGE_METRICS).aggregate(pipeline):
+        stats[row.pop("_id")] = row
+    return stats
+
+
+def _ai_feedback_stats() -> dict:
+    """Thumbs counts + the down-reason histogram.
+
+    Feedback stubs are INCLUDED here: a stub exists precisely to preserve a rating whose
+    turn never persisted a usage record, so excluding them would silently drop
+    thumbs-down on failed turns — the most important feedback there is.
+    """
+    pipeline = [
+        {"$match": {"feedback.rating": {"$in": ["up", "down"]}}},
+        {
+            "$group": {
+                "_id": {"rating": "$feedback.rating", "comment": "$feedback.comment"},
+                "n": {"$sum": 1},
+            }
+        },
+    ]
+    up = down = 0
+    reasons = {reason: 0 for reason in AI_DOWN_REASON_ORDER}
+    for row in connector.collection(Collections.AI_USAGE_METRICS).aggregate(pipeline):
+        key = row["_id"]
+        count = row["n"]
+        if key.get("rating") == "up":
+            up += count
+            continue
+        down += count
+        comment = key.get("comment")
+        if comment in reasons:
+            reasons[comment] += count
+    return {"up": up, "down": down, "reasons": reasons}
+
+
+def _ai_reason_histogram(reasons: dict, down_total: int) -> str:
+    """Render the 5-nibble down-reason histogram — SHARES of thumbs-down, quantised to 1/15.
+
+    Shares rather than raw counts because a nibble caps at 15 and the counts accumulate
+    over the retention window, so raw counts would saturate almost immediately. Absolute
+    counts stay recoverable as ``down_total * nibble / 15``.
+
+    Largest-remainder rounding keeps the sum <= 15, which leaves ``15 - sum`` as the
+    share of thumbs-down where the user dismissed the chip picker without choosing a
+    reason — that bucket comes free, with no extra field.
+    """
+    if not down_total:
+        return "0" * len(AI_DOWN_REASON_ORDER)
+
+    exact = [15 * reasons[reason] / down_total for reason in AI_DOWN_REASON_ORDER]
+    nibbles = [int(value) for value in exact]
+    remaining = 15 - sum(nibbles)
+    # Hand out what integer truncation dropped, largest fractional part first, but never
+    # more than the reasons actually account for (the residual belongs to "no reason").
+    remainders = sorted(
+        range(len(exact)), key=lambda i: exact[i] - int(exact[i]), reverse=True
+    )
+    accounted = sum(reasons[reason] for reason in AI_DOWN_REASON_ORDER)
+    spare = min(remaining, max(0, round(15 * accounted / down_total) - sum(nibbles)))
+    for index in remainders[:spare]:
+        nibbles[index] += 1
+    return "".join(convert_to_hex(value, length=1) for value in nibbles)
+
+
+def _ai_core_block(stats: dict) -> str:
+    """Build the per-feature core block — 27 chars, identical for every feature.
+
+    x1 turns · x2 input · x3 output · x4 code · x5 api/token · x6 network.
+
+    Turns use `convert_size` (exact to 999, then 3 significant digits — a 1% error at
+    100k turns); tokens use `_ai_tokens` instead.
+
+    Abandoned turns are bucketed as network errors by AI_ERROR_BUCKETS, which keeps
+    ``success = x1 - x4 - x5 - x6`` exact. Success count and rate are that subtraction,
+    so neither is encoded.
+    """
+    stats = stats or {}
+    return (
+        convert_size(stats.get("turns", 0), length=3, base=1000)
+        + _ai_tokens(stats.get("inputTokens", 0))
+        + _ai_tokens(stats.get("outputTokens", 0))
+        + _ai_count3(stats.get("errCode", 0))
+        + _ai_count3(stats.get("errApiToken", 0))
+        + _ai_count3(stats.get("errNetwork", 0))
+    )
+
+
+def _ai_web_grounded(stats: dict) -> str:
+    """Web-grounded % over the turns that carry grounding instrumentation — 2 chars."""
+    stats = stats or {}
+    return _ai_pct(stats.get("webUsed", 0), stats.get("groundDen", 0))
+
+
+def _ai_log_analyzer_extension(stats: dict) -> str:
+    """Build segment L extension — 5 chars. L1 iteration-limit hits · L2 web-grounded %.
+
+    No KB-grounded field on purpose: the log analyzer has no knowledge tool. Analyze runs
+    [web_tool, get_ce_docs_keywords] and triage runs the four log tools plus the web tool,
+    and get_ce_docs_keywords returns CE *vocabulary* to aim a web search — it is not a
+    grounding source. A KB field here would be a constant '00'.
+    """
+    return _ai_count3((stats or {}).get("iterLimit", 0)) + _ai_web_grounded(stats)
+
+
+def _ai_journey_stats() -> dict:
+    """Journey counts from copilot_sessions (the active journey + any paused ones).
+
+    A SNAPSHOT, not an accumulating counter: journeys live inside session documents, so
+    they are destroyed by session delete and by the shorter aiDataCleanup window, and
+    dismissing a paused journey removes it outright. Counts can go DOWN between reports.
+    Dismissed-but-still-attached journeys are counted — they were created.
+    """
+    pipeline = [
+        {
+            "$project": {
+                "journeys": {
+                    "$concatArrays": [
+                        {"$cond": [{"$ifNull": ["$journey", False]}, ["$journey"], []]},
+                        {"$ifNull": ["$pausedJourneys", []]},
+                    ]
+                }
+            }
+        },
+        {"$unwind": "$journeys"},
+        {
+            "$group": {
+                "_id": None,
+                "total": {"$sum": 1},
+                # "Started" = ANY step marked done, order-independent.
+                "withProgress": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$gt": [
+                                    {
+                                        "$size": {
+                                            "$filter": {
+                                                "input": {"$ifNull": ["$journeys.steps", []]},
+                                                "cond": {"$eq": ["$$this.state", "done"]},
+                                            }
+                                        }
+                                    },
+                                    0,
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "playbook": {
+                    "$sum": {"$cond": [{"$ifNull": ["$journeys.playbookId", False]}, 1, 0]}
+                },
+            }
+        },
+    ]
+    rows = list(connector.collection(Collections.COPILOT_SESSIONS).aggregate(pipeline))
+    return rows[0] if rows else {"total": 0, "withProgress": 0, "playbook": 0}
+
+
+def _ai_copilot_extension(stats: dict, feedback: dict, journeys: dict) -> str:
+    """Build segment C extension — 30 chars."""
+    stats = stats or {}
+    down_total = feedback["down"]
+    return (
+        _ai_count3(stats.get("iterLimit", 0))
+        + _ai_web_grounded(stats)
+        + _ai_pct(stats.get("kbUsed", 0), stats.get("groundDen", 0))
+        # Two degrade rungs, counted separately: 'repaired_structured' keeps journeys and
+        # insight cards, 'no_structured_response' loses them. Both persist as SUCCESS.
+        + _ai_count3(stats.get("degRepaired", 0))
+        + _ai_count3(stats.get("degNoStruct", 0))
+        + _ai_count3(feedback["up"])
+        + _ai_count3(down_total)
+        + _ai_reason_histogram(feedback["reasons"], down_total)
+        + convert_to_hex(journeys.get("total", 0), 2)
+        + convert_to_hex(journeys.get("withProgress", 0), 2)
+        + convert_to_hex(journeys.get("playbook", 0), 2)
+    )
+
+
+def _ai_automapper_suggested_fields() -> int:
+    """Count entity fields the automapper suggested, across every CRE entity.
+
+    Keys on ``fields[].metadata.ai_suggested`` being true — the marker the automapper
+    sets. Matching on the presence of ``metadata`` alone would also count fields carrying
+    it for unrelated reasons. Returns 0 when no field is marked, including on schemas
+    that carry no such marker.
+    """
+    pipeline = [
+        {"$unwind": "$fields"},
+        {"$match": {"fields.metadata.ai_suggested": True}},
+        {"$count": "n"},
+    ]
+    rows = list(connector.collection(Collections.CREV2_ENTITIES).aggregate(pipeline))
+    return rows[0]["n"] if rows else 0
+
+
+def _ai_findings_stats() -> dict:
+    """Summarise copilot_findings by status/severity, kind and module.
+
+    Shared by the encoded segment N and the diagnose report, so the two can never report
+    different numbers. 'watching' findings are excluded — they are pre-threshold trackers
+    and invisible by design. Auto-resolved counts undercount: findings carry an expireAt
+    TTL, so resolved documents age out of the snapshot.
+    """
+    pipeline = [
+        {"$match": {"status": {"$in": ["open", "acknowledged", "auto_resolved"]}}},
+        {
+            "$group": {
+                "_id": {
+                    "status": "$status",
+                    "severity": "$severity",
+                    "kind": "$kind",
+                    "module": "$module",
+                },
+                "n": {"$sum": 1},
+            }
+        },
+    ]
+    by_status_severity: dict = {}
+    open_by_kind: dict = {}
+    acked_by_kind: dict = {}
+    problematic_modules: set = set()
+    for row in connector.collection(Collections.COPILOT_FINDINGS).aggregate(pipeline):
+        key = row["_id"]
+        status, severity, kind, module = (
+            key.get("status"),
+            key.get("severity"),
+            key.get("kind"),
+            key.get("module"),
+        )
+        count = row["n"]
+        by_status_severity[(status, severity)] = (
+            by_status_severity.get((status, severity), 0) + count
+        )
+        if status == "open":
+            open_by_kind[kind] = open_by_kind.get(kind, 0) + count
+            problematic_modules.add(module)
+        elif status == "acknowledged":
+            acked_by_kind[kind] = acked_by_kind.get(kind, 0) + count
+    return {
+        "byStatusSeverity": by_status_severity,
+        "openByKind": open_by_kind,
+        "ackedByKind": acked_by_kind,
+        # Modules carrying at least one OPEN finding — how wide the problem is, not how deep.
+        "problematicModules": sorted(m for m in problematic_modules if m),
+    }
+
+
+def _ai_proactive_segment(stats: dict) -> str:
+    """Encode segment N — 24 chars, all snapshots, from _ai_findings_stats().
+
+    N1 module bitmask · N2 per-kind OPEN histogram · N3 per-kind ACKNOWLEDGED histogram.
+
+    WHICH rules fire and which get muted is the actionable signal, so the per-kind rows
+    are what the payload keeps; the severity split and the auto-resolved counts are
+    diagnose-only. Nibbles saturate at 'f' = "15 or more", so totals derived by summing a
+    row are a LOWER BOUND — plugin_error_logs groups by errorCode and can realistically
+    exceed 15 on a broken deployment.
+    """
+    module_mask = 0
+    for module in stats["problematicModules"]:
+        module_mask |= AI_FINDING_MODULE_NUMBERS.get(module, 0)
+
+    def _kind_histogram(counts: dict) -> str:
+        return "".join(
+            convert_to_hex(counts.get(finding_kind, 0), length=1)
+            for finding_kind in AI_FINDING_KIND_ORDER
+        )
+
+    return (
+        convert_to_hex(module_mask, 2)
+        + _kind_histogram(stats["openByKind"])
+        + _kind_histogram(stats["ackedByKind"])
+    )
+
+
+def get_ai_details() -> str:
+    """Build the complete 'ai' analytics string, or '' when AI was never configured.
+
+    Layout: -{T}-{V}-{P}-{G}-{L}-{C}-{A}-{N}, where T is the truncation flag (1 when
+    provider blocks were dropped — by the _AI_MAX_PROVIDER_BLOCKS cap, by the 255-char
+    fit, or both). Groups are '-' separated so a field added to one feature's extension
+    never shifts another group's offsets.
+
+    Gated on an LLM provider config EXISTING rather than being active: AI is not a
+    settings.platforms toggle, so the per-module platform check does not apply, and a
+    configured-then-disabled deployment still has history worth reporting.
+    """
+    try:
+        configured = connector.collection(
+            Collections.LLM_PROVIDER_CONFIGURATIONS
+        ).count_documents({})
+        if configured == 0:
+            return ""
+        provider_header, provider_blocks, capped = _ai_provider_segment(configured)
+
+        usage = _ai_usage_stats()
+        log_stats = usage.get(AIFeature.POSTURE_ASSESSMENT.value, {})
+        copilot_stats = usage.get(AIFeature.CONFIGURATION_COPILOT.value, {})
+        automapper_stats = usage.get(AI_FEATURE_AUTOMAPPER, {})
+
+        # Segment G carries sessions ONLY. Which features are in use (x1 > 0 per feature),
+        # the turn total (sum of the three x1s) and turns-per-session (copilot x1 /
+        # sessions) are all exactly derivable from what is already sent, and a second copy
+        # of a derivable value can only ever disagree with its own inputs.
+        sessions = connector.collection(Collections.COPILOT_SESSIONS).count_documents({})
+        global_segment = convert_to_hex(sessions, 3)
+
+        feedback = _ai_feedback_stats()
+        journeys = _ai_journey_stats()
+
+        tail = [
+            global_segment,
+            _ai_core_block(log_stats) + _ai_log_analyzer_extension(log_stats),
+            _ai_core_block(copilot_stats)
+            + _ai_copilot_extension(copilot_stats, feedback, journeys),
+            _ai_core_block(automapper_stats)
+            + convert_to_hex(_ai_automapper_suggested_fields(), 3),
+            _ai_proactive_segment(_ai_findings_stats()),
+        ]
+
+        def _assemble(blocks: list, truncated: bool) -> str:
+            return "-".join(
+                [
+                    "",  # leading '-' from the join
+                    str(int(truncated)),
+                    AI_ANALYTICS_VERSION,
+                    provider_header + "".join(blocks),
+                    *tail,
+                ]
+            )
+
+        # Fit the cap the way truncate_plugins_data does: drop entries off the tail of
+        # the only variable-length list until it fits, and raise the truncation flag.
+        # Blocks are ordered active-first, so the live configuration is the last dropped.
+        # Whole blocks only — the payload is positional, so clipping the string would
+        # shift every field after the cut and decode wrong. The flag is one character in
+        # either state, so dropping a block always shortens the result.
+        #
+        # Seeded from the hard cap rather than False: _AI_MAX_PROVIDER_BLOCKS may already
+        # have dropped configs, and it fires INDEPENDENTLY of length — the fixed part is
+        # ~182 chars, so a 9-provider payload sits ~50 characters under the cap and the
+        # loop below never runs. The flag means "segment P is incomplete", so it has to
+        # cover both limits; otherwise the report claims a complete P while withholding
+        # configs, and only a decoder that re-derives the block count notices.
+        prefix_length = len("netskope-ce-" + api.__version__)
+        truncated = capped
+        while provider_blocks and (
+            prefix_length + len(_assemble(provider_blocks, truncated))
+            > MAX_ANALYTICS_LENGTH
+        ):
+            provider_blocks.pop()
+            truncated = True
+
+        analytics = _assemble(provider_blocks, truncated)
+        if prefix_length + len(analytics) > MAX_ANALYTICS_LENGTH:
+            # Only reachable if the fixed-width part alone outgrows the cap. Mirrors
+            # truncate_plugins_data, which also sends what it has rather than dropping the
+            # report — logged loudly so the overflow is attributable.
+            logger.error(
+                "AI Copilot analytics exceeds the User-Agent limit even with every "
+                f"provider block dropped ({prefix_length + len(analytics)}/"
+                f"{MAX_ANALYTICS_LENGTH} characters).",
+                details=f"raw={analytics}",
+            )
+        return analytics
+    except Exception as e:
+        logger.debug(
+            f"Failed to get ai details: {e}", details=traceback.format_exc()
+        )
+        return ""
+
+
+def _ai_rate(numerator: int, denominator: int):
+    """Return a percentage rounded to 1dp, or None when there is nothing to divide by."""
+    if not denominator:
+        return None
+    return round(100 * numerator / denominator, 1)
+
+
+def _ai_feature_report(stats: dict, *, cancellable: bool = True, kb: bool = False) -> dict:
+    """Expand one feature's raw stats into the readable diagnose shape.
+
+    Values the encoded payload leaves to be derived are spelled out here: the diagnose
+    bundle has no width budget, so nothing needs to be recomputed by hand.
+    """
+    stats = stats or {}
+    turns = stats.get("turns", 0)
+    err_code = stats.get("errCode", 0)
+    err_api = stats.get("errApiToken", 0)
+    err_net = stats.get("errNetwork", 0)
+    cancelled = stats.get("cancelled", 0) if cancellable else 0
+    # err_net already contains the cancelled turns (AI_ERROR_BUCKETS folds
+    # client_disconnected into "network"), so cancelled is NOT subtracted again here.
+    err_total = err_code + err_api + err_net
+    success = turns - err_total
+    # Real failures, with user abandonment taken back out — the honest success-rate
+    # denominator. Heavy Stop-button use is not unreliability.
+    real_errors = err_total - cancelled
+    inp = stats.get("inputTokens", 0)
+    out = stats.get("outputTokens", 0)
+    iter_count = stats.get("iterCount", 0)
+    ground_den = stats.get("groundDen", 0)
+    degraded = stats.get("degRepaired", 0) + stats.get("degNoStruct", 0)
+
+    report = {
+        "turns": turns,
+        "inputTokens": inp,
+        "outputTokens": out,
+        "totalTokens": inp + out,
+        "errors": {
+            "code": err_code,
+            # "network" INCLUDES cancelled turns, since AI_ERROR_BUCKETS buckets
+            # client_disconnected there. Both figures are reported so the two causes can
+            # be separated.
+            "network": err_net,
+            "networkExcludingCancelled": err_net - cancelled,
+            "apiToken": err_api,
+            "total": err_total,
+            "iterationLimitHits": stats.get("iterLimit", 0),
+        },
+        "success": success,
+        "successRatePct": _ai_rate(success, success + real_errors),
+        "errorRatePct": _ai_rate(real_errors, turns),
+        "avgIterations": round(stats.get("iterSum", 0) / iter_count, 2) if iter_count else None,
+        # Denominator is turns that produced an answer AND carry the grounding fields.
+        # Records without them are excluded, so this can be 0 while turns is not.
+        "grounding": {
+            "measurableTurns": ground_den,
+            "webGroundedPct": _ai_rate(stats.get("webUsed", 0), ground_den),
+            "zeroCitationPct": _ai_rate(stats.get("zeroCitation", 0), ground_den),
+        },
+    }
+    if cancellable:
+        report["cancelledTurns"] = cancelled
+        report["cancellationRatePct"] = _ai_rate(cancelled, turns)
+    if kb:
+        report["grounding"]["kbGroundedPct"] = _ai_rate(stats.get("kbUsed", 0), ground_den)
+        # Both degrade rungs persist as SUCCESS: the user got an answer, at reduced
+        # fidelity. noStructuredResponse is the worse of the two — it loses the turn's
+        # journey and insight cards entirely.
+        report["degraded"] = {
+            "repairedStructured": stats.get("degRepaired", 0),
+            "noStructuredResponse": stats.get("degNoStruct", 0),
+            "ratePct": _ai_rate(degraded, turns),
+        }
+    return report
+
+
+def collect_ai_analytics_report() -> dict:
+    """Build the full-precision AI Copilot report for the diagnose bundle.
+
+    Same underlying queries as get_ai_details(), so the two cannot disagree. With no
+    255-char budget it reports exact values rather than quantised ones, spells out the
+    derived fields, and adds operational context — retention settings, collection sizes,
+    environment flags — that matters when debugging a live deployment.
+
+    Contains NO conversation content and no secrets: counts, rates and non-secret config
+    only. Keep it that way — ``aiDataCleanup`` is a privacy control over exactly the
+    transcripts this report does not read.
+    """
+    settings = connector.collection(Collections.SETTINGS).find_one({}) or {}
+    providers = list(
+        connector.collection(Collections.LLM_PROVIDER_CONFIGURATIONS).find(
+            {}, {"_id": 0, "name": 1, "plugin": 1, "active": 1, "sslValidation": 1,
+                 "parameters.model": 1, "parameters.agentic_effort_calibration": 1}
+        )
+    )
+    active = next((p for p in providers if p.get("active")), None)
+    usage = _ai_usage_stats()
+    feedback = _ai_feedback_stats()
+    journeys = _ai_journey_stats()
+    findings = _ai_findings_stats()
+
+    def _sev(status: str) -> dict:
+        pairs = findings["byStatusSeverity"]
+        return {
+            "warn": pairs.get((status, "warn"), 0),
+            "error": pairs.get((status, "error"), 0),
+        }
+
+    open_by_kind = findings["openByKind"]
+    acked_by_kind = findings["ackedByKind"]
+    # Share of a rule's findings that were muted rather than resolved: a high rate marks
+    # the rule as a false-positive generator.
+    mute_rate = {
+        kind: _ai_rate(acked_by_kind.get(kind, 0),
+                       open_by_kind.get(kind, 0) + acked_by_kind.get(kind, 0))
+        for kind in sorted(set(open_by_kind) | set(acked_by_kind))
+    }
+
+    journey_total = journeys.get("total", 0)
+    thumbs_up = feedback["up"]
+    thumbs_down = feedback["down"]
+    copilot_turns = usage.get(AIFeature.CONFIGURATION_COPILOT.value, {}).get("turns", 0)
+    sessions = connector.collection(Collections.COPILOT_SESSIONS).count_documents({})
+
+    return {
+        "provider": {
+            "configured": len(providers),
+            "activeName": active.get("name") if active else None,
+            "activePlugin": active.get("plugin") if active else None,
+            "providerType": plugin_id_to_provider(active.get("plugin", "")).value if active else None,
+            "model": (active.get("parameters") or {}).get("model") if active else None,
+            "effort": (active.get("parameters") or {}).get("agentic_effort_calibration") if active else None,
+            "sslValidation": active.get("sslValidation") if active else None,
+        },
+        # Every counter below is bounded by these windows — a total is "since the oldest
+        # surviving record", never lifetime.
+        "retention": {
+            "aiStatsCleanupDays": settings.get("aiStatsCleanup", 365),
+            "aiDataCleanupDays": settings.get("aiDataCleanup", 90),
+        },
+        "collectionSizes": {
+            "aiUsageMetrics": connector.collection(Collections.AI_USAGE_METRICS).count_documents({}),
+            "copilotSessions": sessions,
+            "copilotTurns": connector.collection(Collections.COPILOT_TURNS).count_documents({}),
+            "copilotFindings": connector.collection(Collections.COPILOT_FINDINGS).count_documents({}),
+        },
+        "sessions": sessions,
+        "turnsPerSession": round(copilot_turns / sessions, 2) if sessions else None,
+        "features": {
+            "postureAssessment": _ai_feature_report(
+                usage.get(AIFeature.POSTURE_ASSESSMENT.value, {})
+            ),
+            "copilot": _ai_feature_report(
+                usage.get(AIFeature.CONFIGURATION_COPILOT.value, {}), kb=True
+            ),
+            "automapper": _ai_feature_report(
+                usage.get(AI_FEATURE_AUTOMAPPER, {}), cancellable=False
+            ),
+        },
+        "feedback": {
+            "thumbsUp": thumbs_up,
+            "thumbsDown": thumbs_down,
+            "satisfactionPct": _ai_rate(thumbs_up, thumbs_up + thumbs_down),
+            "responseRatePct": _ai_rate(thumbs_up + thumbs_down, copilot_turns),
+            # Exact counts here, unlike the /15 shares the User-Agent payload is forced into.
+            "downReasons": dict(feedback["reasons"]),
+            "downNoReasonGiven": thumbs_down - sum(feedback["reasons"].values()),
+        },
+        "journeys": {
+            "total": journey_total,
+            "withProgress": journeys.get("withProgress", 0),
+            "fromPlaybook": journeys.get("playbook", 0),
+            "freeForm": journey_total - journeys.get("playbook", 0),
+            "engagementRatePct": _ai_rate(journeys.get("withProgress", 0), journey_total),
+            "playbookRatePct": _ai_rate(journeys.get("playbook", 0), journey_total),
+        },
+        "findings": {
+            "open": _sev("open"),
+            "acknowledged": _sev("acknowledged"),
+            "autoResolved": _sev("auto_resolved"),
+            "problematicModules": findings["problematicModules"],
+            "openByKind": dict(sorted(open_by_kind.items())),
+            "acknowledgedByKind": dict(sorted(acked_by_kind.items())),
+            "muteRatePctByKind": mute_rate,
+        },
+        "automapperSuggestedFields": _ai_automapper_suggested_fields(),
+        "environment": {
+            "AI_COPILOT_VERBOSITY": os.getenv("AI_COPILOT_VERBOSITY", "concise"),
+            "AI_COPILOT_GATEWAY": os.getenv("AI_COPILOT_GATEWAY", "v1"),
+            "AI_COPILOT_STREAM_STEPS": os.getenv("AI_COPILOT_STREAM_STEPS", "true"),
+            "CE_ATTENTION_SCAN_DISABLED": os.getenv("CE_ATTENTION_SCAN_DISABLED", ""),
+            # Registration is conditional on a provider existing, so its absence
+            # explains an empty findings feed.
+            "attentionScanScheduled": connector.collection(Collections.SCHEDULES).count_documents(
+                {"name": "INTERNAL COPILOT ATTENTION SCAN"}, limit=1
+            ) > 0,
+        },
+    }
+
+
 def truncate_plugins_data(analytics: str, analytics_raw: dict):
     """Truncate plugins data."""
     plugins_truncated = False
@@ -695,6 +1530,27 @@ def collect_analytics_details() -> dict:
                 )
 
             analytics_data_dict[analytics_type] = analytics_data
+
+        # AI Copilot analytics. Adding it to analytics_data_dict is all that is needed to
+        # both SEND it (share_analytics_in_user_agent loops this dict, one request per
+        # type) and PERSIST it (the settings write below), exactly like every other type.
+        # It needs no truncate_plugins_data pass — it carries no plugin list, and its one
+        # variable-width part (the per-provider blocks in segment P) is already capped.
+        ai_analytics = get_ai_details()
+        if ai_analytics:
+            analytics_data_dict["ai"] = ai_analytics
+            logger.debug(
+                "AI Copilot analytics collected.",
+                details=(
+                    f"raw={ai_analytics} "
+                    f"length={len(create_user_agent(ai_analytics))}/{MAX_ANALYTICS_LENGTH} "
+                    f"segments={ai_analytics.split('-')}"
+                ),
+            )
+        else:
+            logger.debug(
+                "AI Copilot analytics skipped: no LLM provider has ever been configured."
+            )
 
         connector.collection(Collections.SETTINGS).update_one(
             {}, {"$set": {"analytics": analytics_data_dict}}
@@ -974,8 +1830,14 @@ def pull_cloud_exchange_banners():
                 },
                 upsert=True,
             )
+        # The AI-provider banner is an internally-managed is_promotion banner (NOT sourced from
+        # GitHub). Keep it out of this delete so the sync doesn't drop it and reset its
+        # `acknowledged` state — its lifecycle is owned by ensure_ai_provider_banner.
         connector.collection(Collections.NOTIFICATIONS).delete_many(
-            {"is_promotion": True, "id": {"$nin": list_of_banner_ids}}
+            {
+                "is_promotion": True,
+                "id": {"$nin": list_of_banner_ids},
+            }
         )
     except Exception as e:
         logger.debug(f"Unable to pull promotion banners from Github: {e}")
@@ -990,5 +1852,12 @@ def share_usage_analytics():
         dict: Dictionary with success result.
     """
     pull_cloud_exchange_banners()
+    # Periodic backstop for the "configure an AI provider" banner: seeds it on an unconfigured
+    # deployment where the migration/CRUD hooks didn't (e.g. a deployment already past the
+    # 7.0.0-beta.1 migration). No-ops when a provider exists or the banner already exists, so it
+    # never resets a user's acknowledgement. Provider CRUD is the immediate path; this is the
+    # 24h safety net. Same standard banner pipeline.
+    from netskope.common.utils.notifier import ensure_ai_provider_banner
+    ensure_ai_provider_banner()
     check_certs_validity()
     return {"success": True}

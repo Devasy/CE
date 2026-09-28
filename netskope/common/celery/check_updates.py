@@ -76,6 +76,7 @@ def check_beta_plugin_upgrades() -> None:
                     Collections.CREV2_CONFIGURATIONS,
                     Collections.EDM_CONFIGURATIONS,
                     Collections.CFC_CONFIGURATIONS,
+                    Collections.LLM_PROVIDER_CONFIGURATIONS,
                 ]
                 for collection in config_collections:
                     plugins = db_connector.collection(collection).find({})
