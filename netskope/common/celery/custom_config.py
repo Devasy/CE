@@ -12,6 +12,11 @@ from netskope.common.utils import Logger
 
 logger = Logger()
 
+# Orbia case 601 (March mechanism): gate the prefetch=0 clamp and the
+# autoscaler empty-pool fix behind an env flag. Off by default — normal
+# customers get today's behavior unchanged.
+CE_ENABLE_PREFETCH_GUARD = os.environ.get("CE_ENABLE_PREFETCH_GUARD", "false").lower() == "true"
+
 
 GLOBAL_MAX_CONCURRENCY = int(
     os.environ.get("WORKER_CONCURRENCY")
@@ -46,15 +51,54 @@ class NoChannelGlobalQoS(bootsteps.StartStopStep):
         """Start step."""
         qos_global = False
 
-        c.connection.default_channel.basic_qos(0, c.initial_prefetch_count, qos_global)
+        initial_prefetch_count = c.initial_prefetch_count
+        if CE_ENABLE_PREFETCH_GUARD:
+            logger.debug(
+                f"NoChannelGlobalQoS starting: worker={getattr(c, 'hostname', 'unknown')}, "
+                f"initial_prefetch_count={c.initial_prefetch_count}, global_qos={qos_global}"
+            )
+            if c.initial_prefetch_count == 0:
+                logger.warn(
+                    f"NoChannelGlobalQoS: initial prefetch_count is 0 (unlimited). "
+                    f"Worker {getattr(c, 'hostname', 'unknown')} may drain the entire queue, "
+                    f"starving consumers on other cluster nodes and stalling low-priority task "
+                    f"distribution. Clamping to 1.",
+                )
+            # Never allow prefetch_count=0: in AMQP semantics 0 means UNLIMITED,
+            # letting one worker drain the whole queue after a reconnect.
+            # Floor of 1 keeps QoS enforced at all times.
+            initial_prefetch_count = max(1, c.initial_prefetch_count)
+
+        c.connection.default_channel.basic_qos(0, initial_prefetch_count, qos_global)
+        if CE_ENABLE_PREFETCH_GUARD:
+            logger.debug(
+                f"basic_qos applied: prefetch_size=0, prefetch_count={initial_prefetch_count}, "
+                f"global={qos_global} (global QoS disabled for quorum queue compatibility)"
+            )
 
         def set_prefetch_count(prefetch_count):
+            if CE_ENABLE_PREFETCH_GUARD:
+                logger.debug(
+                    f"set_prefetch_count: prefetch_count={prefetch_count}, apply_global={qos_global}, "
+                    f"worker={getattr(c, 'hostname', 'unknown')}"
+                )
+                if prefetch_count == 0:
+                    logger.warn(
+                        f"set_prefetch_count: prefetch_count requested as 0 (unlimited) on "
+                        f"worker={getattr(c, 'hostname', 'unknown')}. "
+                        f"With global_qos={qos_global}, this worker could consume all pending messages "
+                        f"from the queue, blocking low-priority task delivery across the cluster. "
+                        f"Clamping to 1."
+                    )
+                    prefetch_count = 1
             return c.task_consumer.qos(
                 prefetch_count=prefetch_count,
                 apply_global=qos_global,
             )
 
-        c.qos = QoS(set_prefetch_count, c.initial_prefetch_count)
+        c.qos = QoS(set_prefetch_count, initial_prefetch_count)
+        if CE_ENABLE_PREFETCH_GUARD:
+            logger.debug(f"setting prefetch count to: {initial_prefetch_count}")
 
 
 class CustomScaler(Autoscaler):
@@ -72,6 +116,19 @@ class CustomScaler(Autoscaler):
 
     def _shrink(self, n):
         logger.debug(f"Scaling down {n} processes for {self.worker}.")
+        if CE_ENABLE_PREFETCH_GUARD and self.processes == 0:
+            # Nothing to shrink at all — distinct from "all N processes are
+            # busy". pool.shrink() raises the identical ValueError for both
+            # cases (billiard's shrink() iterates _iterinactive() and raises
+            # only when it yields nothing, whether that's because there are
+            # 0 workers or because all existing workers are active) — so
+            # this has to be checked before calling it, not inferred from
+            # the exception. Distinguished here only for a clearer log; the
+            # caller (reduce_count) treats both failures identically.
+            logger.debug(
+                f"{self.worker}: Autoscaler won't scale down: pool has 0 processes."
+            )
+            return False
         try:
             self.pool.shrink(n)
             self.pool.maintain_pool()
@@ -91,6 +148,32 @@ class CustomScaler(Autoscaler):
             """Shrink one worker at a time to reduce the possibility of failures due to running workers."""
             while decrease > 0:
                 if not self._shrink(1):
+                    if CE_ENABLE_PREFETCH_GUARD and self.processes == 0:
+                        # The pool is genuinely empty — there is no process
+                        # left to ever satisfy this instruction, so retrying
+                        # it every cycle can only wait forever. Previously
+                        # this case left the stale instruction in
+                        # running_data[REDUCE_PROCESS] untouched permanently
+                        # — every future maybe_scale() call would re-enter
+                        # reduce_count() instead of find_and_adjust(),
+                        # locking this worker out of ever growing again even
+                        # once the instruction was no longer valid.
+                        #
+                        # Drop the whole stale instruction in one pass
+                        # rather than shrinking it by 1 per poll cycle. Do
+                        # NOT fake a successful shrink to get the same
+                        # effect — no process was actually removed, so
+                        # pretending otherwise would drive
+                        # running_data[self.worker_name] negative in the
+                        # persisted state file, corrupting total_running for
+                        # every worker's GLOBAL_MAX_CONCURRENCY check.
+                        #
+                        # If processes > 0 (all busy, not empty), leave the
+                        # instruction in place: those workers may finish
+                        # their current task at any moment, at which point a
+                        # future _shrink(1) can genuinely succeed.
+                        running_data[REDUCE_PROCESS].pop(self.worker_name, None)
+                        logger.debug(f"CE Health: Resets reduce process count for worker {self.worker_name}")
                     return
                 # Shrink is successful, reduce the counts for running workers and instructions.
                 running_data.update(

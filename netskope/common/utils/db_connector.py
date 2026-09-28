@@ -77,6 +77,23 @@ class Collections(str, Enum):
     CREV2_ENTITY_PREFIX = "crev2_entity_"
     CREV2_ACTION_LOGS = "crev2_action_logs"
 
+    UNIFIED_MAPPING = "unified_mapping"
+    UNIFIED_MAPPING_RULES = "unified_mapping_rules"
+    UNIFIED_MAPPING_MARKERS = "unified_mapping_markers"
+    LLM_PROVIDER_CONFIGURATIONS = "llm_provider_configurations"
+
+    AI_USAGE_METRICS = "ai_usage_metrics"
+
+    COPILOT_SESSIONS = "copilot_sessions"
+
+    # Per-turn outcome records (running|ok|error|interrupted) so a dropped SSE stream can be
+    # recovered by polling GET /copilot/config/sessions/{id}/turns/{messageId} (plan v5 §8).
+    COPILOT_TURNS = "copilot_turns"
+
+    # Proactive "Needs attention" findings, written by the programmatic attention_scan task
+    # (no LLM) and served at GET /copilot/attention (plan v5 §6).
+    COPILOT_FINDINGS = "copilot_findings"
+
 
 class CustomCollection:
     """Custom collection with retry mechanism."""

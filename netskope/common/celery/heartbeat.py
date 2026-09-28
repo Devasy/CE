@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 
 import requests
-from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from requests.packages.urllib3.util.retry import Retry
 
@@ -27,6 +26,7 @@ from netskope.common.utils.handle_exception import (
     handle_status_code,
 )
 from netskope.common.utils.rabbitmq_helper import make_rabbitmq_api_call
+from netskope.common.utils.requests_retry_mount import _GuardOnlyHTTPAdapter
 from netskope.common.utils.service_health_check import (
     check_mongodb_service,
     check_rabbitmq_service,
@@ -174,8 +174,8 @@ def make_management_server_call(
 
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=0.1)
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    session.mount("http://", HTTPAdapter(max_retries=retries))  # NOSONAR
+    session.mount("https://", _GuardOnlyHTTPAdapter(max_retries=retries))
+    session.mount("http://", _GuardOnlyHTTPAdapter(max_retries=retries))  # NOSONAR
 
     success, response = handle_exception(
         session.get,

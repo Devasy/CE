@@ -1,3 +1,22 @@
+# 1.7.0 (Requires minimum Cloud Exchange version 7.0.0)
+## Changed
+- Pulled alerts and events are now tagged with the format they were serialized in, so Cloud Exchange parses each batch by its declared format instead of inferring it from the content.
+## Fixed
+- Fixed CSV responses being treated as JSON when the tenant returns a Content-Type with a charset parameter (for example "text/csv; charset=utf-8").
+
+
+# 1.6.2 (Requires minimum Cloud Exchange version 6.1.0)
+## Changed
+- Updated the pull retry mechanism with a unified in-pull exponential backoff engine, replacing the legacy retry decorator for more reliable handling of transient failures. Retries are now strictly bounded by pull windows (or 1 hour for historical pulls).
+- Added recovery for interrupted data streams (including automatic Dataexport resend support) while immediately failing only on authentication/permission errors (401/403).
+## Fixed
+- Fixed historical pulls so that an explicit empty sub-type selection pulls nothing instead of falling back to the tenant-wide sub-type union.
+
+# 1.6.1 (Requires minimum Cloud Exchange version 6.1.0)
+## Added
+- Added coordinated cleanup of the shared client status iterator so it is removed only once no Netskope plugin (CRE or CLS) is using it.
+- Type cast large ID fields to String to avoid UI rounding them off while rendering.
+
 # 1.6.0
 ## Fixed
 - Updated the historical pull logic to ensure that valid events within the requested time range from the last batch are processed.

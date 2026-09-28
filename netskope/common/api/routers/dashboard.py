@@ -16,7 +16,8 @@ from netskope.common.api.routers.auth import get_current_user
 from netskope.common.models import User
 from netskope.common.utils import Collections, DBConnector, Logger
 from netskope.common.utils.db_connector import check_mongo_service, mongo_connection
-from netskope.common.utils.rabbitmq_helper import make_rabbitmq_api_call
+from netskope.common.utils.deployment import deployment_details
+from netskope.common.utils.rabbitmq_helper import get_ce_queue_stats
 
 
 logger = Logger()
@@ -83,13 +84,16 @@ def get_status(
             ] = "Error occurred while connecting to mongodb."
 
     try:
-        queue_stats = make_rabbitmq_api_call(
-            "/api/queues/%2F/?page=1&page_size=500&name=cloudexchange_%5B369%5D&"
-            "columns=messages_unacknowledged,messages_ready,message_bytes_unacknowledged,message_bytes_ready"
-            ",name,leader,members,messages,state,memory&use_regex=true"
-        )
+        # Shared CE-queue query (rabbitmq_helper.get_ce_queue_stats) — one source of truth for the
+        # endpoint + queue-name filter, also used by the copilot attention scan. We request the
+        # richer column set the dashboard renders.
+        queue_items = get_ce_queue_stats([
+            "messages_unacknowledged", "messages_ready",
+            "message_bytes_unacknowledged", "message_bytes_ready",
+            "leader", "members", "messages", "state", "memory",
+        ])
         status_list["rabbitmq"]["queues"] = []
-        for instance in queue_stats.get("items", []):
+        for instance in queue_items:
             status_list["rabbitmq"]["queues"].append(
                 {
                     "name": instance.get("name", "unknown"),
@@ -192,12 +196,12 @@ def get_system_stats(
             connector.collection(Collections.CLUSTER_HEALTH).aggregate(pipeline)
         )
         datapoints.reverse()  # oldest first order.
+        from netskope.common.utils.attention_rules import aware_utc
         for datapoint in datapoints:
             timestamp = datapoint.get("check_time")
-            if timestamp is None:
-                timestamp = datetime.now(UTC)
-            elif timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=UTC)
+            # Shared aware_utc coercion (also converts a non-UTC aware value, which the old
+            # naive-only guard did not); None → now.
+            timestamp = datetime.now(UTC) if timestamp is None else aware_utc(timestamp)
 
             system_stats = datapoint.get("systemStats", {})
             if not system_stats or (not isinstance(system_stats, dict)):
@@ -278,15 +282,4 @@ def get_ce_details(
     Returns:
         dict: Cloud Exchange deployment details.
     """
-    return {
-        "Platform Provider": os.environ.get("PLATFORM_PROVIDER", "custom")
-        .strip()
-        .strip('"'),
-        "Host OS": os.environ.get("HOST_OS", "Unknown").strip().strip('"'),
-        "Deployment Type": "HA" if os.environ.get("HA_IP_LIST") else "Standalone",
-        "Flavor": (
-            "VM"
-            if os.environ.get("CE_AS_VM", "False").strip().strip('"').lower() == "true"
-            else "Container"
-        ),
-    }
+    return deployment_details()

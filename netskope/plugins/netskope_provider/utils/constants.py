@@ -36,8 +36,7 @@ from netskope_api.iterator.const import Const
 import os
 
 MODULE_NAME = "TENANT"
-PLUGIN_VERSION = "1.6.0"
-MAXIMUM_CE_VERSION = "5.1.2"
+PLUGIN_VERSION = "1.7.0"
 PLATFORM_NAME = "Netskope"
 MAX_API_CALLS = 4
 DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -85,20 +84,77 @@ TIMESTAMP_HWM_PATTERN = rb"\"timestamp_hwm\"\s*:\s*(\d+)"
 WAIT_TIME_PATTERN = rb"\"wait_time\"\s*:\s*(\d+)"
 ID_PATTERN = rb'\"_id"\s*:'
 RESULT = "result"
+DATA_FORMAT_JSON = "json"
+DATA_FORMAT_CSV = "csv"
+CONTENT_TYPE_CSV = "text/csv"
 TIMESTAMP_HWM = "timestamp_hwm"
 QUEUE_SIZE = 10
 DEFAULT_WAIT_TIME = 30
-EXPONENTIAL_WAIT_TIME = 180
 WAIT_TIME = "wait_time"
-DEFAULT_RETRY_COUNT = 3
-RETRY_COUNT_FOR_PULLING = os.environ.get("RETRY_COUNT_FOR_PULLING")
-if isinstance(RETRY_COUNT_FOR_PULLING, str) and RETRY_COUNT_FOR_PULLING.isnumeric():
-    RETRY_COUNT_FOR_PULLING = int(RETRY_COUNT_FOR_PULLING)
-    if RETRY_COUNT_FOR_PULLING < 1:
-        RETRY_COUNT_FOR_PULLING = DEFAULT_RETRY_COUNT
-else:
-    RETRY_COUNT_FOR_PULLING = DEFAULT_RETRY_COUNT
-STRING_FIELDS = ['dlp_incident_id', 'connection_id', 'app_session_id', 'dlp_parent_id', 'browser_session_id']
+
+
+def _get_env_int(name, default, minimum=1):
+    """Read a positive integer override from the environment."""
+    value = os.environ.get(name)
+    if isinstance(value, str) and value.isnumeric() and int(value) >= minimum:
+        return int(value)
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Unified pull retry mechanism (see iterator_helper.PullRetryController).
+#
+# Every transient failure while pulling is retried in place with exponential
+# backoff: delays grow 30s -> 60s -> 120s -> 240s -> 480s (~15 min), then
+# stay flat at 15 min. Two bounds stop the retries:
+#   * maintenance pulling never retries past its scheduled pull window
+#     (MAINTENANCE_PULL_WINDOW_SECONDS after the task started);
+#   * any pull retries a single failure episode for at most
+#     BACKOFF_MAX_TOTAL seconds (this is the only bound for the one-shot
+#     historical pulls).
+#
+# Retry policy: retry EVERY HTTP error status except authentication (401)
+# and permission (403) failures, plus every network/stream/unexpected
+# exception. 401/403 are the only non-retryable statuses -- repeating the
+# request cannot succeed until the token or its scopes are fixed, and they
+# keep their banner/storage side effects. Every other 4xx and 5xx (including
+# 400/404 and 501/505) is retried within the bounds above; a request that
+# truly cannot succeed simply exhausts the episode budget and reports an
+# actionable failure.
+# ---------------------------------------------------------------------------
+NON_RETRYABLE_HTTP_STATUS_CODES = {401, 403}
+RETRYABLE_HTTP_STATUS_CODES = (
+    set(range(400, 600)) - NON_RETRYABLE_HTTP_STATUS_CODES
+)
+BACKOFF_INITIAL_DELAY = _get_env_int("PULL_BACKOFF_INITIAL_DELAY", 30)
+BACKOFF_FACTOR = 2
+BACKOFF_MAX_DELAY = _get_env_int("PULL_BACKOFF_MAX_DELAY", 900)
+# Upper bound of a single failure episode; the only bound for historical.
+BACKOFF_MAX_TOTAL = _get_env_int("PULL_BACKOFF_MAX_TOTAL", 3600)
+BACKOFF_JITTER_RATIO = 0.1
+BACKOFF_SLEEP_TICK = 30
+# Scheduled length of one maintenance pull cycle: load() stops pulling and
+# pull() stops retrying once this much time has passed since the cycle
+# started. The env override exists for testing only.
+MAINTENANCE_PULL_WINDOW_SECONDS = _get_env_int(
+    "PULL_MAINTENANCE_WINDOW_SECONDS", 3600
+)
+# ID fields converted to string so large 64-bit identifiers keep their
+# precision downstream (see alert_id_fields_syslog_mapping.md). A set is used
+# for O(1) membership checks since this lookup runs for every field on every
+# log record.
+ID_STRING_FIELDS = {
+    "app_session_id",
+    "browser_session_id",
+    "connection_id",
+    "dlp_incident_id",
+    "dlp_parent_id",
+    "incident_id",
+    "latest_incident_id",
+    "request_id",
+    "signature_id",
+    "transaction_id",
+}
 DLP_INCIDENT_FORENSICS_ENDPOINT = "{base_url}/api/v2/incidents/dlpincidents/{dlp_incident_id}/forensics"
 DLP_INCIDENT_ORIGINAL_FILE_ENDPOINT = "{base_url}/api/v2/incidents/dlpincidents/{dlp_incident_id}/originalfile"
 DLP_INCIDENT_SUB_FILE_ENDPOINT = "{base_url}/api/v2/incidents/dlpincidents/{dlp_incident_id}/subfile"
@@ -106,3 +162,113 @@ DLP_INCIDENT_SUB_FILE_ENDPOINT = "{base_url}/api/v2/incidents/dlpincidents/{dlp_
 RATELIMIT_REMAINING = "ratelimit-remaining"
 # Rate limit RESET value is in seconds
 RATELIMIT_RESET = "ratelimit-reset"
+
+ALERT_EVENT_ID_FIELD_MAPPING = {
+    "alert": {
+        "c2": [
+            "signature_id",
+            "transaction_id"
+        ],
+        "content": [
+            "dlp_incident_id",
+            "incident_id"
+        ],
+        "ctep": [
+            "signature_id",
+            "transaction_id"
+        ],
+        "dlp": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "dlp_incident_id",
+            "dlp_parent_id",
+            "incident_id",
+            "request_id",
+            "transaction_id"
+        ],
+        "ips": [
+            "signature_id",
+            "transaction_id"
+        ],
+        "malsite": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "incident_id",
+            "request_id",
+            "transaction_id"
+        ],
+        "malware": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "incident_id",
+            "request_id",
+            "transaction_id"
+        ],
+        "policy": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "incident_id",
+            "request_id",
+            "transaction_id"
+        ],
+        "remediation": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "incident_id",
+            "request_id",
+            "transaction_id"
+        ],
+        "uba": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "incident_id",
+            "request_id",
+            "transaction_id"
+        ],
+        "watchlist": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "dlp_incident_id",
+            "dlp_parent_id",
+            "incident_id",
+            "request_id",
+            "transaction_id"
+        ]
+    },
+    "event": {
+        "application": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "dlp_incident_id",
+            "dlp_parent_id",
+            "request_id",
+            "transaction_id"
+        ],
+        "endpoint": [
+            "dlp_incident_id",
+            "incident_id"
+        ],
+        "incident": [
+            "app_session_id",
+            "connection_id",
+            "dlp_incident_id",
+            "dlp_parent_id",
+            "latest_incident_id"
+        ],
+        "page": [
+            "app_session_id",
+            "browser_session_id",
+            "connection_id",
+            "request_id",
+            "transaction_id"
+        ]
+    }
+}

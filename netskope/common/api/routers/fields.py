@@ -56,6 +56,7 @@ async def get_subtypes(
             sub_type_result["events"].update(sub_type_obj.get("events", {}))
         except AttributeError:
             pass
+
     event_sub_type_reverse_map = {
         value: key for key, value in sub_type_result["events"].items()
     }

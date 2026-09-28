@@ -145,3 +145,49 @@ class Logger(metaclass=Singleton):
 
         if details and "SoftTimeLimitExceeded" in details:
             raise SoftTimeLimitExceeded()
+
+
+class PrefixedLogger:
+    """Thin proxy over the shared Logger that tags every message with a prefix.
+
+    Use it as a subsystem's logger so its logs are easy to find/filter, e.g.
+    ``logger = PrefixedLogger("[AI-COPILOT]")`` makes every message render as
+    ``[AI-COPILOT]: <message>``. Mirrors Logger's info/debug/warn/error signatures;
+    only the message is prefixed (error_code/details/resolution pass through). Any
+    other Logger attribute is forwarded unchanged.
+    """
+
+    def __init__(self, prefix: str):
+        """Initialize the PrefixedLogger.
+
+        Args:
+            prefix (str): prefix for every log type.
+        """
+        self._prefix = prefix
+        self._logger = Logger()
+
+    def _msg(self, message: str) -> str:
+        return f"{self._prefix}: {message}"
+
+    def info(self, message: str, error_code: str = None, details: str = None, resolution: str = None):
+        """Log an info message with the prefix applied."""
+        self._logger.info(self._msg(message), error_code=error_code, details=details, resolution=resolution)
+
+    def debug(self, message: str, error_code: str = None, details: str = None, resolution: str = None):
+        """Log a debug message with the prefix applied."""
+        self._logger.debug(self._msg(message), error_code=error_code, details=details, resolution=resolution)
+
+    def warn(self, message: str, error_code: str = None, details: str = None, resolution: str = None):
+        """Log a warning message with the prefix applied."""
+        self._logger.warn(self._msg(message), error_code=error_code, details=details, resolution=resolution)
+
+    def error(self, message: str, error_code: str = None, details: str = None, resolution: str = None):
+        """Log an error message with the prefix applied."""
+        self._logger.error(self._msg(message), error_code=error_code, details=details, resolution=resolution)
+
+    def __getattr__(self, name):
+        """Forward any non-overridden attribute (e.g. update_level) to the Logger."""
+        # Guard private names so a missing self._logger can't recurse here.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._logger, name)

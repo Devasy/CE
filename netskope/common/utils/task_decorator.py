@@ -13,7 +13,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from netskope.common.models.other import StatusType
 from . import DBConnector, Collections, Logger
-from netskope.common.utils.requests_retry_mount import override_session_init
+from netskope.common.utils.requests_retry_mount import _patched_session_init
 from .const import SOCKET_DEFAULT_TIMEOUT
 
 try:
@@ -67,11 +67,56 @@ def log_mem(msg="", details=None):
     logger.debug(f"PID: {pid}, USS: {uss:.2f}, RSS: {rss:.2f}, PSS: {pss:.2f} {msg}", details=details)
 
 
-def get_lock_params(schedule_entry_args: list, schedule_entry_kwargs: dict):
+# Collections storing a per-op lock sub-document (lockedAt.pull/.sync/...), mapped to
+# the field each task must write. A message queued before the lock was split carries
+# frozen kwargs naming the bare "lockedAt", which would $set over the whole
+# sub-document and leave the configuration unmanageable. CLS/CRE/EDM/CFC use a scalar
+# lock and are absent here. Inner keys accept a bare or dotted task name.
+DICT_LOCK_FIELDS = {
+    "configurations": {
+        "execute_plugin": "lockedAt.pull",
+        "share_indicators": "lockedAt.share",
+    },
+    "itsm_configurations": {
+        "pull_data_items": "lockedAt.pull",
+        "sync_states": "lockedAt.sync",
+        "update_incidents": "lockedAt.update",
+    },
+}
+
+
+def _reconcile_lock_field(lock_collection, lock_field, task_name):
+    """Return the lock field for the current schema, ignoring a flattened one.
+
+    Args:
+        lock_collection (str): Collection holding the lock.
+        lock_field (str): Lock field named by the schedule entry kwargs.
+        task_name (str): Task function name, or the full Celery task name.
+    """
+    if not task_name or not isinstance(lock_field, str) or "." in lock_field:
+        return lock_field
+    expected = DICT_LOCK_FIELDS.get(lock_collection, {}).get(
+        str(task_name).split(".")[-1]
+    )
+    if not expected:
+        return lock_field
+    logger.warn(
+        f"Task {task_name} was queued with the outdated lock field "
+        f"'{lock_field}'; using '{expected}' instead to avoid overwriting the "
+        f"lock sub-document of {lock_collection}."
+    )
+    return expected
+
+
+def get_lock_params(
+    schedule_entry_args: list, schedule_entry_kwargs: dict, task_name: str = None
+):
     """Get required fields from schedule entry.
 
     Args:
         schedule_entry (dict): Schedule entry
+        task_name (str): Name of the decorated task function, used to ignore a
+            flattened lock field carried by a stale queued message.
     """
     if (
         schedule_entry_kwargs is not None
@@ -81,7 +126,9 @@ def get_lock_params(schedule_entry_args: list, schedule_entry_kwargs: dict):
     ):
         lock_collection = schedule_entry_kwargs.get("lock_collection")
         unique_key = schedule_entry_kwargs.get("lock_unique_key")
-        current_lock_field = schedule_entry_kwargs.get("lock_field")
+        current_lock_field = _reconcile_lock_field(
+            lock_collection, schedule_entry_kwargs.get("lock_field"), task_name
+        )
         if not unique_key:
             query = {}
         else:
@@ -94,13 +141,54 @@ def get_lock_params(schedule_entry_args: list, schedule_entry_kwargs: dict):
     return None, None, None, None
 
 
-def release_lock(args, argv):
+def _heal_flattened_lock_containers(connector, lock_collection, query, lock_field):
+    """Rebuild lock containers that were flattened to a scalar.
+
+    Mongo cannot create a subfield inside a scalar: ``$set`` of
+    ``lockedAt.sync`` against ``{lockedAt: null}`` raises WriteError 28 and the
+    task dies before its body runs. Replacing the scalar with an empty
+    sub-document first makes the write succeed; healthy documents do not match,
+    so this is a no-op for them.
+    """
+    if not query:
+        # An unselective heal would rebuild an arbitrary document's containers.
+        # Only itsm.audit_requests locks without a unique key, and its
+        # settings.itsm container is always an object.
+        return
+    containers = ["task"]
+    if "." in str(lock_field):
+        containers.append(str(lock_field).split(".")[0])
+    # Only an existing non-object blocks the write; an absent field is fine,
+    # Mongo creates the whole path. One update per container, so a healthy
+    # document matches nothing and no write is issued.
+    for container in containers:
+        try:
+            connector.collection(lock_collection).update_one(
+                {
+                    **query,
+                    container: {"$exists": True},
+                    "$nor": [{container: {"$type": "object"}}],
+                },
+                {"$set": {container: {}}},
+            )
+        except Exception:
+            logger.warn(
+                f"Could not rebuild the '{container}' field of "
+                f"{lock_collection} before writing the task lock.",
+                details=traceback.format_exc(),
+            )
+
+
+def release_lock(args, argv, task_name=None):
     """Release lock."""
     connector = DBConnector()
-    lock_collection, lock_field, query, lock_field_change = get_lock_params(args, argv)
+    lock_collection, lock_field, query, lock_field_change = get_lock_params(
+        args, argv, task_name
+    )
     if (
         lock_collection is not None
     ):  # unlock after completion
+        _heal_flattened_lock_containers(connector, lock_collection, query, lock_field)
         connector.collection(lock_collection).update_one(
             query,
             {
@@ -118,12 +206,14 @@ def track():
 
     def decorator(func):
         def wrapper(*args, **argv):
-            requests.sessions.Session.__init__.__code__ = override_session_init.__code__
+            requests.sessions.Session.__init__ = _patched_session_init
             socket.setdefaulttimeout(SOCKET_DEFAULT_TIMEOUT)
             uid = str(uuid.uuid1())
             os.environ["CE_TASK_UID"] = uid
             log_mem(f"Method: {func.__name__}, UID: {uid}, Type: start")
-            lock_collection, lock_field, query, lock_field_change = get_lock_params(args, argv)
+            lock_collection, lock_field, query, lock_field_change = get_lock_params(
+                args, argv, func.__name__
+            )
             try:
                 is_completed = False
                 is_errored = False
@@ -131,6 +221,9 @@ def track():
                 if (
                     lock_collection is not None
                 ):
+                    _heal_flattened_lock_containers(
+                        connector, lock_collection, query, lock_field
+                    )
                     connector.collection(lock_collection).update_one(
                         query,
                         {
@@ -193,7 +286,7 @@ def track():
                 }
             finally:
                 if is_errored or is_completed:
-                    release_lock(args, argv)
+                    release_lock(args, argv, func.__name__)
 
         return wrapper
 

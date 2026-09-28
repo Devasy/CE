@@ -31,6 +31,16 @@ LOCKING_ARGS = {
         "lock_unique_key": "name",
         "lock_field": "lockedAt.share",
     },
+    "cte.um_share_indicators": {
+        "lock_collection": Collections.UNIFIED_MAPPING,
+        "lock_unique_key": "name",
+        "lock_field": "lockedAt.share",
+    },
+    "cre.um_evaluate_records": {
+        "lock_collection": Collections.UNIFIED_MAPPING,
+        "lock_unique_key": "name",
+        "lock_field": "lockedAt.actions",
+    },
     "itsm.pull_data_items": {
         "lock_collection": Collections.ITSM_CONFIGURATIONS,
         "lock_unique_key": "name",

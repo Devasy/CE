@@ -252,6 +252,13 @@ if __name__ == "__main__":
         resp = json_util.dumps(share_data, indent=2)
         print(result)
         print("\n------- Indicators Share Count With Type --------\n", resp)
+    elif collect == "ai_analytics":
+        # Same queries that build the "ai" User-Agent analytics string, but rendered at
+        # full precision with the derived fields spelled out. Counts, rates and non-secret
+        # config only — no conversation content, no credentials.
+        from netskope.common.celery.analytics import collect_ai_analytics_report
+
+        print(json_util.dumps(collect_ai_analytics_report(), indent=2))
     elif collect == "standalone_ha":
         result = ha_connection()
         print("\n------- Monitoring Diagnose --------\n")

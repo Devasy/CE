@@ -49,6 +49,7 @@ class PluginHelper(metaclass=Singleton):
             "edm": [],
             "cfc": [],
             "provider": [],
+            "llm_provider": [],
         }
         PluginBase.supported_types = {
             "cte": {

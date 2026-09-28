@@ -9,7 +9,6 @@ from netskope.common.api.routers.tenants import update_tenant
 
 if __name__ == "__main__":
     connector = DBConnector()
-    loop = asyncio.get_event_loop()
 
     # update tenants
     for tenant in connector.collection(Collections.NETSKOPE_TENANTS).find({}):
@@ -29,7 +28,7 @@ if __name__ == "__main__":
             )
 
         print(f"Updating poll interval for tenant {tenant['name']}.")
-        loop.run_until_complete(
+        asyncio.run(
             update_tenant(
                 TenantUpdate(
                     name=tenant["name"],

@@ -1,6 +1,6 @@
 """Provides logging related endpoints."""
 
-from typing import List
+from typing import List, Optional
 import tempfile
 from jsonschema import validate, ValidationError
 import json
@@ -105,6 +105,31 @@ def get_logs(filters, skip, limit, sort, ascending, download):
     )
 
 
+def resolve_log_type(doc: dict) -> Optional[str]:
+    """Resolve a log document's type.
+
+    Falls back to the legacy ``type`` field when ``ce_log_type`` is absent OR
+    stored as null (``dict.get(key, default)`` would return None in that case).
+    """
+    return doc.get("ce_log_type") or doc.get("type")
+
+
+def build_log(doc: dict) -> Log:
+    """Build a Log response model from a raw MongoDB log document."""
+    log_type = resolve_log_type(doc)
+    return Log(
+        id=str(doc["_id"]),
+        message=doc["message"],
+        createdAt=doc["createdAt"],
+        ce_log_type=log_type,
+        errorCode=doc.get("errorCode"),
+        details=doc.get("details"),
+        resolution=doc.get("resolution"),
+        # Analyzable when the log carries an error code or is an error-type log.
+        isAnalyzable=bool(doc.get("errorCode")) or log_type == "error",
+    )
+
+
 @router.get(
     "/logs/",
     response_model=List[Log],
@@ -152,12 +177,12 @@ async def read_logs(
                 (mode, temp) = tempfile.mkstemp(".txt", "ncte_")
                 nl = "\n"
                 with open(temp, "w") as temp_file:
-                    for logs_dict in logs_dict:
-                        log_type = logs_dict.get('ce_log_type', logs_dict.get('type', ''))
+                    for log_dict in logs_dict:
+                        log_type = resolve_log_type(log_dict) or ""
                         temp_file.write(
-                            f"[{logs_dict['createdAt']}Z] - [{logs_dict.get('errorCode', None)}] - "
+                            f"[{log_dict['createdAt']}Z] - [{log_dict.get('errorCode', None)}] - "
                             f"[{log_type}] "
-                            f"{logs_dict['message']}{nl}{'Resolution: ' + logs_dict.get('resolution', None) if logs_dict.get('resolution', None) else ''}{nl + 'Details: ' + nl + logs_dict.get('details', None) if logs_dict.get('details', None) else ''}\n"  # noqa
+                            f"{log_dict['message']}{nl}{'Resolution: ' + log_dict.get('resolution', None) if log_dict.get('resolution', None) else ''}{nl + 'Details: ' + nl + log_dict.get('details', None) if log_dict.get('details', None) else ''}\n"  # noqa
                         )
                 return FileResponse(
                     temp,
@@ -167,17 +192,7 @@ async def read_logs(
                 )
             else:
                 for log_dict in logs_dict:
-                    out.append(
-                        Log(
-                            id=str(log_dict["_id"]),
-                            message=log_dict["message"],
-                            createdAt=log_dict["createdAt"],
-                            ce_log_type=log_dict.get("ce_log_type", log_dict.get("type")),
-                            errorCode=log_dict.get("errorCode", None),
-                            details=log_dict.get("details", None),
-                            resolution=log_dict.get("resolution", None),
-                        )
-                    )
+                    out.append(build_log(log_dict))
                 return out
         else:
             return aggregate_logs(filters)

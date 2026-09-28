@@ -15,6 +15,17 @@ from netskope.common.utils import Logger
 
 logger = Logger()
 
+# Tasks whose configuration stores a per-op lock sub-document, mapped to the
+# lock field the current schema expects. Used to rewrite the frozen kwargs of a
+# message queued before the lock was split per operation.
+INFLIGHT_LOCK_FIELDS = {
+    "cte.execute_plugin": "lockedAt.pull",
+    "cte.share_indicators": "lockedAt.share",
+    "itsm.pull_data_items": "lockedAt.pull",
+    "itsm.sync_states": "lockedAt.sync",
+    "itsm.update_incidents": "lockedAt.update",
+}
+
 
 class CustomConsumerProducerMixin(ConsumerProducerMixin):
     """Consumer and Producer mixin."""
@@ -119,10 +130,15 @@ class CustomConsumerProducerMixin(ConsumerProducerMixin):
             kwargs = body[0]
             kwargs.insert(4, kwargs[3])
             message.headers["argsrepr"] = safe_repr(body[0])
-        if message.headers.get("task", "None") == "cte.execute_plugin":
+        # A message queued before the per-op lock split carries a frozen
+        # "lockedAt", which would $set over the whole lock sub-document.
+        expected_lock_field = INFLIGHT_LOCK_FIELDS.get(
+            message.headers.get("task", "None")
+        )
+        if expected_lock_field is not None:
             kwargs = body[1]
             if kwargs.get("lock_field") is not None:
-                kwargs["lock_field"] = "lockedAt.pull"
+                kwargs["lock_field"] = expected_lock_field
             message.headers["kwargsrepr"] = safe_repr(body[1])
 
     def handle_message(self, body, message):

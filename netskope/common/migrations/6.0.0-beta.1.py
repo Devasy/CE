@@ -22,7 +22,6 @@ from netskope.common.utils.integrations_tasks_scheduler import (
 
 connector = DBConnector()
 logger = Logger()
-loop = asyncio.get_event_loop()
 manager = RepoManager()
 
 
@@ -509,7 +508,7 @@ def update_default_cto_cleanup_query():
 if __name__ == "__main__":
     add_ce_logs_fields()
     migrate_transform_data()
-    loop.run_until_complete(migrate_cto())
+    asyncio.run(migrate_cto())
     update_cre_value_map_type()
     add_default_password_policy_to_settings()
     script_path = os.path.join(os.path.dirname(__file__), "5.1.1-dlp-beta-1.py")
@@ -523,4 +522,3 @@ if __name__ == "__main__":
     add_default_value_for_required_approval_cto()
     schedule_audit_requests_task()
     update_default_cto_cleanup_query()
-    loop.close()

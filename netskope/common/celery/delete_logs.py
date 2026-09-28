@@ -68,6 +68,7 @@ def delete_logs():
                 f"Removed {result.deleted_count} cluster health check record{'s' if result.deleted_count != 1 else ''}"
                 f" as part of the automatic cleanup."
             )
+
     except Exception:
         logger.error(
             "Error occurred while cleaning up system logs.",

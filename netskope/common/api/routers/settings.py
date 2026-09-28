@@ -1,8 +1,9 @@
 """Handles the settings related endpoints."""
 
 import os
+import traceback
 import requests
-from requests.adapters import HTTPAdapter
+from datetime import datetime
 from requests.packages.urllib3.util.retry import Retry
 from fastapi import APIRouter, Security, HTTPException, Header
 
@@ -29,7 +30,9 @@ from netskope.common.utils.integrations_tasks_scheduler import (
     schedule_or_delete_integrations_tasks,
 )
 from netskope.common.utils.proxy import get_proxy_params
+from netskope.common.utils.requests_retry_mount import _GuardOnlyHTTPAdapter
 from netskope.common.utils.settings import VALID_INTEGRATIONS_GROUPS
+from netskope.integrations.crev2.utils import THREAT_INDICATORS_ENTITY
 from netskope.common.utils.secrets_manager_schemas import (
     get_all_providers,
     get_provider_schema,
@@ -45,6 +48,404 @@ db_connector = DBConnector()
 logger = Logger()
 UI_SERVICE_NAME = os.environ.get("UI_SERVICE_NAME", "ui")
 UI_PROTOCOL = os.environ.get("UI_PROTOCOL", "http")
+
+
+def disable_cre_entity_business_rules():
+    """Mute and lock every CTE business rule that uses a CRE entity.
+
+    Called when the CRE module is being disabled. Each affected rule is muted
+    (so it stops sharing) and marked ``disabledByCre`` (so it can't be edited,
+    muted/unmuted, synced or deleted). The rule's prior mute state is snapshotted
+    into ``creMuteSnapshot`` so it can be restored when CRE is re-enabled.
+    """
+    result = db_connector.collection(Collections.CTE_BUSINESS_RULES).update_many(
+        {
+            "entity": {"$nin": [None, THREAT_INDICATORS_ENTITY]},
+            "disabledByCre": {"$ne": True},
+        },
+        [
+            {
+                "$set": {
+                    # Snapshot the prior mute state before overwriting it. Within a
+                    # single $set stage all expressions read the pre-update
+                    # document, so "$muted"/"$unmuteAt" capture the old values.
+                    "creMuteSnapshot": {
+                        "muted": {"$ifNull": ["$muted", False]},
+                        "unmuteAt": "$unmuteAt",
+                    },
+                    "disabledByCre": True,
+                    "muted": True,
+                    "unmuteAt": None,
+                }
+            }
+        ],
+    )
+    if result.modified_count:
+        logger.info(
+            f"Disabled {result.modified_count} CTE business rule(s) that use CRE "
+            "entities because the CRE module was disabled."
+        )
+
+
+def restore_cre_entity_business_rules():
+    """Unlock CTE business rules that were auto-disabled when CRE was turned off.
+
+    Called when the CRE module is being re-enabled. The prior mute state saved in
+    ``creMuteSnapshot`` is restored and the lock (``disabledByCre``) is cleared.
+    A snapshotted unmute time keeps running while CRE is down, so a mute whose
+    deadline already elapsed is restored as unmuted rather than as a mute waiting
+    for the next unmute sweep - matching what the rule reported while locked.
+    """
+    now = datetime.now()
+    result = db_connector.collection(Collections.CTE_BUSINESS_RULES).update_many(
+        {"disabledByCre": True},
+        [
+            {
+                "$set": {
+                    "muteExpired": {
+                        "$and": [
+                            {
+                                "$ne": [
+                                    {"$ifNull": ["$creMuteSnapshot.unmuteAt", None]},
+                                    None,
+                                ]
+                            },
+                            {"$lte": ["$creMuteSnapshot.unmuteAt", now]},
+                        ]
+                    }
+                }
+            },
+            {
+                "$set": {
+                    "muted": {
+                        "$cond": [
+                            "$muteExpired",
+                            False,
+                            {"$ifNull": ["$creMuteSnapshot.muted", False]},
+                        ]
+                    },
+                    "unmuteAt": {
+                        "$cond": [
+                            "$muteExpired",
+                            None,
+                            {"$ifNull": ["$creMuteSnapshot.unmuteAt", None]},
+                        ]
+                    },
+                    "disabledByCre": False,
+                }
+            },
+            {"$unset": ["creMuteSnapshot", "muteExpired"]},
+        ],
+    )
+    if result.modified_count:
+        logger.info(
+            f"Re-enabled {result.modified_count} CTE business rule(s) that were "
+            "disabled while the CRE module was off."
+        )
+
+
+def disable_ti_business_rules():
+    """Mute and lock every CRE business rule that uses the Threat Indicators entity.
+
+    Called when the CTE module is being disabled. Threat Indicators data is owned
+    by CTE, so these CRE rules can't function once CTE is off. Each affected rule
+    is muted (so it stops evaluating) and marked ``disabledByCte`` (so it can't be
+    edited, muted/unmuted, synced or deleted). The prior mute state is snapshotted
+    into ``cteMuteSnapshot`` so it can be restored when CTE is re-enabled.
+    """
+    result = db_connector.collection(Collections.CREV2_BUSINESS_RULES).update_many(
+        {
+            "entity": THREAT_INDICATORS_ENTITY,
+            "disabledByCte": {"$ne": True},
+        },
+        [
+            {
+                "$set": {
+                    # Snapshot the prior mute state before overwriting it. Within a
+                    # single $set stage all expressions read the pre-update
+                    # document, so "$muted"/"$unmuteAt" capture the old values.
+                    "cteMuteSnapshot": {
+                        "muted": {"$ifNull": ["$muted", False]},
+                        "unmuteAt": "$unmuteAt",
+                    },
+                    "disabledByCte": True,
+                    "muted": True,
+                    "unmuteAt": None,
+                }
+            }
+        ],
+    )
+    if result.modified_count:
+        logger.info(
+            f"Disabled {result.modified_count} CRE business rule(s) that use the "
+            "Threat Indicators entity because the CTE module was disabled."
+        )
+
+
+def restore_ti_business_rules():
+    """Unlock CRE Threat Indicators rules auto-disabled when CTE was turned off.
+
+    Called when the CTE module is being re-enabled. The prior mute state saved in
+    ``cteMuteSnapshot`` is restored and the lock (``disabledByCte``) is cleared.
+    A snapshotted unmute time keeps running while CTE is down, so a mute whose
+    deadline already elapsed is restored as unmuted rather than as a mute waiting
+    for the next unmute sweep - matching what the rule reported while locked.
+    """
+    now = datetime.now()
+    result = db_connector.collection(Collections.CREV2_BUSINESS_RULES).update_many(
+        {"disabledByCte": True},
+        [
+            {
+                "$set": {
+                    "muteExpired": {
+                        "$and": [
+                            {
+                                "$ne": [
+                                    {"$ifNull": ["$cteMuteSnapshot.unmuteAt", None]},
+                                    None,
+                                ]
+                            },
+                            {"$lte": ["$cteMuteSnapshot.unmuteAt", now]},
+                        ]
+                    }
+                }
+            },
+            {
+                "$set": {
+                    "muted": {
+                        "$cond": [
+                            "$muteExpired",
+                            False,
+                            {"$ifNull": ["$cteMuteSnapshot.muted", False]},
+                        ]
+                    },
+                    "unmuteAt": {
+                        "$cond": [
+                            "$muteExpired",
+                            None,
+                            {"$ifNull": ["$cteMuteSnapshot.unmuteAt", None]},
+                        ]
+                    },
+                    "disabledByCte": False,
+                }
+            },
+            {"$unset": ["cteMuteSnapshot", "muteExpired"]},
+        ],
+    )
+    if result.modified_count:
+        logger.info(
+            f"Re-enabled {result.modified_count} CRE business rule(s) that were "
+            "disabled while the CTE module was off."
+        )
+
+
+def _um_names_using_indicators() -> list:
+    """Names of unified mappings that join the CTE indicators collection."""
+    return [
+        doc["name"]
+        for doc in db_connector.collection(Collections.UNIFIED_MAPPING).find(
+            {
+                "$or": [
+                    {"baseTable": Collections.INDICATORS.value},
+                    {"joins.rightTable": Collections.INDICATORS.value},
+                ]
+            },
+            {"name": 1},
+        )
+    ]
+
+
+_UM_MUTE_SNAPSHOT_FIELD = "moduleMuteSnapshot"
+
+
+def _disable_um_rules(match_query: dict, own_field: str, other_field: str) -> int:
+    """Mute+lock unified mapping rules matching ``match_query``, snapshotting mute state.
+
+    Shared by the CTE- and CRE-disable directions: unlike the classic
+    per-collection locks (a CTE_BUSINESS_RULES doc only ever gets
+    ``disabledByCre``, a CREV2_BUSINESS_RULES doc only ever ``disabledByCte``),
+    a single unified mapping rule can be locked by both flags at once, so
+    ``own_field``/``other_field`` swap which is which and share one snapshot
+    field (``moduleMuteSnapshot``) — see its callers' docstrings.
+    """
+    result = db_connector.collection(Collections.UNIFIED_MAPPING_RULES).update_many(
+        {**match_query, own_field: {"$ne": True}},
+        [
+            {
+                "$set": {
+                    _UM_MUTE_SNAPSHOT_FIELD: {
+                        "$cond": [
+                            {"$eq": [f"${other_field}", True]},
+                            # Already locked by the other module — that lock's
+                            # disable call captured the true pre-lock state;
+                            # don't clobber it.
+                            f"${_UM_MUTE_SNAPSHOT_FIELD}",
+                            {
+                                "muted": {"$ifNull": ["$muted", False]},
+                                "unmuteAt": "$unmuteAt",
+                            },
+                        ]
+                    },
+                    own_field: True,
+                    "muted": True,
+                    "unmuteAt": None,
+                }
+            }
+        ],
+    )
+    return result.modified_count
+
+
+def _restore_um_rules(own_field: str, other_field: str) -> int:
+    """Unlock unified mapping rules locked by ``own_field``, restoring mute state.
+
+    If ``other_field`` is still set, the rule stays muted and the snapshot is
+    kept for that lock's own restore. Otherwise the prior mute state is
+    restored — same elapsed-mute handling as restore_ti_business_rules /
+    restore_cre_entity_business_rules: a snapshotted unmute time keeps
+    running while the module is down, so a mute whose deadline already
+    elapsed is restored as unmuted rather than as a mute waiting for the next
+    unmute sweep.
+    """
+    now = datetime.now()
+    result = db_connector.collection(Collections.UNIFIED_MAPPING_RULES).update_many(
+        {own_field: True},
+        [
+            {
+                "$set": {
+                    "muteExpired": {
+                        "$and": [
+                            {
+                                "$ne": [
+                                    {"$ifNull": [f"${_UM_MUTE_SNAPSHOT_FIELD}.unmuteAt", None]},
+                                    None,
+                                ]
+                            },
+                            {"$lte": [f"${_UM_MUTE_SNAPSHOT_FIELD}.unmuteAt", now]},
+                        ]
+                    }
+                }
+            },
+            {
+                "$set": {
+                    "muted": {
+                        "$cond": [
+                            {"$eq": [f"${other_field}", True]},
+                            True,
+                            {
+                                "$cond": [
+                                    "$muteExpired",
+                                    False,
+                                    {"$ifNull": [f"${_UM_MUTE_SNAPSHOT_FIELD}.muted", False]},
+                                ]
+                            },
+                        ]
+                    },
+                    "unmuteAt": {
+                        "$cond": [
+                            {"$eq": [f"${other_field}", True]},
+                            None,
+                            {
+                                "$cond": [
+                                    "$muteExpired",
+                                    None,
+                                    {"$ifNull": [f"${_UM_MUTE_SNAPSHOT_FIELD}.unmuteAt", None]},
+                                ]
+                            },
+                        ]
+                    },
+                    _UM_MUTE_SNAPSHOT_FIELD: {
+                        "$cond": [
+                            {"$eq": [f"${other_field}", True]},
+                            f"${_UM_MUTE_SNAPSHOT_FIELD}",
+                            "$$REMOVE",
+                        ]
+                    },
+                    own_field: False,
+                }
+            },
+            {"$unset": "muteExpired"},
+        ],
+    )
+    return result.modified_count
+
+
+def disable_ti_unified_mapping_rules():
+    """Mute and lock unified mapping rules whose mapping joins CTE indicators.
+
+    Called when the CTE module is disabled. Such a mapping/rule is already
+    hidden from the UI (list_unified_mappings/list_unified_mapping_rules), but
+    its background schedules are gated per module independently — in
+    particular ``cre.um_evaluate_records`` only checks the CRE module, so
+    without this it would keep performing CRE actions on CTE-owned rows while
+    CTE is off. Mirrors ``disable_ti_business_rules`` for classic CRE rules.
+    """
+    um_names = _um_names_using_indicators()
+    if not um_names:
+        return
+    modified = _disable_um_rules(
+        {"view": {"$in": um_names}}, "disabledByCte", "disabledByCre"
+    )
+    if modified:
+        logger.info(
+            f"[Unified Mapping]: Disabled {modified} unified mapping "
+            "business rule(s) that use Threat Exchange (Indicators) data because "
+            "the CTE module was disabled."
+        )
+
+
+def restore_ti_unified_mapping_rules():
+    """Unlock unified mapping rules auto-disabled when CTE was turned off.
+
+    Called when the CTE module is being re-enabled. See ``_restore_um_rules``
+    for the restore/elapsed-mute semantics.
+    """
+    modified = _restore_um_rules("disabledByCte", "disabledByCre")
+    if modified:
+        logger.info(
+            f"[Unified Mapping]: Re-enabled {modified} unified "
+            "mapping business rule(s) that were disabled while the CTE module "
+            "was off."
+        )
+
+
+def disable_cre_unified_mapping_rules():
+    """Mute and lock unified mapping rules whose ``cteShare`` is configured.
+
+    Called when the CRE module is disabled. Every unified mapping joins at
+    least one CRE entity collection (the indicators collection cannot join to
+    itself), so a rule's ``cteShare`` reads live CRE entity data to build the
+    indicators it pushes — same reasoning ``share_cre_entity_rules`` in
+    share_indicators.py uses for classic CRE-entity CTE business rules. Rules
+    with only ``creActions`` are left alone: ``cre.um_evaluate_records`` is
+    already gated by ``@integration("cre")`` and won't run at all.
+    """
+    modified = _disable_um_rules(
+        {"cteShare": {"$exists": True, "$nin": [None, {}]}},
+        "disabledByCre",
+        "disabledByCte",
+    )
+    if modified:
+        logger.info(
+            f"[Unified Mapping]: Disabled {modified} unified mapping "
+            "business rule(s) with CTE sharing configured because the CRE "
+            "module was disabled."
+        )
+
+
+def restore_cre_unified_mapping_rules():
+    """Unlock unified mapping rules auto-disabled when CRE was turned off.
+
+    Called when the CRE module is being re-enabled. See ``_restore_um_rules``
+    for the restore/elapsed-mute semantics.
+    """
+    modified = _restore_um_rules("disabledByCre", "disabledByCte")
+    if modified:
+        logger.info(
+            f"[Unified Mapping]: Re-enabled {modified} unified "
+            "mapping business rule(s) that were disabled while the CRE module "
+            "was off."
+        )
 
 
 @router.get(
@@ -114,6 +515,8 @@ async def read_settings(
         out["dataBatchCleanup"] = settings_out.dataBatchCleanup
         out["enableUpdateChecking"] = settings_out.enableUpdateChecking
         out["tasksCleanup"] = settings_out.tasksCleanup
+        out["aiDataCleanup"] = settings_out.aiDataCleanup
+        out["aiStatsCleanup"] = settings_out.aiStatsCleanup
         out["disk_alarm"] = settings_out.disk_alarm
         out["columns"] = settings_out.columns
         out["sslValidation"] = settings_out.sslValidation
@@ -181,8 +584,8 @@ def update_env(token, proxy):
 
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=0.1)
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    session.mount("http://", HTTPAdapter(max_retries=retries))
+    session.mount("https://", _GuardOnlyHTTPAdapter(max_retries=retries))
+    session.mount("http://", _GuardOnlyHTTPAdapter(max_retries=retries))
 
     success, response = handle_exception(
         session.put,
@@ -331,6 +734,27 @@ async def update_settings(
                     "or CE as a VM standalone and HA deployment or medium profile deployment, please switch to "
                     "containerised(Ubuntu and RHEL) standalone deployment with large profile.",
                 )
+
+        cre_being_disabled = (
+            "cre" in settings.platforms
+            and not settings.platforms["cre"]
+            and current_platforms.get("cre", False)
+        )
+        cre_being_enabled = (
+            "cre" in settings.platforms
+            and settings.platforms["cre"]
+            and not current_platforms.get("cre", False)
+        )
+        cte_being_disabled = (
+            "cte" in settings.platforms
+            and not settings.platforms["cte"]
+            and current_platforms.get("cte", False)
+        )
+        cte_being_enabled = (
+            "cte" in settings.platforms
+            and settings.platforms["cte"]
+            and not current_platforms.get("cte", False)
+        )
         message = "Module status updated."
         enabled = [p.upper() for p in settings.platforms if settings.platforms[p]]
         disabled = [p.upper() for p in settings.platforms if not settings.platforms[p]]
@@ -368,11 +792,44 @@ async def update_settings(
         set_dict["passwordPolicy"] = policy_data
 
     if set_dict != {}:
+        # secretsManagerSettings must be saved as a whole document to avoid
+        # MongoDB WriteError when the existing params field is null — dot-notation
+        # $set cannot traverse null to create sub-fields.
+        sm_settings = set_dict.pop("secretsManagerSettings", None)
+        update_doc = flatten(set_dict)
+        if sm_settings is not None:
+            update_doc["secretsManagerSettings"] = sm_settings
         db_connector.collection(Collections.SETTINGS).update_one(
-            {}, {"$set": flatten(set_dict)}
+            {}, {"$set": update_doc}
         )
 
+    # AI retention is TTL-driven; when either window changes, reconcile the AI-collection TTL
+    # indexes so the new duration takes effect within a TTL sweep (~1 min) instead of on the
+    # next migration. Best-effort (never fails the settings save); reads the just-saved doc.
+    if settings.aiDataCleanup is not None or settings.aiStatsCleanup is not None:
+        try:
+            from netskope.common.utils.ai_retention import reconcile_ai_ttls
+
+            reconcile_ai_ttls(db_connector.collection(Collections.SETTINGS).find_one({}))
+        except Exception:
+            logger.warn(
+                "Could not reconcile AI retention TTLs after settings update.",
+                details=traceback.format_exc(),
+            )
+
     if settings.platforms is not None:
+        if cre_being_disabled:
+            disable_cre_entity_business_rules()
+            disable_cre_unified_mapping_rules()
+        elif cre_being_enabled:
+            restore_cre_entity_business_rules()
+            restore_cre_unified_mapping_rules()
+        if cte_being_disabled:
+            disable_ti_business_rules()
+            disable_ti_unified_mapping_rules()
+        elif cte_being_enabled:
+            restore_ti_business_rules()
+            restore_ti_unified_mapping_rules()
         schedule_or_delete_common_pull_tasks()
         schedule_or_delete_integrations_tasks(settings)
     if settings.logLevel is not None:

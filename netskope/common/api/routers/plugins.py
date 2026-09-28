@@ -37,8 +37,21 @@ from netskope.integrations.itsm.models import (
 from netskope.integrations.itsm.routers.configurations import (
     delete_configuration as delete_itsm_configuration,
 )
+from netskope.integrations.edm.models.plugin import (
+    ConfigurationDelete as EDMConfigurationDelete,
+)
+from netskope.integrations.edm.routers.configurations import (
+    delete_configuration as delete_edm_configuration,
+)
+from netskope.integrations.cfc.models.configurations import (
+    ConfigurationDelete as CFCConfigurationDelete,
+)
+from netskope.integrations.cfc.routers.configurations import (
+    delete_configuration as delete_cfc_configuration,
+)
 
 from netskope.common.api.routers.tenants import delete_tenant
+from netskope.common.api.routers.llm_providers import delete_llm_provider_configuration
 
 from ...models import ErrorMessage, User
 from ...utils import Collections, DBConnector, Logger, PluginHelper, RepoManager
@@ -183,7 +196,7 @@ MANIFEST_SCHEMA = {
     ],
 }
 
-SCOPES_NEEDED_PROVIDER = {"cte_read", "cto_read", "cls_read", "cre_read"}
+SCOPES_NEEDED_PROVIDER = {"cte_read", "cto_read", "cls_read", "cre_read", "settings_read", "ai_read"}
 
 
 @router.get("/plugins", tags=["Plugins"])
@@ -214,6 +227,21 @@ async def list_plugins(
                 netskope_plugins.append(plugin)
             else:
                 out.append(plugin)
+        for plugin_cls in helper.plugins["llm_provider"]:
+            metadata = plugin_cls.metadata
+            plugin = {
+                "name": metadata["name"],
+                "netskope": metadata.get("netskope", False),
+                "id": plugin_cls.__module__,
+                "version": metadata["version"],
+                "configuration": metadata["configuration"],
+                "description": metadata["description"],
+                "icon": metadata["icon"],
+                "category": "LLMProvider",
+                "repo": metadata.get("repo_name"),
+                "provider_id": metadata.get("provider_id"),
+            }
+            out.append(plugin)
 
     if "cte_read" in user.scopes:
         for plugin_cls in helper.plugins["cte"]:
@@ -559,6 +587,30 @@ async def delete_plugin(
             logger.debug(f"Plugin {dir_name[3]} Deleted Successfully.")
             is_plugin_deleted = True
         elif category.lower() == "provider":
+            # Netskope tenant providers only. LLM providers are category "LLMProvider" and are
+            # handled by their own branch below — do NOT fold them back in here.
+            provider_plugin_id = dir_name[3]
+            dependent_plugins = []
+            for entry in os.scandir(custom_plugin_path):
+                if not entry.is_dir() or entry.name == provider_plugin_id or entry.name.startswith("_"):
+                    continue
+                manifest_path = os.path.join(entry.path, "manifest.json")
+                if not os.path.exists(manifest_path):
+                    continue
+                try:
+                    with open(manifest_path) as f:
+                        manifest = json.load(f)
+                    if manifest.get("provider_id") == provider_plugin_id:
+                        dependent_plugins.append(manifest.get("name", entry.name))
+                except Exception:
+                    pass
+            if dependent_plugins:
+                raise HTTPException(
+                    400,
+                    f"Cannot delete provider plugin '{provider_plugin_id}' because \
+                    the following dependent plugin(s) are present: {', '.join(dependent_plugins)}. \
+                    Delete them first.",
+                )
             tenants = db_connector.collection(Collections.NETSKOPE_TENANTS).find(
                 {"plugin": plugin_id}
             )
@@ -566,6 +618,37 @@ async def delete_plugin(
                 await delete_tenant(tenant["name"], user)
             shutil.rmtree(plugin_path)
             logger.debug(f"Provider {dir_name[3]} Deleted Successfully.")
+            is_plugin_deleted = True
+        elif category.lower() == "llmprovider":
+            configs = db_connector.collection(
+                Collections.LLM_PROVIDER_CONFIGURATIONS
+            ).find({"plugin": plugin_id})
+            for config in configs:
+                await delete_llm_provider_configuration(name=config["name"], user=user)
+            shutil.rmtree(plugin_path)
+            logger.debug(f"LLM Provider {dir_name[3]} Deleted Successfully.")
+            is_plugin_deleted = True
+        elif category.lower() == "edm":
+            plugins = db_connector.collection(Collections.EDM_CONFIGURATIONS).find(
+                {"plugin": plugin_id}
+            )
+            for plugin in plugins:
+                await delete_edm_configuration(
+                    EDMConfigurationDelete(name=plugin["name"]), user
+                )
+            shutil.rmtree(plugin_path)
+            logger.debug(f"Plugin {dir_name[3]} Deleted Successfully.")
+            is_plugin_deleted = True
+        elif category.lower() == "cfc":
+            plugins = db_connector.collection(Collections.CFC_CONFIGURATIONS).find(
+                {"plugin": plugin_id}
+            )
+            for plugin in plugins:
+                await delete_cfc_configuration(
+                    CFCConfigurationDelete(name=plugin["name"]), user
+                )
+            shutil.rmtree(plugin_path)
+            logger.debug(f"Plugin {dir_name[3]} Deleted Successfully.")
             is_plugin_deleted = True
         if is_plugin_deleted:
             helper.refresh()
