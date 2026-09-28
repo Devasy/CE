@@ -28,6 +28,19 @@ class TaskStatusFields(BaseModel):
     update: Union[bool, None] = Field(None)
 
 
+def coerce_task_fields(cls, v):
+    """Treat a flattened scalar lock/run-state field as the empty sub-document.
+
+    Pre-6.1.0 schedule kwargs named the lock field ``lockedAt`` without the
+    per-op suffix, so a redelivered task could ``$set`` over the whole
+    sub-document. A malformed bookkeeping field must not make the
+    configuration unmanageable.
+    """
+    # A flattened field can hold either the acquire-side datetime or the
+    # release-side null, so coerce any non-dict scalar -- not just null.
+    return v if isinstance(v, (dict, BaseModel)) else {}
+
+
 def validate_tenant(cls, v, values, **kwargs):
     """Make sure that the tenant exists."""
     values = values.data
@@ -154,6 +167,10 @@ class ConfigurationOut(BaseModel):
     updateIncidents: bool = Field(False)
     netskope: bool = Field(False)
 
+    _coerce_task_fields = field_validator(
+        "lastRunAt", "lastRunSuccess", mode="before"
+    )(coerce_task_fields)
+
 
 class ConfigurationDB(BaseModel):
     """Database configuration model."""
@@ -173,6 +190,10 @@ class ConfigurationDB(BaseModel):
     lastRunSuccess: TaskStatusFields = Field(TaskStatusFields())
     lockedAt: TaskFields = Field(TaskFields())
     lockedAtAudit: Union[datetime, None] = None
+
+    _coerce_task_fields = field_validator(
+        "lastRunAt", "lastRunSuccess", "lockedAt", mode="before"
+    )(coerce_task_fields)
 
 
 class ConfigurationDelete(BaseModel):

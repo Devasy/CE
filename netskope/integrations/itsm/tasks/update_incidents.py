@@ -4,6 +4,7 @@ import traceback
 from datetime import datetime
 from typing import List
 
+from pydantic import ValidationError
 from pymongo import UpdateOne
 
 from netskope.common.celery.main import APP
@@ -115,7 +116,16 @@ def update_incidents(
     )
     if configuration is None:
         return False
-    configuration = ConfigurationDB(**configuration)
+    try:
+        configuration = ConfigurationDB(**configuration)
+    except ValidationError:
+        logger.error(
+            f"Configuration {configuration_name} is stored in an invalid state. "
+            "Skipping itsm.update_incidents task until the document is repaired.",
+            details=traceback.format_exc(),
+            error_code="CTO_1051",
+        )
+        return False
     if configuration.active is False:
         return False
 

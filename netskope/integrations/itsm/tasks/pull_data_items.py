@@ -1,11 +1,12 @@
 """Provides task for pulling alerts/events."""
 
 from __future__ import absolute_import, unicode_literals
-import gzip
 import json
+import re
 from datetime import datetime, timedelta
 from typing import List, Union
 from mongoquery import Query
+from pydantic import ValidationError
 import traceback
 import threading
 from queue import Queue
@@ -13,12 +14,15 @@ import os
 from netskope.common.celery.main import APP
 from netskope.common.celery.scheduler import execute_celery_task
 from netskope.integrations.itsm.utils.custom_mapping_utils import apply_custom_mapping
-from netskope.common.models import NetskopeFieldType, TenantDB
+from netskope.common.models import FieldDataType, NetskopeFieldType, TenantDB
 from netskope.integrations.itsm.models.custom_fields import MappingDirection
 from netskope.common.utils import (
+    DATA_FORMAT_JSON,
+    compress_batch,
     DBConnector,
     Collections,
     integration,
+    Notifier,
     PluginHelper,
     Logger,
     parse_dates,
@@ -38,7 +42,12 @@ from netskope.integrations.itsm.models import (
     Event,
     DataType,
 )
-from netskope.integrations.itsm.utils.tickets import create_tickets_or_requests, data_fields, _filter_data_items
+from netskope.integrations.itsm.utils.tickets import (
+    MAIN_ATTRS,
+    create_tickets_or_requests,
+    data_fields,
+    _filter_data_items,
+)
 from netskope.integrations.itsm.utils.constants import MAX_BATCH_SIZE
 
 
@@ -47,6 +56,11 @@ logger = Logger()
 helper = PluginHelper()
 alerts_helper = AlertsHelper()
 plugin_provider_helper = PluginProviderHelper()
+notifier = Notifier()
+
+# Alert rawData keys already known to be registered in NETSKOPE_FIELDS;
+# per-worker-process cache to avoid a database lookup for every alert.
+_KNOWN_ALERT_FIELDS = set()
 
 MAX_NUM_OF_THREADS = os.environ.get("MAX_NUM_OF_THREADS_FOR_CTO", 3)
 
@@ -349,18 +363,129 @@ def _create_mappings_for_rules(rule: BusinessRuleDB, mappings):
     return mappings
 
 
+# Word boundary inside an unspaced identifier: a lowercase letter or digit
+# immediately followed by an uppercase one ("sourceConfiguration",
+# "sha256Hash").
+_CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _humanize_field_name(field: str) -> str:
+    """Build the display label for a module-generated alert field.
+
+    ``store_new_field`` derives labels with ``field.replace("_", " ").title()``.
+    ``str.title()`` lowercases everything after a word's first character, so a
+    camelCase key collapses into one word ("sourceConfiguration" ->
+    "Sourceconfiguration"). Spacing the boundaries out first avoids that.
+
+    Examples:
+        "sourceConfiguration" -> "Source Configuration"
+        "first_seen"          -> "First Seen"
+        "sha256Hash"          -> "Sha256 Hash"
+    """
+    return _CAMEL_CASE_BOUNDARY.sub(" ", field.replace("_", " ")).title()
+
+
+def _register_alert_raw_fields(data_items: List[Alert], field_labels: dict = None):
+    """Register unseen alert rawData keys in the NETSKOPE_FIELDS collection.
+
+    Fields must exist in NETSKOPE_FIELDS to be offered for queue field
+    mapping and business-rule filtering; module-generated alerts (CRE/CTE)
+    carry dynamic rawData keys that no provider plugin registers.
+
+    These are also the only camelCase field names that reach the collection —
+    provider plugins register snake_case ones, which title-case correctly on
+    their own — so their labels are corrected here rather than in the shared
+    helper every provider plugin writes through.
+
+    Args:
+        field_labels (dict): Curated {fieldName: label} map (e.g. from a CRE
+            entity's own field catalog) preferred over the generic humanized
+            label for any field name it covers.
+    """
+    field_labels = field_labels or {}
+    try:
+        for data_item in data_items:
+            for field, value in data_item.rawData.items():
+                if field in _KNOWN_ALERT_FIELDS or value in (None, ""):
+                    continue
+                # Skip rawData keys that shadow fixed top-level alert columns
+                # (id, user, app, alertType, etc.).  Those fields are already
+                # handled by MAIN_ATTRS resolution in _map_values /
+                # _substitute_vars; registering them again as rawData entries
+                # would create duplicate dropdown options and ambiguous mappings.
+                if field in MAIN_ATTRS:
+                    _KNOWN_ALERT_FIELDS.add(field)
+                    continue
+                if plugin_provider_helper.get_stored_field(field) is None:
+                    message = (
+                        f"The CE platform has detected new field '{field}' in the "
+                        f"{data_item.alertType} alert with id {data_item.id}. "
+                        "Configure CTO to use this field if you wish to map to a ticket."
+                    )
+                    logger.info(message)
+                    notifier.info(message)
+                    datatype = (
+                        FieldDataType.BOOLEAN
+                        if isinstance(value, bool)
+                        else (
+                            FieldDataType.NUMBER
+                            if isinstance(value, (int, float))
+                            else (
+                                FieldDataType.DATETIME
+                                if isinstance(value, datetime)
+                                else FieldDataType.TEXT
+                            )
+                        )
+                    )
+                    plugin_provider_helper.store_new_field(
+                        field,
+                        NetskopeFieldType.ALERT,
+                        datatype,
+                        label=(
+                            field_labels[field]
+                            if field in field_labels
+                            else (
+                                field
+                                if field.startswith("_")
+                                else _humanize_field_name(field)
+                            )
+                        ),
+                    )
+                _KNOWN_ALERT_FIELDS.add(field)
+    except Exception:
+        logger.error(
+            "Error occurred while registering alert fields.",
+            details=traceback.format_exc(),
+        )
+
+
 def _store_data_items(
     data_items: Union[List[Alert], List[Event]],
     configuration: ConfigurationDB = None,
     data_type: DataType = DataType.ALERT,
+    register_alert_fields: bool = False,
+    field_labels: dict = None,
 ):
-    """Store the alerts/events into the database."""
+    """Store the alerts/events into the database.
+
+    Args:
+        register_alert_fields (bool): Register unseen rawData keys in
+            NETSKOPE_FIELDS. Only the module-generated (CRE/CTE) alert paths set
+            this: the provider pull path already registers fields via
+            ``provider.extract_and_store_fields()`` before storing, so doing it
+            here again would be a redundant second pass over the same data.
+        field_labels (dict): Curated {fieldName: label} map preferred over
+            the generic humanized label when registering a new field. See
+            ``store_cre_alerts``.
+    """
     items = []
     storage_collection = (
         Collections.ITSM_ALERTS
         if data_type == DataType.ALERT
         else Collections.ITSM_EVENTS
     )
+    if data_type == DataType.ALERT and register_alert_fields:
+        _register_alert_raw_fields(data_items, field_labels=field_labels)
     for data_item in data_items:
         if configuration:
             data_item.configuration = configuration.name
@@ -426,20 +551,54 @@ def _sync_alerts_and_events(
     return True
 
 
+def _do_store_module_alerts(
+    alerts: List[Alert], source: str, field_labels: dict = None
+):
+    """Shared implementation: persist alerts and trigger CTO business rules."""
+    if not alerts:
+        return
+    # Module-generated alerts (CRE/CTE) carry dynamic rawData keys that no
+    # provider plugin registers, so field learning must run here. The provider
+    # pull path already registers fields before storing and must not re-run it.
+    _store_data_items(
+        alerts,
+        data_type=DataType.ALERT,
+        register_alert_fields=True,
+        field_labels=field_labels,
+    )
+    logger.info(f"Stored {len(alerts)} alerts successfully from {source}.")
+    _create_tickets(alerts, data_type=DataType.ALERT)
+
+
 @APP.task(name="itsm.store_cre_alerts")
 @integration("itsm")
 @track()
-def store_cre_alerts(alerts: List[Alert]):
-    """Store alerts and trigger business rules.
+def store_cre_alerts(
+    alerts: List[Alert], source: str = "CRE", field_labels: dict = None
+):
+    """Store CRE-generated alerts and trigger CTO business rules.
 
     Args:
         alerts (List[Alert]): List of alerts.
+        source (str): Name of the module that generated the alerts.
+        field_labels (dict): Curated {fieldName: label} map from the CRE
+            entity the alerts were generated from (see evaluate_records.py),
+            preferred over the generic humanized label when a rawData key is
+            registered in NETSKOPE_FIELDS for the first time.
     """
-    if not alerts:
-        return
-    _store_data_items(alerts, data_type=DataType.ALERT)
-    logger.info(f"Stored {len(alerts)} alerts successfully from CRE.")
-    _create_tickets(alerts, data_type=DataType.ALERT)
+    _do_store_module_alerts(alerts, source, field_labels=field_labels)
+
+
+@APP.task(name="itsm.store_cte_alerts")
+@integration("itsm")
+@track()
+def store_cte_alerts(alerts: List[Alert]):
+    """Store CTE-generated alerts and trigger CTO business rules.
+
+    Args:
+        alerts (List[Alert]): List of CTE alerts to store.
+    """
+    _do_store_module_alerts(alerts, "CTE")
 
 
 @APP.task(name="itsm.sync_alerts_and_events")
@@ -497,7 +656,16 @@ def pull_data_items(
     )
     if configuration is None:
         return False
-    configuration = ConfigurationDB(**configuration)
+    try:
+        configuration = ConfigurationDB(**configuration)
+    except ValidationError:
+        logger.error(
+            f"Configuration {configuration_name} is stored in an invalid state. "
+            "Skipping itsm.pull_data_items task until the document is repaired.",
+            details=traceback.format_exc(),
+            error_code="CTO_1051",
+        )
+        return False
     if configuration.active is False:
         return False
     PluginClass = helper.find_by_id(configuration.plugin)  # NOSONAR
@@ -653,9 +821,9 @@ def pull_historical_data(
                     "itsm.pull_data_items",
                     args=[
                         configuration.name,
-                        gzip.compress(
+                        compress_batch(
                             json.dumps({"result": data}).encode("utf-8"),
-                            compresslevel=3,
+                            DATA_FORMAT_JSON,
                         ),
                         data_type,
                         sub_type,

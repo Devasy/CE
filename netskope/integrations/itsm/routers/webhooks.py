@@ -105,7 +105,10 @@ async def accept_webhook(
             logger,
         )
         tasks, webhook_response = plugin.process_webhooks(request.query_params, request.headers, webhook_payload)
-
+        connector.collection(Collections.ITSM_CONFIGURATIONS).update_one(
+            {"name": webhook_config.name},
+            {"$set": {"storage": plugin.storage}},
+        )
         if not tasks:
             logger.info(
                 f"No tasks to update for configuration {webhook_config.name}."

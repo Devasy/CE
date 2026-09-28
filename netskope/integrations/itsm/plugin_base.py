@@ -68,6 +68,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             Union[List[Alert], List[Event]]: List of alerts/events fetched.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -81,6 +84,9 @@ class PluginBase(CommonPluginBase):
 
         Args:
             alert (Union[Alert, Event]): Alert/Event.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -100,11 +106,19 @@ class PluginBase(CommonPluginBase):
         raise NotImplementedError()
 
     def sync_states(self, tasks: List[Task]) -> List[Task]:
-        """Sync states of tasks."""
+        """Sync states of tasks.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         raise NotImplementedError()
 
     def sync_incidents(self, incidents: List[Task]) -> PushResult:
-        """Sync incidents back to platform."""
+        """Sync incidents back to platform.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
+        """
         raise NotImplementedError()
 
     def get_available_fields(self, configuration: dict) -> List[MappingField]:
@@ -128,6 +142,9 @@ class PluginBase(CommonPluginBase):
 
         Returns:
             List[str]: List of queues.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
@@ -150,6 +167,9 @@ class PluginBase(CommonPluginBase):
         Returns:
             List[Task]: List of task.
             Response: Webhook response.
+
+        Note: Any changes made to self.storage within this method are persisted
+        to the database (configuration.storage).
         """
         raise NotImplementedError()
 
