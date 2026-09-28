@@ -17,7 +17,7 @@ from netskope.common.utils import (
     get_dynamic_fields_from_plugin,
 )
 from netskope.common.utils.plugin_helper import PluginHelper
-from netskope.integrations import trim_space_parameters_fields
+from netskope.integrations import trim_space_parameters_fields, get_step_fields_and_persist_storage
 
 from ..models import (
     ActionWithoutParams,
@@ -43,7 +43,7 @@ def log_changes(configuration, updated_configuration):
     """Log changes based on the incoming request."""
     if configuration.active is not None:
         logger.debug(
-            f"Configuration '{configuration.name}' is {'enabled' if configuration.active else 'disabled'}."
+            f"Configuration '{configuration.name}' is {'enabled' if updated_configuration.active else 'disabled'}."
         )
     if configuration.pollInterval or configuration.pollIntervalUnit:
         logger.debug(
@@ -136,7 +136,7 @@ def get_plugin_instance(
     plugin: PluginBase = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        configuration_db.storage if configuration_db else {},
+        (configuration_db.storage or {}) if configuration_db else {},
         None,
         logger,
     )
@@ -149,9 +149,15 @@ def _validate_configuration_step(step, configuration, configuration_db=None):
         configuration.plugin, configuration, configuration_db=configuration_db
     )
     try:
-        return plugin.validate_step(step)
+        result = plugin.validate_step(step)
+        if configuration_db is not None:
+            db_connector.collection(Collections.CFC_CONFIGURATIONS).update_one(
+                {"name": configuration.name},
+                {"$set": {"storage": plugin.storage}},
+            )
+        return result
     except Exception as e:
-        logger.info(
+        logger.error(
             f"Exception occurred while executing validate for step {step}",
             details=traceback.format_exc(),
             error_code="CFC_1058",
@@ -190,38 +196,20 @@ def _get_dynamic_step_fields(
     step_name: str,
     configuration: Union[ConfigurationIn, ConfigurationUpdate],
 ) -> List:
-    """Fetch dynamic step fields from a plugin based on the provided plugin ID, step name, and configuration.
-
-    Args:
-        plugin_id (str): The ID of the plugin to retrieve dynamic step fields from.
-        step_name (str): The name of the step for which dynamic fields are requested.
-        configuration (Union[ConfigurationIn, ConfigurationUpdate]): Plugin configuration.
-
-    Raises:
-        HTTPException: If the plugin does not implement dynamic steps or if an error occurs during the retrieval.
-
-    Returns:
-        List: A list of dynamic step fields.
-    """
     PluginClass = plugin_helper.find_by_id(plugin_id)  # NOSONAR S117
-    plugin = PluginClass(
-        configuration.name, SecretDict(configuration.parameters), {}, None, logger
+    if not PluginClass:
+        raise HTTPException(400, f"Plugin with id='{plugin_id}' does not exist.")
+    params = SecretDict(configuration.parameters)
+    return get_step_fields_and_persist_storage(
+        PluginClass,
+        configuration.name,
+        params,
+        step_name,
+        params,
+        db_connector.collection(Collections.CFC_CONFIGURATIONS),
+        logger,
+        "CFC_1003",
     )
-    try:
-        return plugin.get_fields(step_name, SecretDict(configuration.parameters))
-    except NotImplementedError as error:
-        logger.error(
-            message=str(error), details=traceback.format_exc(), error_code="CFC_1003"
-        )
-        raise HTTPException(400, str(error))
-    except Exception as error:
-        logger.error(
-            message=str(error), details=traceback.format_exc(), error_code="CFC_1004"
-        )
-        raise HTTPException(
-            500,
-            f"Error occurred while retrieving dynamic step fields for '{step_name}'.",
-        )
 
 
 @router.post(
@@ -320,7 +308,7 @@ def _validate_entire_configuration(plugin, configuration):
         try:
             result = plugin.validate_step(step)
         except Exception as e:
-            logger.info(
+            logger.error(
                 f"Exception occurred while executing validate for step {step}",
                 details=traceback.format_exc(),
                 error_code="CFC_1059",
@@ -457,6 +445,7 @@ async def update_configuration(
     Returns:
         ConfigurationOut: The newly updated configuration.
     """
+    request_configuration = configuration
     # to trim extra spaces for parameters fields.
     trim_space_parameters_fields(configuration.parameters)
     update_payload = filter_out_none_values(configuration.model_dump())
@@ -480,7 +469,7 @@ async def update_configuration(
     plugin = PluginClass(
         configuration_to_validate.name,
         SecretDict(configuration_to_validate.parameters),
-        configuration_to_validate.storage,
+        configuration_to_validate.storage or {},
         configuration_to_validate.checkpoint,
         logger,
     )
@@ -538,7 +527,7 @@ async def update_configuration(
                 poll_interval_unit=configuration.pollIntervalUnit,
                 args=[configuration.name],
             )
-    log_changes(existing_configuration, configuration)
+    log_changes(request_configuration, configuration)
     metadata = plugin_helper.find_by_id(configuration.plugin).metadata
 
     return {
@@ -638,13 +627,18 @@ async def list_actions(
     plugin: PluginBase = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        configuration.storage,
+        configuration.storage or {},
         configuration.checkpoint,
         logger,
     )
     plugin.ssl_validation = configuration.sslValidation
     try:
-        return plugin.get_actions()
+        actions = plugin.get_actions()
+        db_connector.collection(Collections.CFC_CONFIGURATIONS).update_one(
+            {"name": name},
+            {"$set": {"storage": plugin.storage}},
+        )
+        return actions
     except Exception:
         logger.debug(
             "Error occurred while getting list of actions.",
@@ -686,7 +680,7 @@ async def get_action_fields(
     plugin: PluginBase = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        configuration.storage,
+        configuration.storage or {},
         configuration.checkpoint,
         logger,
     )

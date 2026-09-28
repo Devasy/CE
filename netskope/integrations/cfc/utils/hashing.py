@@ -3,10 +3,14 @@ import os
 import subprocess
 import shutil
 
+from netskope.common.utils import Logger
+
 from .constants import FILE_PATH, MANUAL_UPLOAD_PATH
 
 
 PATH_TO_HASHING_SCRIPT = "/opt/ns/bin/nsdlp/dlp-fingerprint20"
+
+logger = Logger()
 
 
 def hash_file_folder(
@@ -128,20 +132,31 @@ def create_hashes(
     if not os.path.exists(new_path):
         os.makedirs(new_path)
     new_file_path_mappings = {}
-    for file in files:
-        current_file_path, current_file_new_path = current_and_new_file_paths(
-            file,
-            files_base_path,
-            new_path,
-            manual_upload=manual_upload,
+    try:
+        for file in files:
+            current_file_path, current_file_new_path = current_and_new_file_paths(
+                file,
+                files_base_path,
+                new_path,
+                manual_upload=manual_upload,
+            )
+            if not os.path.exists(current_file_new_path):
+                os.makedirs(current_file_new_path)
+            if file["file"] and os.path.exists(current_file_path):
+                with open(f"{current_file_new_path}/{file['file']}", "wb") as f:
+                    shutil.copyfileobj(open(current_file_path, "rb"), f)
+            new_file_path_mappings[f"{current_file_new_path}/{file['file']}"] = file
+        path_to_hash = hash_file_folder(
+            new_path, classifier_id, classifier_name, delete_source=True
         )
-        if not os.path.exists(current_file_new_path):
-            os.makedirs(current_file_new_path)
-        if file["file"] and os.path.exists(current_file_path):
-            with open(f"{current_file_new_path}/{file['file']}", "wb") as f:
-                shutil.copyfileobj(open(current_file_path, "rb"), f)
-        new_file_path_mappings[f"{current_file_new_path}/{file['file']}"] = file
-    path_to_hash = hash_file_folder(
-        new_path, classifier_id, classifier_name, delete_source=True
-    )
+    except Exception:
+        if os.path.exists(new_path):
+            try:
+                shutil.rmtree(new_path)
+            except Exception:
+                logger.warn(
+                    f"Failed to clean up hashing working directory '{new_path}' "
+                    "after an error occurred while generating CFC hashes."
+                )
+        raise
     return path_to_hash, new_file_path_mappings

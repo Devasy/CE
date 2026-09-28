@@ -1,5 +1,7 @@
 """JSON query schemas."""
 
+from netskope.common.utils import DATE_VALUE_SCHEMA
+
 IMAGE_METADATA_QUERY_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "definitions": {
@@ -9,30 +11,20 @@ IMAGE_METADATA_QUERY_SCHEMA = {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "$gt": {"type": "string"},
-                        "$lt": {"type": "string"},
-                        "$gte": {"type": "string"},
-                        "$lte": {"type": "string"},
-                        "$ne": {"type": "string"},
+                        "$gt": DATE_VALUE_SCHEMA,
+                        "$lt": DATE_VALUE_SCHEMA,
+                        "$gte": DATE_VALUE_SCHEMA,
+                        "$lte": DATE_VALUE_SCHEMA,
+                        "$ne": DATE_VALUE_SCHEMA,
                         "$not": {
                             "type": "object",
                             "additionalProperties": False,
                             "properties": {
-                                "$gt": {
-                                    "type": "string",
-                                },
-                                "$lt": {
-                                    "type": "string",
-                                },
-                                "$gte": {
-                                    "type": "string",
-                                },
-                                "$lte": {
-                                    "type": "string",
-                                },
-                                "$ne": {
-                                    "type": "string",
-                                },
+                                "$gt": DATE_VALUE_SCHEMA,
+                                "$lt": DATE_VALUE_SCHEMA,
+                                "$gte": DATE_VALUE_SCHEMA,
+                                "$lte": DATE_VALUE_SCHEMA,
+                                "$ne": DATE_VALUE_SCHEMA,
                             },
                         },
                     },

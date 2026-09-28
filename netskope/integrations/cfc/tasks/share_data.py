@@ -149,6 +149,48 @@ def _update_task_status(id: str, status: StatusType):
     )
 
 
+def _record_run_outcomes(run_outcomes: List[Dict], files: list, status: StatusType):
+    """Record the outcome of the current sharing run for each of the given files.
+
+    Only terminal outcomes belong here; intermediate statuses such as
+    GENERATING_HASH and UPLOADING_HASH are not run results.
+
+    Args:
+        run_outcomes (List[Dict]): Accumulator for the current run, mutated in place.
+        files (list): Image metadata the outcome applies to.
+        status (StatusType): Terminal status reached for those files.
+    """
+    run_outcomes.extend({"status": status.value} for _ in files)
+
+
+def _calculate_run_status(run_outcomes: List[Dict], had_error: bool = False) -> StatusType:
+    """Derive the sharing status from the files processed in the current run.
+
+    Deliberately ignores image metadata from previous runs: files that have gone
+    outdated or no longer match a business rule must not influence the status
+    shown for the latest sharing.
+
+    Args:
+        run_outcomes (List[Dict]): Per-file outcomes recorded during this run.
+        had_error (bool): Whether an error (e.g. a deleted classifier) occurred
+            while processing this run's mappings. Only consulted when
+            run_outcomes is empty; a mapping error alongside files shared by
+            other mappings must not drag their SUCCESS/PARTIAL_SUCCESS down to
+            FAILED — that is reported via error_state/errorState instead.
+
+    Returns:
+        StatusType: SUCCESS when the run had nothing to share and no error
+        occurred, FAILED when the run had nothing to share because of an error,
+        otherwise the status derived from the outcomes of the files it did share.
+    """
+    if not run_outcomes:
+        # Every rule was muted or nothing matched the mappings; not an error,
+        # unless a mapping error (e.g. a deleted classifier) is the reason
+        # nothing was shared.
+        return StatusType.FAILED if had_error else StatusType.SUCCESS
+    return StatusType(CFCFileUtils.calculate_status_from_files(run_outcomes))
+
+
 def _upsert_destinations_of_image_data(
     files: list,
     destination_plugin_name: str,
@@ -217,9 +259,24 @@ def share_data(
 
         # Iterating sharings
         for sharing in sharings:
+            destination_configuration = sharing["destinationConfiguration"]
+
+            # Skip if a previous cycle is still mid-flight for this sharing;
+            # reprocessing it here would race on the same image directories
+            # and hash temp files that cycle is still using.
+            if sharing.get("status") in (
+                StatusType.GENERATING_HASH,
+                StatusType.UPLOADING_HASH,
+            ):
+                logger.info(
+                    f"Skipping sharing for source configuration '{source_config_name}' "
+                    f"and destination configuration '{destination_configuration}'. "
+                    "A previous sharing cycle is still in progress for this pair."
+                )
+                continue
+
             source_storage = _get_storage(source_config_name)
             source_storage = source_storage["storage"] if source_storage else {}
-            destination_configuration = sharing["destinationConfiguration"]
 
             # Validating destination configuration
             configuration_dict = connector.collection(
@@ -288,6 +345,10 @@ def share_data(
                 actions = sharing["actions"]
                 # Iterating the actions
                 error_state = {"error": False, "errorMessage": ""}
+                # Outcome of every file this run shares with this destination.
+                # The reported status is derived from these alone, so metadata
+                # left behind by previous runs cannot influence it.
+                run_outcomes: List[Dict] = []
                 for action_dict in actions:
                     _update_task_status(sharing["_id"], StatusType.GENERATING_HASH)
                     # Iterating mappings
@@ -433,14 +494,22 @@ def share_data(
                                 status=StatusType.FAILED,
                                 update_last_shared=False,
                             )
+                            _record_run_outcomes(
+                                run_outcomes, invalid_file_metadata, StatusType.FAILED
+                            )
                             _upsert_destinations_of_image_data(
                                 files=list(valid_file_metadata.values()),
                                 classifier_id=mapping["classifierID"],
                                 classifier_name=mapping["classifierName"],
                                 training_type=mapping["trainingType"],
                                 destination_plugin_name=configuration.name,
-                                status=StatusType.COMPLETED,
+                                status=StatusType.SUCCESS,
                                 update_last_shared=True,
+                            )
+                            _record_run_outcomes(
+                                run_outcomes,
+                                list(valid_file_metadata.values()),
+                                StatusType.SUCCESS,
                             )
                             if invalid_same_files:
                                 _upsert_destinations_of_image_data(
@@ -449,8 +518,13 @@ def share_data(
                                     classifier_name=mapping["classifierName"],
                                     training_type=mapping["trainingType"],
                                     destination_plugin_name=configuration.name,
-                                    status=StatusType.COMPLETED,
+                                    status=StatusType.SUCCESS,
                                     update_last_shared=False,
+                                )
+                                _record_run_outcomes(
+                                    run_outcomes,
+                                    invalid_same_files,
+                                    StatusType.SUCCESS,
                                 )
                             if mapping != new_mapping:
                                 _update_mapping(
@@ -466,6 +540,11 @@ def share_data(
                             )
                             logger.error(message=message, error_code="CFC_1023")
                             error_state = {"error": True, "errorMessage": message}
+                            # The destination rejected us, so none of this
+                            # mapping's files were shared in this run.
+                            _record_run_outcomes(
+                                run_outcomes, files, StatusType.FAILED
+                            )
                             break
                         except Exception as error:
                             _upsert_destinations_of_image_data(
@@ -477,9 +556,12 @@ def share_data(
                                 status=StatusType.FAILED,
                                 update_last_shared=False,
                             )
+                            _record_run_outcomes(
+                                run_outcomes, files, StatusType.FAILED
+                            )
                             raise error
                         finally:
-                            if os.path.exists(hash_file_path):
+                            if hash_file_path and os.path.exists(hash_file_path):
                                 rmtree(os.path.dirname(hash_file_path))
                         # Update the storage which will be set in push
                         _update_storage(configuration.name, plugin.storage)
@@ -489,23 +571,20 @@ def share_data(
                                 "errorMessage": result.message,
                             }
                     if error_state["error"]:
-                        _update_task_status(sharing["_id"], StatusType.FAILED)
                         _update_error_state(
                             sharing["_id"],
                             error_state["error"],
                             error_state["errorMessage"],
                         )
                     else:
-                        _update_task_status(
-                            sharing["_id"],
-                            StatusType.COMPLETED
-                            if pull_success
-                            else StatusType.PARTIALLY_COMPLETED
-                        )
                         connector.collection(Collections.CFC_SHARING).update_one(
                             {"_id": sharing["_id"]},
                             {"$set": {"sharedAt": datetime.now(UTC)}},
                         )
+                    final_status = _calculate_run_status(
+                        run_outcomes, error_state["error"]
+                    )
+                    _update_task_status(sharing["_id"], final_status)
             except NotImplementedError:
                 error_message = (
                     f"Could not share CFC hashes with configuration "
