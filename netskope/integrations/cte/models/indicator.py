@@ -62,6 +62,8 @@ class IndicatorType(str, Enum):
 
     IPV4 = "ipv4"
     IPV6 = "ipv6"
+    IPV4_CIDR = "ipv4_cidr"
+    IPV6_CIDR = "ipv6_cidr"
     HOSTNAME = "hostname"
     DOMAIN = "domain"
     FQDN = "fqdn"
@@ -314,6 +316,15 @@ class IndicatorDB(BaseModel):
     comments: str = Field(...)
     tags: List[str] = Field(...)
     extendedInformation: str = Field(...)
+    lastUpdated: Union[datetime, None] = Field(
+        None,
+        description=(
+            "CE storage time: stamped on every insert/update of the document, "
+            "never taken from the plugin-supplied indicator. Unlike lastSeen "
+            "(plugin-supplied, max-merged), this moves on every re-pull, so it "
+            "is the recency field for unified view sharing."
+        ),
+    )
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -348,6 +359,12 @@ class IndicatorSourceDB(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     retracted: bool = Field(False)
     retractionDestinations: List[dict] = Field([])
+    # Set only by persist_cre_entity_indicators (share_indicators.py), the one
+    # code path that creates CRE- or unified-view-sourced entries — plugin
+    # pulls go through insert_or_update_indicator and never set this. Lets
+    # retract_indicators_for_destination exclude these from retraction by a
+    # real field instead of pattern-matching the "source" display string.
+    derived: bool = Field(False)
 
 
 class IndicatorDBWithSources(IndicatorDB):

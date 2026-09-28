@@ -118,10 +118,50 @@ def parse_mongo_query(tag_dict, tag_name):
     return False
 
 
+def tag_used_by_field_mapping(tag_name: str):
+    """Rule whose field mapping can produce ``tag_name``, or None.
+
+    A rule mapping a Value Map / Range Map to ``tags`` is validated at save time
+    against the existing tags, so deleting one afterwards would silently take the
+    rule back to dropping every record as CTE_1101. Both rule kinds are checked.
+
+    Only bounded sources are knowable; a plain String mapped to ``tags`` produces
+    per-record values and is not guarded here, exactly as at save time.
+    """
+    from netskope.common.utils.unified_mapping_fields import (
+        rule_mapped_tag_labels,
+    )
+    from netskope.integrations.cte.utils.entity import get_entity_collection
+
+    for rule in connector.collection(Collections.CTE_BUSINESS_RULES).find(
+        {"fieldMapping.tags": {"$exists": True}}
+    ):
+        table = get_entity_collection(rule.get("entity") or "")
+        if tag_name in rule_mapped_tag_labels(rule, table):
+            return rule.get("name")
+    for rule in connector.collection(Collections.UNIFIED_MAPPING_RULES).find(
+        {"fieldMapping.tags": {"$exists": True}}
+    ):
+        if tag_name in rule_mapped_tag_labels(rule):
+            return rule.get("name")
+    return None
+
+
 @router.delete("/tags", tags=["Tags"], description="Delete a tag.")
 async def delete_tag(tag: TagDelete, user: User = Security(get_current_user, scopes=["cte_write"])):
     """Delete a tag."""
     used = False
+    mapped_by = tag_used_by_field_mapping(tag.name)
+    if mapped_by:
+        logger.debug(
+            f"{tag.name} is produced by the field mapping of business rule "
+            f"'{mapped_by}'."
+        )
+        raise HTTPException(
+            400,
+            f"{tag.name} is used by the Field Mapping of business rule "
+            f"'{mapped_by}'. Remove it from that mapping before deleting the tag.",
+        )
 
     for business_rule in list(connector.collection(Collections.CTE_BUSINESS_RULES).find({})):
         # simple rules

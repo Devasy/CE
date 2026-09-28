@@ -1,7 +1,7 @@
 """Provides configuration related endpoints."""
 
 import traceback
-from typing import List, Any
+from typing import Any, List
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Security
 
@@ -33,6 +33,7 @@ from ..models import (
 )
 from netskope.integrations.cte.models.business_rule import ActionWithoutParams
 from ..plugin_base import PluginBase
+from ..utils.constants import CTE_NO_ACTION_LABEL, CTE_NO_ACTION_VALUE
 from pymongo import ReturnDocument
 
 
@@ -345,7 +346,7 @@ async def update_configuration(
     plugin = PluginClass(
         updated_configuration.name,
         SecretDict(updated_configuration.parameters),
-        updated_configuration.storage,
+        updated_configuration.storage or {},
         None,
         logger,
         ssl_validation=updated_configuration.sslValidation,
@@ -465,7 +466,7 @@ async def delete_configuration(
         plugin = PluginClass(
             configuration_db.name,
             SecretDict(configuration_db.parameters),
-            configuration_db.storage,
+            configuration_db.storage or {},
             None,
             logger,
             ssl_validation=configuration_db.sslValidation,
@@ -487,6 +488,10 @@ async def delete_configuration(
     )
     db_connector.collection(Collections.CTE_BUSINESS_RULES).update_many(
         {}, {"$unset": {f"sharedWith.{configuration.name}": ""}}
+    )
+    # CRE-entity rules reference destinations directly under creShare.
+    db_connector.collection(Collections.CTE_BUSINESS_RULES).update_many(
+        {}, {"$unset": {f"creShare.{configuration.name}": ""}}
     )
     for brule in db_connector.collection(Collections.CTE_BUSINESS_RULES).find({}):
         sharedWith = brule.get("sharedWith", {})
@@ -526,13 +531,41 @@ async def list_actions(
     plugin: PluginBase = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        {},
+        configuration.storage or {},
         None,
         logger,
         ssl_validation=configuration.sslValidation,
     )
     try:
-        return plugin.get_actions()
+        actions = plugin.get_actions()
+        db_connector.collection(Collections.CONFIGURATIONS).update_one(
+            {"name": configuration.name},
+            {"$set": {"storage": plugin.storage}},
+        )
+        action_values = {
+            (a.value if hasattr(a, "value") else a.get("value")) for a in actions
+        }
+        if CTE_NO_ACTION_VALUE in action_values:
+            # Should never happen (the value is namespaced); never shadow a
+            # plugin-defined action.
+            logger.error(
+                f"Plugin {configuration.plugin} defines an action with the "
+                f"reserved value '{CTE_NO_ACTION_VALUE}'; the core-level "
+                "No Action target will not be available for it.",
+                error_code="CTE_1031",
+            )
+        else:
+            # Core-level pseudo-action: generate alerts without pushing
+            # indicators to the destination plugin. patch_supported is forced
+            # so only newly qualified indicators are processed each cycle.
+            actions.append(
+                ActionWithoutParams(
+                    label=CTE_NO_ACTION_LABEL,
+                    value=CTE_NO_ACTION_VALUE,
+                    patch_supported=True,
+                )
+            )
+        return actions
     except Exception:
         logger.error(
             "Error occurred while getting list of actions.",
@@ -549,6 +582,10 @@ async def get_action_fields(
     user: User = Security(get_current_user, scopes=["cte_read"]),
 ) -> Any:
     """List all actions."""
+    if action.value == CTE_NO_ACTION_VALUE:
+        # Core-level pseudo-action; plugins do not know about it and it has
+        # no parameters.
+        return []
     configuration = db_connector.collection(Collections.CONFIGURATIONS).find_one(
         {"name": name}
     )
@@ -563,13 +600,18 @@ async def get_action_fields(
     plugin: PluginBase = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        {},
+        configuration.storage or {},
         configuration.checkpoint,
         logger,
         ssl_validation=configuration.sslValidation,
     )
     try:
-        return plugin.get_action_fields(action)
+        fields = plugin.get_action_fields(action)
+        db_connector.collection(Collections.CONFIGURATIONS).update_one(
+            {"name": configuration.name},
+            {"$set": {"storage": plugin.storage}},
+        )
+        return fields
     except Exception:
         logger.error(
             "Error occurred while getting list of actions.",

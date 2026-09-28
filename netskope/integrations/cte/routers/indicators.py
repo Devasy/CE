@@ -27,6 +27,9 @@ from ..tasks.plugin_lifecycle_task import (
     get_possible_destinations,
 )
 from ..tasks.share_indicators import share_indicators
+from netskope.integrations.crev2.utils.ti_evaluation import (
+    queue_threat_indicator_evaluation,
+)
 from ..utils.schema import (
     INDICATOR_QUERY_SCHEMA as QUERY_SCHEMA,
     INDICATOR_STRING_FIELDS as STRING_FIELDS,
@@ -40,6 +43,7 @@ from ..models.indicator import (
     RetractionUpdate,
 )
 from ..models.tags import TagIn
+from ..utils.entity import is_cre_source
 from .tags import create_tag
 
 router = APIRouter()
@@ -375,17 +379,20 @@ async def create_indicators(
         for r in list(db_connector.collection(Collections.CONFIGURATIONS).find())
     }
     out = []
+    indicator_ids = []
     for indicator in indicators:
         if not validate_iocs(indicator.type, indicator.value):
             raise HTTPException(422, "Invalid indicator value provided.")
         if indicator.tags:
             indicator.tags = await create_tag_helper(indicator)
-        insert_or_update_indicator(
+        indicator_id = insert_or_update_indicator(
             ConfigurationDB(**(sources[indicator.source])),
             indicator,
             sources[indicator.source]["plugin"] == "netskope",
             True,
         )
+        if indicator_id is not None:
+            indicator_ids.append(indicator_id)
         indicator = db_connector.collection(Collections.INDICATORS).find_one(
             {"value": indicator.value}
         )
@@ -399,6 +406,8 @@ async def create_indicators(
             args=[indicator.source],
             kwargs={"indicators": [indicator.value]},
         )
+    if indicator_ids:
+        queue_threat_indicator_evaluation(indicator_ids)
     return out
 
 
@@ -419,12 +428,18 @@ async def update_indicator(
         indicator (IndicatorIn): Indicator to be updated.
     """
     if isinstance(indicator, RetractionUpdate):
+        if is_cre_source(indicator.source):
+            raise HTTPException(
+                status_code=400,
+                detail="Retraction is not supported for indicators created from CRE records.",
+            )
         destinations = get_possible_destinations(indicator.source)
-        destinations_query = (
-            {"sources.$[elem].destinations": destinations}
-            if not indicator.retracted
-            else {}
-        )
+        if indicator.retracted:
+            # Set all retractionDestinations with initial status "N/A".
+            retraction_destinations_na = [
+                {"name": dest["name"], "status": "N/A"}
+                for dest in destinations
+            ]
         db_connector.collection(Collections.INDICATORS).update_one(
             {
                 "value": indicator.value,
@@ -439,13 +454,93 @@ async def update_indicator(
                 "$set": {
                     "sources.$[elem].retracted": indicator.retracted,
                     "sources.$[elem].retractionDestinations": (
-                        destinations if indicator.retracted else []
+                        retraction_destinations_na if indicator.retracted else []
                     ),
-                    **destinations_query,
                 }
             },
             array_filters=[{"elem.source": indicator.source}],
         )
+        if indicator.retracted:
+            # Promote to "pending" only for destinations the indicator is actually shared with.
+            for dest in destinations:
+                db_connector.collection(Collections.INDICATORS).update_one(
+                    {
+                        "value": indicator.value,
+                        "sharedWith": {"$in": [dest["name"]]},
+                        "sources": {
+                            "$elemMatch": {
+                                "source": indicator.source,
+                                "destinations": {
+                                    "$elemMatch": {
+                                        "name": dest["name"],
+                                        "status": "shared"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "$set": {
+                            "sources.$[elem].retractionDestinations.$[dest].status": "pending"
+                        }
+                    },
+                    array_filters=[
+                        {"elem.source": indicator.source},
+                        {"dest.name": dest["name"]},
+                    ],
+                )
+        else:
+            # Unretraction: remove each destination from sharedWith and reset sharing
+            # status to "pending" so the next maintenance cycle re-shares the indicator.
+            for dest in destinations:
+                dest_name = dest["name"]
+                # Update existing destination entry to "pending" and remove from sharedWith.
+                db_connector.collection(Collections.INDICATORS).update_one(
+                    {
+                        "value": indicator.value,
+                        "sources": {
+                            "$elemMatch": {
+                                "source": indicator.source,
+                                "destinations.name": dest_name,
+                            }
+                        },
+                    },
+                    {
+                        "$pull": {"sharedWith": dest_name},
+                        "$set": {
+                            "sources.$[elem].destinations.$[dest].status": "pending"
+                        },
+                    },
+                    array_filters=[
+                        {"elem.source": indicator.source},
+                        {"dest.name": dest_name},
+                    ],
+                )
+                # If no destination entry exists yet, create one with "pending"
+                # and still remove from sharedWith in case it was populated there.
+                db_connector.collection(Collections.INDICATORS).update_one(
+                    {
+                        "value": indicator.value,
+                        "sources": {
+                            "$elemMatch": {
+                                "source": indicator.source,
+                                "destinations": {
+                                    "$not": {"$elemMatch": {"name": dest_name}}
+                                },
+                            }
+                        },
+                    },
+                    {
+                        "$pull": {"sharedWith": dest_name},
+                        "$push": {
+                            "sources.$[elem].destinations": {
+                                "name": dest_name,
+                                "status": "pending",
+                            }
+                        },
+                    },
+                    array_filters=[{"elem.source": indicator.source}],
+                )
         return True
     if indicator.tags:
         indicator.tags = await create_tag_helper(indicator)
@@ -465,7 +560,11 @@ async def update_indicator(
             f"Configuration with name='{indicator.source}' does not exist.",
         )
     source = ConfigurationDB(**source_dict)
-    insert_or_update_indicator(source, indicator, source.plugin == "netskope", True)
+    indicator_id = insert_or_update_indicator(
+        source, indicator, source.plugin == "netskope", True
+    )
+    if indicator_id is not None:
+        queue_threat_indicator_evaluation([indicator_id])
     execute_celery_task(
         share_indicators.apply_async,
         "cte.share_indicators",
