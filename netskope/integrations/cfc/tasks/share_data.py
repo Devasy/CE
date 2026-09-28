@@ -439,7 +439,7 @@ def share_data(
                                 classifier_name=mapping["classifierName"],
                                 training_type=mapping["trainingType"],
                                 destination_plugin_name=configuration.name,
-                                status=StatusType.COMPLETED,
+                                status=StatusType.SUCCESS,
                                 update_last_shared=True,
                             )
                             if invalid_same_files:
@@ -449,7 +449,7 @@ def share_data(
                                     classifier_name=mapping["classifierName"],
                                     training_type=mapping["trainingType"],
                                     destination_plugin_name=configuration.name,
-                                    status=StatusType.COMPLETED,
+                                    status=StatusType.SUCCESS,
                                     update_last_shared=False,
                                 )
                             if mapping != new_mapping:
@@ -489,23 +489,20 @@ def share_data(
                                 "errorMessage": result.message,
                             }
                     if error_state["error"]:
-                        _update_task_status(sharing["_id"], StatusType.FAILED)
                         _update_error_state(
                             sharing["_id"],
                             error_state["error"],
                             error_state["errorMessage"],
                         )
                     else:
-                        _update_task_status(
-                            sharing["_id"],
-                            StatusType.COMPLETED
-                            if pull_success
-                            else StatusType.PARTIALLY_COMPLETED
-                        )
                         connector.collection(Collections.CFC_SHARING).update_one(
                             {"_id": sharing["_id"]},
                             {"$set": {"sharedAt": datetime.now(UTC)}},
                         )
+                    final_status = StatusType(
+                        CFCFileUtils.get_sharing_status_for_destination(source_config_id, configuration.name)
+                    )
+                    _update_task_status(sharing["_id"], final_status)
             except NotImplementedError:
                 error_message = (
                     f"Could not share CFC hashes with configuration "
