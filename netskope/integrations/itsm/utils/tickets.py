@@ -65,7 +65,10 @@ def _substitute_vars(message: str, data_item: Union[Alert, Event]) -> str:
         """Resolve variable name."""
         raw_key = "rawData"
         if match.group(1) in (MAIN_ATTRS):
-            return getattr(data_item, match.group(1), "value_unavailable")
+            value = getattr(data_item, match.group(1), None)
+            if value is None:
+                value = getattr(data_item, raw_key).get(match.group(1), None)
+            return value if value is not None else "value_unavailable"
         else:
             return getattr(data_item, raw_key).get(match.group(1), "value_unavailable")
 
@@ -84,9 +87,12 @@ def _map_values(data_item: Union[Alert, Event], mappings: List[FieldMapping]) ->
     for mapping in mappings:
         if mapping.extracted_field not in [None, "custom_message"]:
             if mapping.extracted_field in (MAIN_ATTRS):
-                result[mapping.destination_field] = getattr(
-                    data_item, mapping.extracted_field, None
-                )
+                value = getattr(data_item, mapping.extracted_field, None)
+                if value is None:
+                    value = getattr(data_item, raw_key).get(
+                        mapping.extracted_field, None
+                    )
+                result[mapping.destination_field] = value
             else:
                 result[mapping.destination_field] = getattr(data_item, raw_key).get(
                     mapping.extracted_field, None

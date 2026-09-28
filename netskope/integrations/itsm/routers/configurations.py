@@ -1,7 +1,7 @@
 """Configuration related endpoints."""
 import json
 from datetime import datetime, timedelta
-from typing import List, Any
+from typing import List, Any, Union
 from fastapi import APIRouter, HTTPException, Path, Body, Security
 import traceback
 from netskope.common.utils import (
@@ -16,7 +16,7 @@ from netskope.common.utils import (
 from netskope.common.api.routers.auth import get_current_user
 from netskope.common.models import User, TenantDB, ActionType
 from netskope.common.celery.historical_alerts import historical_alerts
-from netskope.integrations import trim_space_parameters_fields
+from netskope.integrations import trim_space_parameters_fields, get_step_fields_and_persist_storage
 from netskope.common.utils.plugin_provider_helper import PluginProviderHelper
 from netskope.common.celery.scheduler import execute_celery_task
 from netskope.common.utils.common_pull_scheduler import (
@@ -170,7 +170,12 @@ async def get_configuration_queues(
         logger,
     )
     try:
-        return plugin.get_queues()
+        queues = plugin.get_queues()
+        connector.collection(Collections.ITSM_CONFIGURATIONS).update_one(
+            {"name": configuration.name},
+            {"$set": {"storage": plugin.storage}},
+        )
+        return queues
     except NotImplementedError:
         logger.error(
             f"Plugin {configuration.plugin} does not implement the get_queues method.",
@@ -517,26 +522,20 @@ async def create_configuration(
     return configuration
 
 
-def _get_dynamic_step_fields(step_name: str, configuration: dict) -> List:
+def _get_dynamic_step_fields(step_name: str, configuration: Union[ConfigurationIn, ConfigurationUpdate]) -> List:
     PluginClass = helper.find_by_id(configuration.plugin)  # NOSONAR S117
-    plugin = PluginClass(
+    if not PluginClass:
+        raise HTTPException(400, f"Plugin with id='{configuration.plugin}' does not exist.")
+    return get_step_fields_and_persist_storage(
+        PluginClass,
         configuration.name,
         None,
-        None,
-        None,
+        step_name,
+        SecretDict(configuration.parameters),
+        connector.collection(Collections.ITSM_CONFIGURATIONS),
         logger,
+        "CTO_1007",
     )
-    try:
-        return plugin.get_fields(step_name, SecretDict(configuration.parameters))
-    except NotImplementedError:
-        raise HTTPException(400, "Plugin does not implement dynamic steps.")
-    except Exception:
-        logger.error(
-            "Error occurred while getting fields.",
-            details=traceback.format_exc(),
-            error_code="CTO_1007",
-        )
-        raise HTTPException(400, "Error occurred while getting fields. Check logs.")
 
 
 @router.post("/configuration/step/{name}", tags=["CTO Configurations"])

@@ -4,6 +4,7 @@ from __future__ import absolute_import, unicode_literals
 from datetime import datetime
 from typing import List
 import traceback
+from pydantic import ValidationError
 from pymongo import UpdateOne
 from netskope.common.celery.main import APP
 from netskope.integrations.itsm.utils.custom_mapping_utils import plugin_to_ce_task_map
@@ -152,7 +153,16 @@ def sync_states(name: str):
     )
     if configuration is None:
         return False
-    configuration = ConfigurationDB(**configuration)
+    try:
+        configuration = ConfigurationDB(**configuration)
+    except ValidationError:
+        logger.error(
+            f"Configuration {name} is stored in an invalid state. Skipping "
+            "itsm.sync_states task until the document is repaired.",
+            details=traceback.format_exc(),
+            error_code="CTO_1051",
+        )
+        return False
 
     if configuration.active is False:
         return False
