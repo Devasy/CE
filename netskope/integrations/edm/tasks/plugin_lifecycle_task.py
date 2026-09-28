@@ -67,8 +67,9 @@ def end_life(name: str, success: bool) -> bool:
 def _mark_eligible_destinations_generating(source_config_name: str):
     """Re-check and mark eligible destinations as GENERATING_HASH.
 
-    This is called at the start of execute_plugin to dynamically pick up
-    any destinations that are in ready states (COMPLETED, FAILED, SCHEDULED).
+    This is called by execute_plugin, after the source configuration has been
+    validated as existing and active, to dynamically pick up any destinations
+    that are in ready states (COMPLETED, FAILED, SCHEDULED).
 
     Args:
         source_config_name (str): Name of the source configuration.
@@ -94,18 +95,16 @@ def execute_plugin(configuration_name):
     - Generate EDM hashes
     - Upload hashes to all eligible destinations
 
-    Re-checks destination statuses at the start to dynamically pick up any
-    destinations that have become ready since the sync was triggered.
+    Re-checks destination statuses after validating the configuration to
+    dynamically pick up any destinations that have become ready since the
+    sync was triggered. Does nothing if the configuration is disabled.
 
     Args:
         configuration_name (str): Name of the source configuration.
     """
     logger.info(
-        f"Executing pulling lifecylce for source configuration with name {configuration_name}."
+        f"Executing pulling lifecycle for source configuration with name {configuration_name}."
     )
-
-    # Re-check and mark eligible destinations as GENERATING_HASH
-    _mark_eligible_destinations_generating(configuration_name)
 
     try:
         configuration_db_dict = connector.collection(
@@ -124,7 +123,13 @@ def execute_plugin(configuration_name):
             return end_life(configuration_name, False)
 
         if not configuration_db.active:
+            logger.info(
+                f"Skipping sharing for configuration '{configuration_name}' as it is disabled."
+            )
             return False
+
+        # Re-check and mark eligible destinations as GENERATING_HASH
+        _mark_eligible_destinations_generating(configuration_name)
 
         plugin = PluginClass(
             configuration_db.name,

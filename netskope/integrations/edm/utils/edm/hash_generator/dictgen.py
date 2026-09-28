@@ -357,7 +357,7 @@ def test_assess_dict(out_grammar, edk_lic, edk_tool, inputs):
     try:
         output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         regex = re.compile(r'(?:(FAIL)|(PASS)):\s+valid input\s+'\
-                            '\(\"(.*)\"\)\s+is matched$', re.MULTILINE)
+                            r'\(\"(.*)\"\)\s+is matched$', re.MULTILINE)
         result_list = regex.findall(output.decode('utf-8'))
         for result in result_list:
             if result[1] != 'PASS':
