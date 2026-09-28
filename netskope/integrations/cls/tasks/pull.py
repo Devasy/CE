@@ -89,7 +89,14 @@ def pull(
 
             temp_events = events
             if isinstance(events, bytes):
-                temp_events = parse_events(events)
+                # Passed the configuration so the batch is attributed to the
+                # plugin that produced it.
+                temp_events = parse_events(
+                    events,
+                    configuration=configuration,
+                    data_type=batch_type,
+                    sub_type=batch_subtype,
+                )
             data_count = len(
                 temp_events.get("result", [])
                 if isinstance(temp_events, dict)

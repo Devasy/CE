@@ -64,7 +64,7 @@ def validate_mapping_file(jsonfile: MappingFileUpdate):
         plugin = PluginClass(
             config.get("name"),
             None,
-            None,
+            config.get("storage") or {},
             None,
             logger,
             mappings=jsonfile.model_dump(),
