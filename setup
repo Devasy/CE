@@ -165,7 +165,7 @@ LATEST_TAG_AND_VERSION = {
     "MONGO_TAG": "netskopetechnicalalliances/cloudexchange:mongo7-7.0.0-beta-8.3.4",
     "RABBITMQ_TAG": "netskopetechnicalalliances/cloudexchange:rabbitmq7-7.0.0-beta-4.3.2",
     "BETA_OPT_IN": "No",
-    "INSTALL_VERSION": "7.0.0-beta.1",
+    "INSTALL_VERSION": "7.0.0-beta",
 }
 CHECKS = {}
 MIN_CPU = 8
