@@ -50,27 +50,70 @@ def sent_hashes_for_polling(
     )
 
 
+# A record in one of these has already been claimed by the poller, so the
+# transient "checking" marker must not drag it backwards every poll cycle.
+POLLING_IN_PROGRESS_STATUSES = (
+    StatusType.CHECKING_APPLY_STATUS,
+    StatusType.APPLY_IN_PROGRESS,
+)
+
+
 def _change_the_file_source_status(
     fileSourceID: str,
     fileSourceType: EDMTaskType,
     status: StatusType,
+    skip_if_status_in: tuple = (),
 ):
+    """Set the status of the polled source and stamp updatedAt on real transitions.
+
+    The status is only written when it actually differs from the stored one, so
+    `updatedAt` reflects the last genuine status change and does not advance on
+    every poll cycle. Mirrors the updatedAt handling in `utils/task_listing.py`.
+
+    Args:
+        fileSourceID (str): _id of the business rule or manual upload configuration.
+        fileSourceType (EDMTaskType): whether the source is a plugin or a manual upload.
+        status (StatusType): status to be set.
+        skip_if_status_in (tuple, optional): leave the record untouched when its current
+            status is one of these. Used to keep the transient CHECKING_APPLY_STATUS
+            marker from moving a record that is already being polled.
+    """
     if fileSourceType == EDMTaskType.MANUAL:
-        connector.collection(Collections.EDM_MANUAL_UPLOAD_CONFIGURATIONS).update_one(
-            {"_id": ObjectId(fileSourceID)},
-            {"$set": {"status": status}}
-        )
+        collection = Collections.EDM_MANUAL_UPLOAD_CONFIGURATIONS
     elif fileSourceType == EDMTaskType.PLUGIN:
-        connector.collection(Collections.EDM_BUSINESS_RULES).update_one(
-            {"_id": ObjectId(fileSourceID)},
-            {"$set": {"status": status}}
-        )
+        collection = Collections.EDM_BUSINESS_RULES
     else:
         return False
+    connector.collection(collection).update_one(
+        {
+            "_id": ObjectId(fileSourceID),
+            "status": {"$nin": [status, *skip_if_status_in]},
+        },
+        {"$set": {"status": status, "updatedAt": datetime.now(UTC)}}
+    )
     return True
 
 
-def _get_status_for_source(apply_status: str):
+def _get_status_for_source(apply_status: str, file_id: str = ""):
+    """Map the tenant's apply status onto an EDM StatusType.
+
+    Never returns None. `apply_status` comes straight off the tenant response,
+    so an unknown value (a status added by a newer tenant release, or an
+    explicit null, which `.get`'s default does not cover) must not reach the
+    caller's `$set`: writing None would blank a non-Optional `status` field, so
+    every later `GET /task_status/edm` would fail to build `EDMTask` and 500 the
+    whole task list, and the record would never reach a terminal state so its
+    EDM_HASHES_STATUS row would be polled forever.
+
+    Args:
+        apply_status (str): apply status as reported by the tenant.
+        file_id (str, optional): staging file id, for log context.
+
+    Returns:
+        StatusType: mapped status; APPLY_IN_PROGRESS for anything unrecognised,
+            which keeps the record polling until the tenant reports a terminal
+            status.
+    """
     if (
         apply_status == "pending" or
         apply_status == "inprogress"
@@ -80,6 +123,16 @@ def _get_status_for_source(apply_status: str):
         return StatusType.COMPLETED
     elif apply_status == "error":
         return StatusType.FAILED
+    logger.error(
+        "Unexpected apply status reported for the uploaded EDM Hashes "
+        f"for file id {file_id}. Treating it as apply in progress.",
+        error_code="EDM_1047",
+        details=(
+            f"Received apply status: '{apply_status}'. Expected one of "
+            "'pending', 'inprogress', 'completed' or 'error'."
+        ),
+    )
+    return StatusType.APPLY_IN_PROGRESS
 
 
 @APP.task(name="edm.poll_edm_hash_upload_status", acks_late=True)
@@ -98,6 +151,7 @@ def poll_edm_hash_upload_status():
                 hash_db.fileSourceID,
                 hash_db.fileSourceType,
                 StatusType.CHECKING_APPLY_STATUS,
+                skip_if_status_in=POLLING_IN_PROGRESS_STATUSES,
             )
             try:
                 tenant = provider_helper.get_tenant_details(hash_db.fileUploadedAtTenant)
@@ -134,7 +188,9 @@ def poll_edm_hash_upload_status():
             if response:
                 apply_status = response.get("apply_status", "pending")
                 message = response["msg"]
-                apply_status = _get_status_for_source(apply_status)
+                apply_status = _get_status_for_source(
+                    apply_status, hash_db.file_id
+                )
             _change_the_file_source_status(
                 hash_db.fileSourceID,
                 hash_db.fileSourceType,

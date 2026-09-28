@@ -58,7 +58,10 @@ async def post_sanitization(
         logger,
         plugin_type=sanitization_config.pluginType,
     )
-    validation_result = plugin.validate(SecretDict(sanitization_config.parameters))
+    try:
+        validation_result = plugin.validate(SecretDict(sanitization_config.parameters))
+    except Exception as e:
+        raise HTTPException(400, str(e))
     if validation_result.success is False:
         raise HTTPException(
             400,

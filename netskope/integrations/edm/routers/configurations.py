@@ -37,7 +37,7 @@ from ..models.plugin import (
 )
 from ..plugin_base import PluginBase, ValidationResult
 from ..utils import FILE_PATH, MANUAL_UPLOAD_PATH, UPLOAD_PATH
-from netskope.integrations import trim_space_parameters_fields
+from netskope.integrations import trim_space_parameters_fields, get_step_fields_and_persist_storage
 
 router = APIRouter()
 scheduler = Scheduler()
@@ -121,7 +121,7 @@ def get_plugin_instance(
     plugin: PluginBase = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        configuration_db.storage if configuration_db else {},
+        (configuration_db.storage or {}) if configuration_db else {},
         None,
         logger,
     )
@@ -436,49 +436,24 @@ async def create_configuration(
 
 
 def _get_dynamic_step_fields(
-    plugin_id: str, step_name: str,
-    configuration: Union[ConfigurationIn, ConfigurationUpdate]
+    plugin_id: str,
+    step_name: str,
+    configuration: Union[ConfigurationIn, ConfigurationUpdate],
 ) -> List:
-    """Fetch dynamic step fields from a plugin based on the provided plugin ID, step name, and configuration.
-
-    Args:
-        plugin_id (str): The ID of the plugin to retrieve dynamic step fields from.
-        step_name (str): The name of the step for which dynamic fields are requested.
-        configuration (Union[ConfigurationIn, ConfigurationUpdate]): Plugin configuration.
-
-    Raises:
-        HTTPException: If the plugin does not implement dynamic steps or if an error occurs during the retrieval.
-
-    Returns:
-        List: A list of dynamic step fields.
-    """
     PluginClass = plugin_helper.find_by_id(plugin_id)  # NOSONAR S117
     if not PluginClass:
         raise HTTPException(400, f"Plugin with id='{plugin_id}' does not exist.")
-    plugin = PluginClass(
+    params = SecretDict(configuration.parameters)
+    return get_step_fields_and_persist_storage(
+        PluginClass,
         configuration.name,
-        SecretDict(configuration.parameters),
-        {},
-        None,
+        params,
+        step_name,
+        params,
+        db_connector.collection(Collections.EDM_CONFIGURATIONS),
         logger,
+        "EDM_1005",
     )
-
-    try:
-        return plugin.get_fields(
-            step_name,
-            SecretDict(configuration.parameters)
-        )
-
-    except NotImplementedError:
-        raise HTTPException(400, "Plugin does not implement dynamic steps.")
-
-    except Exception:
-        logger.error(
-            "Error occurred while getting fields.",
-            details=traceback.format_exc(),
-            error_code="EDM_1005",
-        )
-        raise HTTPException(400, "Error occurred while getting fields. Check logs.")
 
 
 def _clean_file_on_configuration_delete(name: str):
@@ -520,11 +495,17 @@ async def validate_configuration_name(
     return ValidationResult(success=True, message="Validation successful.")
 
 
-def _validate_configuration_step(step, configuration):
+def _validate_configuration_step(step, configuration, configuration_db=None):
     """Validate individual steps of a configuration."""
-    plugin = get_plugin_instance(configuration.plugin, configuration)
+    plugin = get_plugin_instance(configuration.plugin, configuration, configuration_db)
     try:
-        return plugin.validate_step(step)
+        result = plugin.validate_step(step)
+        if configuration_db is not None:
+            db_connector.collection(Collections.EDM_CONFIGURATIONS).update_one(
+                {"name": configuration.name},
+                {"$set": {"storage": plugin.storage}},
+            )
+        return result
     except Exception as e:
         logger.error(
             f"Exception occurred while executing validate for step {step}",
@@ -577,7 +558,13 @@ async def validate_patch_configuration_step(
     user: User = Security(get_current_user, scopes=["edm_write"]),
 ) -> Any:
     """Validate a configuration step."""
-    return _validate_configuration_step(step, configuration)
+    config_db = db_connector.collection(Collections.EDM_CONFIGURATIONS).find_one(
+        {"name": configuration.name}
+    )
+    if config_db is None:
+        raise HTTPException(404, f"Configuration '{configuration.name}' not found.")
+    configuration_db = ConfigurationDB(**config_db)
+    return _validate_configuration_step(step, configuration, configuration_db)
 
 
 @router.post(
@@ -699,7 +686,7 @@ async def update_configuration(
         plugin = PluginClass(
             configuration.name,
             SecretDict(updated_configuration.parameters),
-            updated_configuration.storage,
+            updated_configuration.storage or {},
             updated_configuration.checkpoint,
             logger,
             plugin_type=updated_configuration.pluginType
@@ -795,13 +782,18 @@ async def list_actions(
     plugin: PluginBase = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        configuration.storage,
+        configuration.storage or {},
         configuration.checkpoint,
         logger,
     )
     plugin.ssl_validation = configuration.sslValidation
     try:
-        return plugin.get_actions()
+        actions = plugin.get_actions()
+        db_connector.collection(Collections.EDM_CONFIGURATIONS).update_one(
+            {"name": name},
+            {"$set": {"storage": plugin.storage}},
+        )
+        return actions
     except Exception:
         logger.debug(
             "Error occurred while getting list of actions.",
@@ -832,13 +824,18 @@ async def get_action_fields(
     plugin: PluginBase = PluginClass(
         configuration.name,
         SecretDict(configuration.parameters),
-        configuration.storage,
+        configuration.storage or {},
         configuration.checkpoint,
         logger,
     )
     plugin.ssl_validation = configuration.sslValidation
     try:
-        return plugin.get_action_fields(action)
+        fields = plugin.get_action_fields(action)
+        db_connector.collection(Collections.EDM_CONFIGURATIONS).update_one(
+            {"name": name},
+            {"$set": {"storage": plugin.storage}},
+        )
+        return fields
     except Exception:
         logger.debug(
             "Error occurred while getting list of actions.",
